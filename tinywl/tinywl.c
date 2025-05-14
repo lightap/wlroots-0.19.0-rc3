@@ -38,12 +38,7 @@
 #include <render/allocator/RDP_allocator.h>
 #include <wlr/backend/RDP.h>
 
-/* Function declarations */
-struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display);
-struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void);
-struct wlr_allocator *wlr_rdp_allocator_create(struct wlr_renderer *renderer);
-void rdp_transmit_surface(struct wlr_buffer *buffer);
-//freerdp_peer *get_global_rdp_peer(void);
+
 
 /* RDP backend access */
 struct wlr_rdp_backend {
@@ -54,7 +49,7 @@ struct wlr_rdp_backend {
 };
 
 /* Global backend for get_global_rdp_peer */
-static struct wlr_backend *backend = NULL;
+//static struct wlr_backend *backend = NULL;
 
 /* Implementation of get_global_rdp_peer 
 freerdp_peer *get_global_rdp_peer(void) {
@@ -242,6 +237,17 @@ struct tinywl_keyboard {
     struct wl_listener key;
     struct wl_listener destroy;
 };
+
+
+
+/* Function declarations */
+struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display);
+struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void);
+struct wlr_allocator *wlr_rdp_allocator_create(struct wlr_renderer *renderer);
+void rdp_transmit_surface(struct wlr_buffer *buffer);
+//freerdp_peer *get_global_rdp_peer(void);
+struct wlr_egl *setup_surfaceless_egl(struct tinywl_server *server) ;
+void cleanup_egl(struct tinywl_server *server);
 
 /* Function implementations */
 static void server_destroy(struct tinywl_server *server) {
@@ -756,7 +762,7 @@ static void server_new_output(struct wl_listener *listener, void *data) {
         struct wlr_output_state state;
         wlr_output_state_init(&state);
         wlr_output_state_set_enabled(&state, true);
-        wlr_output_state_set_custom_mode(&state, 1280, 720, 60000);
+        wlr_output_state_set_custom_mode(&state, 1024, 768, 60000);
         wlr_output_state_set_render_format(&state, formats[i]);
         if (wlr_output_test_state(wlr_output, &state)) {
             if (wlr_output_commit_state(wlr_output, &state)) {
@@ -986,7 +992,7 @@ static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
     wl_signal_add(&xdg_popup->events.destroy, &popup->destroy);
 }
 
-
+/*
 static bool is_zink_renderer(struct wlr_backend *backend, struct wlr_renderer *renderer, struct wlr_allocator *allocator) {
     if (!renderer) {
         wlr_log(WLR_ERROR, "No renderer available to check type");
@@ -1032,7 +1038,7 @@ static bool is_zink_renderer(struct wlr_backend *backend, struct wlr_renderer *r
     eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
 
     return is_zink;
-}
+}*/
 
 #ifndef EGL_PLATFORM_SURFACELESS_MESA
 #define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
@@ -1044,26 +1050,21 @@ static bool is_zink_renderer(struct wlr_backend *backend, struct wlr_renderer *r
 struct wlr_egl *setup_surfaceless_egl(struct tinywl_server *server) {
     wlr_log(WLR_INFO, "Starting surfaceless EGL setup");
 
-    // 1. Check for required EGL extensions
-    const char *egl_vendor = eglQueryString(EGL_NO_DISPLAY, EGL_VENDOR);
-    const char *egl_version = eglQueryString(EGL_NO_DISPLAY, EGL_VERSION);
-    wlr_log(WLR_INFO, "EGL Vendor: %s", egl_vendor ? egl_vendor : "Unknown");
-    wlr_log(WLR_INFO, "EGL Version: %s", egl_version ? egl_version : "Unknown");
-
-    const char *extensions = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
-    if (!extensions) {
-        wlr_log(WLR_ERROR, "Could not query EGL extensions");
+    // 1. Check for client extensions (can use EGL_NO_DISPLAY)
+    const char *client_extensions = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
+    if (!client_extensions) {
+        wlr_log(WLR_ERROR, "Could not query EGL client extensions");
         return NULL;
     }
-    wlr_log(WLR_INFO, "EGL extensions: %s", extensions);
+    wlr_log(WLR_INFO, "EGL client extensions: %s", client_extensions);
 
-    bool has_surfaceless = strstr(extensions, "EGL_MESA_platform_surfaceless") != NULL;
-    bool has_platform_base = strstr(extensions, "EGL_EXT_platform_base") != NULL;
+    bool has_surfaceless = strstr(client_extensions, "EGL_MESA_platform_surfaceless") != NULL;
+    bool has_platform_base = strstr(client_extensions, "EGL_EXT_platform_base") != NULL;
     wlr_log(WLR_INFO, "Surfaceless platform support: %s", has_surfaceless ? "YES" : "NO");
     wlr_log(WLR_INFO, "Platform base extension: %s", has_platform_base ? "YES" : "NO");
 
     if (!has_surfaceless || !has_platform_base) {
-        wlr_log(WLR_ERROR, "Required EGL extensions not available");
+        wlr_log(WLR_ERROR, "Required EGL client extensions not available");
         return NULL;
     }
 
@@ -1079,10 +1080,10 @@ struct wlr_egl *setup_surfaceless_egl(struct tinywl_server *server) {
     // 3. Create surfaceless display
     EGLDisplay display = get_platform_display(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
     if (display == EGL_NO_DISPLAY) {
-        wlr_log(WLR_ERROR, "Failed to create surfaceless display. EGL error: 0x%x", eglGetError());
+        wlr_log(WLR_ERROR, "Failed to create surfaceless display. Error: 0x%x", eglGetError());
         return NULL;
     }
-    wlr_log(WLR_INFO, "Created surfaceless display: %p", (void*)display);
+    wlr_log(WLR_INFO, "Created EGL display: %p", (void*)display);
 
     // 4. Initialize EGL
     EGLint major, minor;
@@ -1092,161 +1093,125 @@ struct wlr_egl *setup_surfaceless_egl(struct tinywl_server *server) {
         return NULL;
     }
     wlr_log(WLR_INFO, "EGL initialized, version: %d.%d", major, minor);
-    server->egl_display = display;
-
-    // 5. Multiple configuration attempts
-    const EGLint config_attempts[][20] = {
-        {
-            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-            EGL_SURFACE_TYPE, EGL_PBUFFER_BIT | EGL_WINDOW_BIT | EGL_PIXMAP_BIT,
-            EGL_RED_SIZE, 8,
-            EGL_GREEN_SIZE, 8,
-            EGL_BLUE_SIZE, 8,
-            EGL_ALPHA_SIZE, 8,
-            EGL_DEPTH_SIZE, EGL_DONT_CARE,
-            EGL_STENCIL_SIZE, EGL_DONT_CARE,
-            EGL_NONE
-        },
-        {
-            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-            EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
-            EGL_RED_SIZE, 8,
-            EGL_GREEN_SIZE, 8,
-            EGL_BLUE_SIZE, 8,
-            EGL_ALPHA_SIZE, 8,
-            EGL_NONE
-        },
-        {
-            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-            EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
-            EGL_RED_SIZE, 1,
-            EGL_GREEN_SIZE, 1,
-            EGL_BLUE_SIZE, 1,
-            EGL_NONE
-        }
-    };
-
-    EGLConfig config = NULL;
-    EGLint num_config = 0;
-
-    // Try different configurations
-    for (size_t i = 0; i < sizeof(config_attempts) / sizeof(config_attempts[0]); i++) {
-        wlr_log(WLR_INFO, "Attempting EGL configuration attempt %zu", i);
-        
-        if (eglChooseConfig(display, config_attempts[i], &config, 1, &num_config)) {
-            if (num_config > 0) {
-                wlr_log(WLR_INFO, "Successfully found EGL configuration");
-                break;
-            }
-        } else {
-            wlr_log(WLR_ERROR, "EGL config selection failed. Error code: 0x%x", eglGetError());
-        }
-    }
-
-    if (num_config == 0) {
-        wlr_log(WLR_ERROR, "No matching EGL configurations found after multiple attempts");
+    
+    // 5. NOW query display extensions (must use initialized display)
+    const char *display_extensions = eglQueryString(display, EGL_EXTENSIONS);
+    if (!display_extensions) {
+        wlr_log(WLR_ERROR, "Failed to query EGL display extensions. Error: 0x%x", eglGetError());
         eglTerminate(display);
         return NULL;
     }
-    server->egl_config = config;
-    wlr_log(WLR_INFO, "Found suitable EGL configuration");
+    wlr_log(WLR_INFO, "EGL display extensions: %s", display_extensions);
 
-    // Log selected config attributes
-    EGLint renderable_type, surface_type;
-    eglGetConfigAttrib(display, server->egl_config, EGL_RENDERABLE_TYPE, &renderable_type);
-    eglGetConfigAttrib(display, server->egl_config, EGL_SURFACE_TYPE, &surface_type);
-    wlr_log(WLR_INFO, "Selected config: Renderable Type=0x%x, Surface Type=0x%x",
-            renderable_type, surface_type);
-    if (!(renderable_type & EGL_OPENGL_ES2_BIT)) {
-        wlr_log(WLR_ERROR, "Selected config does not support EGL_OPENGL_ES2_BIT");
-        eglTerminate(display);
-        return NULL;
-    }
-
-    // 6. Bind OpenGL ES API
+    // 6. Set bind API first (before choosing config)
     if (!eglBindAPI(EGL_OPENGL_ES_API)) {
         wlr_log(WLR_ERROR, "Failed to bind OpenGL ES API. Error: 0x%x", eglGetError());
         eglTerminate(display);
         return NULL;
     }
-    EGLint current_api = eglQueryAPI();
-    if (current_api != EGL_OPENGL_ES_API) {
-        wlr_log(WLR_ERROR, "EGL API is not OpenGL ES (got 0x%x)", current_api);
+    wlr_log(WLR_INFO, "Successfully bound OpenGL ES API");
+
+    // 7. Choose a config with explicit GLES2
+    const EGLint config_attribs[] = {
+        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_NONE
+    };
+
+    EGLConfig config;
+    EGLint num_config;
+    if (!eglChooseConfig(display, config_attribs, &config, 1, &num_config) || num_config < 1) {
+        wlr_log(WLR_ERROR, "Failed to choose EGL config. Error: 0x%x", eglGetError());
         eglTerminate(display);
         return NULL;
     }
-    wlr_log(WLR_INFO, "EGL API bound to OpenGL ES");
+    wlr_log(WLR_INFO, "Found suitable EGL configuration");
 
-    // 7. Create EGL context
-    EGLint ctx_attribs[] = {
+    // 8. Create context with explicit version
+    const EGLint ctx_attribs[] = {
         EGL_CONTEXT_CLIENT_VERSION, 2,
+        EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR,
         EGL_NONE
     };
-    server->egl_context = eglCreateContext(display, server->egl_config, EGL_NO_CONTEXT, ctx_attribs);
-    if (server->egl_context == EGL_NO_CONTEXT) {
-        wlr_log(WLR_ERROR, "Context creation failed. Error: 0x%x", eglGetError());
-        eglTerminate(display);
-        return NULL;
+    
+    EGLContext context = eglCreateContext(display, config, EGL_NO_CONTEXT, ctx_attribs);
+    if (context == EGL_NO_CONTEXT) {
+        // Try without profile mask if it failed
+        const EGLint simple_ctx_attribs[] = {
+            EGL_CONTEXT_CLIENT_VERSION, 2,
+            EGL_NONE
+        };
+        
+        context = eglCreateContext(display, config, EGL_NO_CONTEXT, simple_ctx_attribs);
+        if (context == EGL_NO_CONTEXT) {
+            wlr_log(WLR_ERROR, "Failed to create EGL context. Error: 0x%x", eglGetError());
+            eglTerminate(display);
+            return NULL;
+        }
     }
     wlr_log(WLR_INFO, "Created EGL context");
 
-    // 8. Create Pbuffer surface
-    EGLint pbuffer_attribs[] = {
+    // 9. Create pbuffer surface
+    const EGLint pbuffer_attribs[] = {
         EGL_WIDTH, 16,
         EGL_HEIGHT, 16,
         EGL_NONE
     };
-    server->egl_surface = eglCreatePbufferSurface(display, server->egl_config, pbuffer_attribs);
-    if (server->egl_surface == EGL_NO_SURFACE) {
-        wlr_log(WLR_ERROR, "Failed to create PBuffer surface. Error: 0x%x", eglGetError());
-        eglDestroyContext(display, server->egl_context);
+    
+    EGLSurface surface = eglCreatePbufferSurface(display, config, pbuffer_attribs);
+    if (surface == EGL_NO_SURFACE) {
+        wlr_log(WLR_ERROR, "Failed to create pbuffer surface. Error: 0x%x", eglGetError());
+        eglDestroyContext(display, context);
         eglTerminate(display);
         return NULL;
     }
+    wlr_log(WLR_INFO, "Created EGL pbuffer surface");
 
-    // 9. Make context current
-    if (!eglMakeCurrent(display, server->egl_surface, server->egl_surface, server->egl_context)) {
+    // 10. Make context current to verify it works
+    if (!eglMakeCurrent(display, surface, surface, context)) {
         wlr_log(WLR_ERROR, "Failed to make context current. Error: 0x%x", eglGetError());
-        eglDestroySurface(display, server->egl_surface);
-        eglDestroyContext(display, server->egl_context);
+        eglDestroySurface(display, surface);
+        eglDestroyContext(display, context);
         eglTerminate(display);
         return NULL;
     }
-    wlr_log(WLR_INFO, "EGL context made current");
+    wlr_log(WLR_INFO, "Made EGL context current");
 
-    // 10. Create wlr_egl
-    struct wlr_egl *wlr_egl = wlr_egl_create_with_context(display, server->egl_config);
-    if (!wlr_egl) {
-        wlr_log(WLR_ERROR, "Failed to create wlr_egl");
-        eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        eglDestroySurface(display, server->egl_surface);
-        eglDestroyContext(display, server->egl_context);
-        eglTerminate(display);
-        return NULL;
-    }
-
-    // 11. Log OpenGL ES information
+    // 11. Verify the context is GLES2 as expected
     const char *gl_vendor = (const char *)glGetString(GL_VENDOR);
     const char *gl_renderer = (const char *)glGetString(GL_RENDERER);
     const char *gl_version = (const char *)glGetString(GL_VERSION);
     wlr_log(WLR_INFO, "OpenGL ES Vendor: %s", gl_vendor ? gl_vendor : "Unknown");
     wlr_log(WLR_INFO, "OpenGL ES Renderer: %s", gl_renderer ? gl_renderer : "Unknown");
     wlr_log(WLR_INFO, "OpenGL ES Version: %s", gl_version ? gl_version : "Unknown");
+    
+    // 12. Clear context before passing to wlroots
+    eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    wlr_log(WLR_INFO, "Cleared EGL context before passing to wlroots");
 
-    // 12. Test OpenGL ES
-    glClearColor(0.2f, 0.3f, 0.8f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    GLenum error = glGetError();
-    if (error != GL_NO_ERROR) {
-        wlr_log(WLR_ERROR, "OpenGL ES error: 0x%x", error);
-        eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        eglDestroySurface(display, server->egl_surface);
-        eglDestroyContext(display, server->egl_context);
+    // 13. Store EGL resources in server structure
+    server->egl_display = display;
+    server->egl_config = config;
+    server->egl_context = context;
+    server->egl_surface = surface;
+
+    // 14. Now let wlroots create its wrapper with our context
+    wlr_log(WLR_INFO, "Creating wlr_egl with context");
+    struct wlr_egl *wlr_egl = wlr_egl_create_with_context(display, config);
+    
+    if (!wlr_egl) {
+        wlr_log(WLR_ERROR, "Failed to create wlr_egl with context");
+        eglDestroySurface(display, surface);
+        eglDestroyContext(display, context);
         eglTerminate(display);
         return NULL;
     }
-
-    eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    
+    wlr_log(WLR_INFO, "Successfully created wlr_egl");
     return wlr_egl;
 }
 
@@ -1271,18 +1236,7 @@ void cleanup_egl(struct tinywl_server *server) {
 /* Updated main function */
 int main(int argc, char *argv[]) {
     printf("Starting compositor with surfaceless EGL display\n");
- /*
 
-    // Set Mesa environment variables for Zink
-    setenv("MESA_VK_VERSION_OVERRIDE", "1.2", 1);
-    setenv("MESA_LOADER_DRIVER_OVERRIDE", "zink", 1);
-    setenv("GALLIUM_DRIVER", "zink", 1);
-    setenv("ZINK_DEBUG", "nofp64,nofast_color_clear", 1);
-    setenv("VK_DRIVER_FILES", "/usr/share/vulkan/icd.d/vulkan_icd.json", 1);
-    setenv("ZINK_DESCRIPTORS", "lazy", 1);
-    setenv("ZINK_NO_TIMELINES", "1", 1);
-    setenv("ZINK_NO_DECOMPRESS", "1", 1);
-*/
     // Print environment variables
     printf("VK_ICD_FILENAMES=%s\n", getenv("VK_ICD_FILENAMES"));
     printf("MESA_LOADER_DRIVER_OVERRIDE=%s\n", getenv("MESA_LOADER_DRIVER_OVERRIDE"));
