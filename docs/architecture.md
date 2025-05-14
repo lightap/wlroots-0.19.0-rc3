@@ -9,7 +9,7 @@ its protocol implementations.
 
 Backends are responsible for exposing input devices and output devices.
 wlroots provides DRM and libinput backends to directly drive physical
-devices, Wayland and X11 backends to run nested inside another compositor,
+devices, Wayland and RDP backends to run nested inside another compositor,
 and a headless backend. A special "multi" backend is used to combine together
 multiple backends, for instance DRM and libinput. Compositors can also
 implement their own custom backends if they have special needs.
@@ -58,7 +58,7 @@ Shells give a meaning to surfaces. There are many kinds of surfaces:
 application windows, tooltips, right-click menus, desktop panels, wallpapers,
 lock screens, on-screen keyboards, and so on. Each of these use-cases is
 fulfilled with a shell. wlroots supports xdg-shell for regular windows and
-popups, Xwayland for interoperability with X11 applications, layer-shell for
+popups, Xwayland for interoperability with RDP applications, layer-shell for
 desktop UI elements, and more.
 
 ### Other protocols

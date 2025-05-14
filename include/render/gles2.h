@@ -16,6 +16,8 @@
 
 #include "render/egl.h"
 
+#include <wlr/util/transform.h> // For wlr_matrix_* functions
+
 // mesa ships old GL headers that don't include this type, so for distros that use headers from
 // mesa we need to def it ourselves until they update.
 // https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/23144
@@ -35,6 +37,8 @@ struct wlr_gles2_tex_shader {
 	GLint tex;
 	GLint alpha;
 	GLint pos_attrib;
+	GLint invert_y;
+    GLint texcoord_attrib;
 };
 
 struct wlr_gles2_renderer {
@@ -87,6 +91,7 @@ struct wlr_gles2_renderer {
 
 	struct wl_list buffers; // wlr_gles2_buffer.link
 	struct wl_list textures; // wlr_gles2_texture.link
+	struct wlr_gles2_buffer *current_buffer;
 };
 
 struct wlr_gles2_render_timer {
@@ -172,5 +177,9 @@ void pop_gles2_debug(struct wlr_gles2_renderer *renderer);
 struct wlr_gles2_render_pass *begin_gles2_buffer_pass(struct wlr_gles2_buffer *buffer,
 	struct wlr_egl_context *prev_ctx, struct wlr_gles2_render_timer *timer,
 	struct wlr_drm_syncobj_timeline *signal_timeline, uint64_t signal_point);
+
+//#if WLR_HAS_GLES2_RENDERER
+struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void);
+//#endif
 
 #endif

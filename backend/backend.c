@@ -14,6 +14,7 @@
 #include "types/wlr_output.h"
 #include "util/env.h"
 #include "util/time.h"
+#include "render/allocator/RDP_allocator.h"
 
 #if WLR_HAS_SESSION
 #include <wlr/backend/session.h>
@@ -28,10 +29,19 @@
 #include <wlr/backend/libinput.h>
 #endif
 
-#if WLR_HAS_X11_BACKEND
-#include <wlr/backend/x11.h>
+#if WLR_HAS_RDP_BACKEND
+#include <wlr/backend/RDP.h>
 #endif
 
+struct wlr_allocator *backend_get_allocator(struct wlr_backend *backend);
+
+
+/* Global display set by compositor (e.g., tinywl.c) */
+static struct wl_display *compositor_display = NULL;
+
+void wlr_backend_set_compositor_display(struct wl_display *display) {
+    compositor_display = display;
+}
 #define WAIT_SESSION_TIMEOUT 10000 // ms
 
 void wlr_backend_init(struct wlr_backend *backend,
@@ -121,6 +131,8 @@ int wlr_backend_get_drm_fd(struct wlr_backend *backend) {
 	return backend->impl->get_drm_fd(backend);
 }
 
+
+
 static size_t parse_outputs_env(const char *name) {
 	const char *outputs_str = getenv(name);
 	if (outputs_str == NULL) {
@@ -198,25 +210,45 @@ static struct wlr_backend *attempt_wl_backend(struct wl_event_loop *loop) {
 	return backend;
 }
 
-static struct wlr_backend *attempt_x11_backend(struct wl_event_loop *loop,
-		const char *x11_display) {
-#if WLR_HAS_X11_BACKEND
-	struct wlr_backend *backend = wlr_x11_backend_create(loop, x11_display);
-	if (backend == NULL) {
-		return NULL;
-	}
 
-	size_t outputs = parse_outputs_env("WLR_X11_OUTPUTS");
-	for (size_t i = 0; i < outputs; ++i) {
-		wlr_x11_output_create(backend);
-	}
+static struct wlr_backend *attempt_RDP_backend(struct wl_display *display) {
+#if WLR_HAS_RDP_BACKEND
+    if (!display) {
+        wlr_log(WLR_ERROR, "No display available for RDP backend");
+        return NULL;
+    }
 
-	return backend;
+    wlr_log(WLR_INFO, "Creating RDP backend");
+
+  
+    
+    // Try different graphics drivers in order of preference
+    const char* preferred_driver = getenv("WLR_RENDERER");
+    if (!preferred_driver) {
+        // First try llvmpipe for software rendering
+        setenv("GALLIUM_DRIVER", "zink", 1);
+       
+    }
+
+    struct wlr_backend *backend = wlr_RDP_backend_create(display);
+    if (!backend) {
+        wlr_log(WLR_ERROR, "Failed to create RDP backend");
+        return NULL;
+    }
+
+    size_t outputs = parse_outputs_env("WLR_RDP_OUTPUTS");
+    if (outputs > 0) {
+        wlr_log(WLR_INFO, "RDP backend will use default output configuration");
+    }
+
+    
+    return backend;
 #else
-	wlr_log(WLR_ERROR, "Cannot create X11 backend: disabled at compile-time");
-	return NULL;
+    wlr_log(WLR_ERROR, "RDP backend not enabled during compilation");
+    return NULL;
 #endif
 }
+
 
 static struct wlr_backend *attempt_headless_backend(struct wl_event_loop *loop) {
 	struct wlr_backend *backend = wlr_headless_backend_create(loop);
@@ -293,8 +325,12 @@ static bool attempt_backend_by_name(struct wl_event_loop *loop,
 	struct wlr_backend *backend = NULL;
 	if (strcmp(name, "wayland") == 0) {
 		backend = attempt_wl_backend(loop);
-	} else if (strcmp(name, "x11") == 0) {
-		backend = attempt_x11_backend(loop, NULL);
+	} else if (strcmp(name, "RDP") == 0) {
+		if (!compositor_display) {
+			wlr_log(WLR_ERROR, "Compositor display not set for RDP backend");
+			return false;
+		}
+		backend = attempt_RDP_backend(compositor_display);
 	} else if (strcmp(name, "headless") == 0) {
 		backend = attempt_headless_backend(loop);
 	} else if (strcmp(name, "drm") == 0 || strcmp(name, "libinput") == 0) {
@@ -378,15 +414,19 @@ struct wlr_backend *wlr_backend_autocreate(struct wl_event_loop *loop,
 		goto success;
 	}
 
-	const char *x11_display = getenv("DISPLAY");
-	if (x11_display) {
-		struct wlr_backend *x11_backend = attempt_x11_backend(loop, x11_display);
-		if (!x11_backend) {
+	const char *RDP_display = getenv("DISPLAY");
+	if (RDP_display) {
+		if (!compositor_display) {
+			wlr_log(WLR_ERROR, "Compositor display not set for RDP backend");
 			goto error;
 		}
-		wlr_multi_backend_add(multi, x11_backend);
+		struct wlr_backend *RDP_backend = attempt_RDP_backend(compositor_display);
+		if (!RDP_backend) {
+			goto error;
+		}
+		wlr_multi_backend_add(multi, RDP_backend);
 
-		if (!auto_backend_monitor_create(multi, x11_backend)) {
+		if (!auto_backend_monitor_create(multi, RDP_backend)) {
 			goto error;
 		}
 

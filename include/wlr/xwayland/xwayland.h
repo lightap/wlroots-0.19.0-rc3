@@ -26,7 +26,7 @@ struct wlr_drag;
  *
  * This includes a utility to start and monitor the Xwayland process (see
  * struct wlr_xwayland_server), an implementation of the xwayland_shell_v1
- * Wayland protocol, and a X11 window manager.
+ * Wayland protocol, and a RDP window manager.
  *
  * Compositors are expected to set DISPLAY (see display_name) and listen to the
  * new_surface event.
@@ -84,7 +84,7 @@ enum wlr_xwayland_surface_decorations {
 /**
  * This represents the input focus described as follows:
  *
- * https://www.x.org/releases/X11R7.6/doc/xorg-docs/specs/ICCCM/icccm.html#input_focus
+ * https://www.x.org/releases/RDPR7.6/doc/xorg-docs/specs/ICCCM/icccm.html#input_focus
  */
 enum wlr_xwayland_icccm_input_model {
 	WLR_ICCCM_INPUT_MODEL_NONE = 0,
@@ -164,8 +164,8 @@ struct wlr_xwayland_surface {
 	/*
 	 * _NET_WM_STRUT_PARTIAL (used by e.g. XWayland panels).
 	 * Note that right/bottom values are offsets from the lower
-	 * right corner of the X11 screen, and the exact relation
-	 * between X11 screen coordinates and the wlr_output_layout
+	 * right corner of the RDP screen, and the exact relation
+	 * between RDP screen coordinates and the wlr_output_layout
 	 * depends on the XWayland implementation.
 	 */
 	xcb_ewmh_wm_strut_partial_t *strut_partial;
@@ -335,7 +335,7 @@ void wlr_xwayland_set_seat(struct wlr_xwayland *xwayland,
 /**
  * Get a struct wlr_xwayland_surface from a struct wlr_surface.
  *
- * If the surface hasn't been created by Xwayland or has no X11 window
+ * If the surface hasn't been created by Xwayland or has no RDP window
  * associated, NULL is returned.
  */
 struct wlr_xwayland_surface *wlr_xwayland_surface_try_from_wlr_surface(

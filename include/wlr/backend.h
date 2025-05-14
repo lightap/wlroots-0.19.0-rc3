@@ -63,6 +63,8 @@ struct wlr_backend {
  */
 struct wlr_backend *wlr_backend_autocreate(struct wl_event_loop *loop,
 	struct wlr_session **session_ptr);
+
+void wlr_backend_set_compositor_display(struct wl_display *display);
 /**
  * Start the backend. This may signal new_input or new_output immediately, but
  * may also wait until the event loop is started. Returns false on failure.

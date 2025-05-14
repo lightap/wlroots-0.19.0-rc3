@@ -14,6 +14,27 @@ static struct wlr_swapchain *create_swapchain(struct wlr_output *output,
 	struct wlr_allocator *allocator = output->allocator;
 	assert(output->allocator != NULL);
 
+	// For RDP (surfaceless) backend, create a default format explicitly
+	if (!(allocator->buffer_caps & WLR_BUFFER_CAP_DMABUF)) {
+		wlr_log(WLR_DEBUG, "Using default format for surfaceless output '%s'", output->name);
+		struct wlr_drm_format *format = calloc(1, sizeof(struct wlr_drm_format) + sizeof(uint64_t));
+		if (!format) {
+			wlr_log(WLR_ERROR, "Failed to allocate format for surfaceless swapchain");
+			return NULL;
+		}
+
+		format->format = DRM_FORMAT_XRGB8888;
+		format->modifiers = (uint64_t *)(format + 1); // Place modifiers after the struct
+		format->modifiers[0] = DRM_FORMAT_MOD_INVALID;
+		format->len = 1;
+		format->capacity = 1;
+
+		struct wlr_swapchain *swapchain = wlr_swapchain_create(allocator, width, height, format);
+		free(format);
+		return swapchain;
+	}
+
+	// Standard path for hardware-accelerated backends
 	const struct wlr_drm_format_set *display_formats =
 		wlr_output_get_primary_formats(output, allocator->buffer_caps);
 	struct wlr_drm_format format = {0};
@@ -83,33 +104,42 @@ bool wlr_output_configure_primary_swapchain(struct wlr_output *output,
 	struct wlr_swapchain *old_swapchain = *swapchain_ptr;
 	if (old_swapchain != NULL &&
 			old_swapchain->width == width && old_swapchain->height == height &&
-			old_swapchain->format.format == format) {
+			old_swapchain->format->format == format) {
 		return true;
 	}
 
+	// Try creating swapchain with modifiers
 	struct wlr_swapchain *swapchain = create_swapchain(output, width, height, format, true);
-	if (swapchain == NULL) {
+	if (swapchain == NULL && (output->allocator->buffer_caps & WLR_BUFFER_CAP_DMABUF)) {
 		wlr_log(WLR_ERROR, "Failed to create swapchain for output '%s'", output->name);
 		return false;
 	}
 
-	wlr_log(WLR_DEBUG, "Testing swapchain for output '%s'", output->name);
-	if (!test_swapchain(output, swapchain, state)) {
-		wlr_log(WLR_DEBUG, "Output test failed on '%s', retrying without modifiers",
-			output->name);
-		wlr_swapchain_destroy(swapchain);
-		swapchain = create_swapchain(output, width, height, format, false);
-		if (swapchain == NULL) {
-			wlr_log(WLR_ERROR, "Failed to create modifier-less swapchain for output '%s'",
-				output->name);
-			return false;
-		}
-		wlr_log(WLR_DEBUG, "Testing modifier-less swapchain for output '%s'", output->name);
+	// For non-RDP backends, test and retry without modifiers if necessary
+	if (swapchain != NULL && (output->allocator->buffer_caps & WLR_BUFFER_CAP_DMABUF)) {
+		wlr_log(WLR_DEBUG, "Testing swapchain for output '%s'", output->name);
 		if (!test_swapchain(output, swapchain, state)) {
-			wlr_log(WLR_ERROR, "Swapchain for output '%s' failed test", output->name);
+			wlr_log(WLR_DEBUG, "Output test failed on '%s', retrying without modifiers",
+				output->name);
 			wlr_swapchain_destroy(swapchain);
-			return false;
+			swapchain = create_swapchain(output, width, height, format, false);
+			if (swapchain == NULL) {
+				wlr_log(WLR_ERROR, "Failed to create modifier-less swapchain for output '%s'",
+					output->name);
+				return false;
+			}
+			wlr_log(WLR_DEBUG, "Testing modifier-less swapchain for output '%s'", output->name);
+			if (!test_swapchain(output, swapchain, state)) {
+				wlr_log(WLR_ERROR, "Swapchain for output '%s' failed test", output->name);
+				wlr_swapchain_destroy(swapchain);
+				return false;
+			}
 		}
+	}
+
+	if (swapchain == NULL) {
+		wlr_log(WLR_ERROR, "Failed to create swapchain for output '%s'", output->name);
+		return false;
 	}
 
 	wlr_swapchain_destroy(*swapchain_ptr);

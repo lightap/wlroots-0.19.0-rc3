@@ -66,24 +66,27 @@ else
 	)
 endif
 
+# Update features based on options
+backends = get_option('backends')
 features = {
-	'drm-backend': false,
-	'x11-backend': false,
-	'libinput-backend': false,
-	'xwayland': false,
-	'gles2-renderer': false,
-	'vulkan-renderer': false,
-	'gbm-allocator': false,
-	'udmabuf-allocator': false,
-	'session': false,
-	'color-management': false,
+	'drm-backend': backends.contains('drm') or backends.contains('auto'),
+	'RDP-backend': backends.contains('RDP'),
+	'libinput-backend': backends.contains('libinput') or backends.contains('auto'),
+	'xwayland': get_option('xwayland').enabled(),
+	'gles2-renderer': get_option('renderers').contains('gles2') or get_option('renderers').contains('auto'),
+	'vulkan-renderer': get_option('renderers').contains('vulkan'),
+	'gbm-allocator': get_option('allocators').contains('gbm') or get_option('allocators').contains('auto'),
+	'udmabuf-allocator': get_option('allocators').contains('udmabuf'),
+	'session': get_option('session').enabled(),
+	'color-management': get_option('color-management').enabled(),
 }
 internal_features = {
-	'xcb-errors': false,
+	'xcb-errors': get_option('xcb-errors').enabled(),
 	'egl': false,
-	'libliftoff': false,
+	'libliftoff': get_option('libliftoff').enabled(),
 }
 internal_config = configuration_data()
+internal_config.set('WLR_HAS_RDP_BACKEND', features['RDP-backend'].to_int())
 
 wayland_kwargs = {
 	'version': '>=1.23.1',
@@ -123,6 +126,10 @@ pixman = dependency('pixman-1',
 math = cc.find_library('m')
 rt = cc.find_library('rt')
 
+# Add FreeRDP and WinPR dependencies for RDP-backend
+freerdp2 = dependency('freerdp2', required: features['RDP-backend'])
+winpr2 = dependency('winpr2', required: features['RDP-backend'])
+
 wlr_files = []
 wlr_deps = [
 	wayland_server,
@@ -132,6 +139,12 @@ wlr_deps = [
 	math,
 	rt,
 ]
+
+# Include RDP backend source if enabled
+if features['RDP-backend']
+	wlr_deps += [freerdp2, winpr2]
+	wlr_files += ['backend/RDP/backend.c']
+endif
 
 subdir('protocol')
 subdir('render')
@@ -143,6 +156,14 @@ subdir('xcursor')
 subdir('xwayland')
 
 subdir('include')
+
+# Generate config.h
+config_h = configure_file(
+	output: 'config.h',
+	configuration: internal_config,
+	install: true,
+	install_dir: '@0@-@1@.@2@/wlr'.format(meson.project_name(), version_major, version_minor)
+)
 
 wlr_inc = include_directories('include')
 
@@ -181,7 +202,7 @@ endif
 pkgconfig = import('pkgconfig')
 pkgconfig.generate(
 	lib_wlr,
-	name: versioned_name,
+	name: 'wlroots',
 	description: 'Wayland compositor library',
 	subdirs: versioned_name,
 	url: 'https://gitlab.freedesktop.org/wlroots/wlroots',

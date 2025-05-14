@@ -96,7 +96,7 @@ static void xwm_notify_ready_for_next_incr_chunk(
 }
 
 /**
- * Write the X11 selection to a Wayland client. Returns a nonzero value if the
+ * Write the RDP selection to a Wayland client. Returns a nonzero value if the
  * Wayland client might become writeable again in the future.
  */
 static int write_selection_property_to_wl_client(int fd, uint32_t mask,
@@ -135,8 +135,8 @@ static int write_selection_property_to_wl_client(int fd, uint32_t mask,
 static void xwm_write_selection_property_to_wl_client(
 		struct wlr_xwm_selection_transfer *transfer) {
 	if (transfer->incr && transfer->wl_client_fd < 0) {
-		// Wayland client closed its pipe prematurely before the X11 client finished
-		// its incremental transfer. Continue draining the X11 client.
+		// Wayland client closed its pipe prematurely before the RDP client finished
+		// its incremental transfer. Continue draining the RDP client.
 		xwm_notify_ready_for_next_incr_chunk(transfer);
 		return;
 	}
@@ -159,7 +159,7 @@ void xwm_get_incr_chunk(struct wlr_xwm_selection_transfer *transfer) {
 	wlr_log(WLR_DEBUG, "xwm_get_incr_chunk");
 
 	if (transfer->property_reply) {
-		wlr_log(WLR_ERROR, "X11 client offered a new property before we deleted");
+		wlr_log(WLR_ERROR, "RDP client offered a new property before we deleted");
 		return;
 	}
 
@@ -213,7 +213,7 @@ static void source_send(struct wlr_xwm_selection *selection,
 		++i;
 	}
 	if (!found) {
-		wlr_log(WLR_DEBUG, "Cannot send X11 selection to Wayland: "
+		wlr_log(WLR_DEBUG, "Cannot send RDP selection to Wayland: "
 			"unsupported MIME type");
 		close(fd);
 		return;
@@ -240,7 +240,7 @@ static void source_send(struct wlr_xwm_selection *selection,
 	transfer->wl_client_fd = fd;
 }
 
-struct x11_data_source {
+struct RDP_data_source {
 	struct wlr_data_source base;
 	struct wlr_xwm_selection *selection;
 	struct wl_array mime_types_atoms;
@@ -253,16 +253,16 @@ bool data_source_is_xwayland(
 	return wlr_source->impl == &data_source_impl;
 }
 
-static struct x11_data_source *data_source_from_wlr_data_source(
+static struct RDP_data_source *data_source_from_wlr_data_source(
 		struct wlr_data_source *wlr_source) {
 	assert(data_source_is_xwayland(wlr_source));
-	struct x11_data_source *source = wl_container_of(wlr_source, source, base);
+	struct RDP_data_source *source = wl_container_of(wlr_source, source, base);
 	return source;
 }
 
 static void data_source_send(struct wlr_data_source *wlr_source,
 		const char *mime_type, int32_t fd) {
-	struct x11_data_source *source =
+	struct RDP_data_source *source =
 		data_source_from_wlr_data_source(wlr_source);
 	struct wlr_xwm_selection *selection = source->selection;
 
@@ -271,7 +271,7 @@ static void data_source_send(struct wlr_data_source *wlr_source,
 }
 
 static void data_source_destroy(struct wlr_data_source *wlr_source) {
-	struct x11_data_source *source =
+	struct RDP_data_source *source =
 		data_source_from_wlr_data_source(wlr_source);
 	wl_array_release(&source->mime_types_atoms);
 	free(source);
@@ -282,7 +282,7 @@ static const struct wlr_data_source_impl data_source_impl = {
 	.destroy = data_source_destroy,
 };
 
-struct x11_primary_selection_source {
+struct RDP_primary_selection_source {
 	struct wlr_primary_selection_source base;
 	struct wlr_xwm_selection *selection;
 	struct wl_array mime_types_atoms;
@@ -299,7 +299,7 @@ bool primary_selection_source_is_xwayland(
 static void primary_selection_source_send(
 		struct wlr_primary_selection_source *wlr_source,
 		const char *mime_type, int fd) {
-	struct x11_primary_selection_source *source = wl_container_of(wlr_source, source, base);
+	struct RDP_primary_selection_source *source = wl_container_of(wlr_source, source, base);
 	struct wlr_xwm_selection *selection = source->selection;
 
 	source_send(selection, &wlr_source->mime_types, &source->mime_types_atoms,
@@ -308,7 +308,7 @@ static void primary_selection_source_send(
 
 static void primary_selection_source_destroy(
 		struct wlr_primary_selection_source *wlr_source) {
-	struct x11_primary_selection_source *source = wl_container_of(wlr_source, source, base);
+	struct RDP_primary_selection_source *source = wl_container_of(wlr_source, source, base);
 	wl_array_release(&source->mime_types_atoms);
 	free(source);
 }
@@ -397,11 +397,11 @@ static bool source_get_targets(struct wlr_xwm_selection *selection,
 }
 
 static void xwm_selection_get_targets(struct wlr_xwm_selection *selection) {
-	// set the wayland selection to the X11 selection
+	// set the wayland selection to the RDP selection
 	struct wlr_xwm *xwm = selection->xwm;
 
 	if (selection == &xwm->clipboard_selection) {
-		struct x11_data_source *source = calloc(1, sizeof(*source));
+		struct RDP_data_source *source = calloc(1, sizeof(*source));
 		if (source == NULL) {
 			return;
 		}
@@ -419,7 +419,7 @@ static void xwm_selection_get_targets(struct wlr_xwm_selection *selection) {
 			wlr_data_source_destroy(&source->base);
 		}
 	} else if (selection == &xwm->primary_selection) {
-		struct x11_primary_selection_source *source = calloc(1, sizeof(*source));
+		struct RDP_primary_selection_source *source = calloc(1, sizeof(*source));
 		if (source == NULL) {
 			return;
 		}
@@ -500,7 +500,7 @@ int xwm_handle_xfixes_selection_notify(struct wlr_xwm *xwm,
 			} else if (selection == &xwm->dnd_selection) {
 				// TODO: DND
 			} else {
-				wlr_log(WLR_DEBUG, "X11 selection has been cleared, but cannot "
+				wlr_log(WLR_DEBUG, "RDP selection has been cleared, but cannot "
 					"clear Wayland selection");
 			}
 		}

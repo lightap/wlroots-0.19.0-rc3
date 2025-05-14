@@ -15,9 +15,44 @@
 #include "types/wlr_subcompositor.h"
 #include "util/array.h"
 #include "util/time.h"
+#include <freerdp/freerdp.h> // For RDP backend
+#include <freerdp/freerdp.h>
+#include <freerdp/version.h>
+
+#include <freerdp/freerdp.h>
+#include <freerdp/listener.h>
+#include <freerdp/update.h>
+#include <freerdp/input.h>
+#include <freerdp/codec/color.h>
+#include <freerdp/codec/rfx.h>
+#include <freerdp/codec/nsc.h>
+#include <freerdp/locale/keyboard.h>
+#include <wlr/backend/RDP.h>
 
 #define COMPOSITOR_VERSION 6
 #define CALLBACK_VERSION 1
+#define RDP_PEER_OUTPUT_ENABLED (1 << 0)
+
+// RDP backend structures (from 0.16.2)
+struct rdp_peers_item {
+	freerdp_peer *peer;
+	uint32_t flags;
+	struct wlr_compositor *compositor;
+	struct wl_list link;
+};
+
+struct rdp_peer_context {
+	freerdp_peer *peer;
+	struct wlr_compositor *compositor;
+	struct wlr_output *current_output;
+	bool frame_ack_pending;
+};
+freerdp_peer *get_global_rdp_peer(void);
+// Function declarations (assumed implemented in backend/rdp/backend.c)
+static void surface_update_opaque_region(struct wlr_surface *surface);
+static void surface_update_input_region(struct wlr_surface *surface);
+;
+void rdp_transmit_surface(struct wlr_buffer *buffer);
 
 static int min(int fst, int snd) {
 	if (fst < snd) {
@@ -405,44 +440,128 @@ static void surface_state_move(struct wlr_surface_state *state,
 }
 
 static void surface_apply_damage(struct wlr_surface *surface) {
-	if (surface->current.buffer == NULL) {
-		// NULL commit
-		if (surface->buffer != NULL) {
-			wlr_buffer_unlock(&surface->buffer->base);
-		}
-		surface->buffer = NULL;
-		surface->opaque = false;
-		return;
-	}
+    if (surface->current.buffer == NULL) {
+        if (surface->buffer != NULL) {
+            wlr_buffer_unlock(&surface->buffer->base);
+        }
+        surface->buffer = NULL;
+        surface->opaque = false;
+        return;
+    }
 
-	surface->opaque = wlr_buffer_is_opaque(surface->current.buffer);
+    surface->opaque = wlr_buffer_is_opaque(surface->current.buffer);
 
-	if (surface->buffer != NULL) {
-		if (wlr_client_buffer_apply_damage(surface->buffer,
-				surface->current.buffer, &surface->buffer_damage)) {
-			wlr_buffer_unlock(surface->current.buffer);
-			surface->current.buffer = NULL;
-			return;
-		}
-	}
+    if (surface->buffer != NULL) {
+        if (wlr_client_buffer_apply_damage(surface->buffer,
+                surface->current.buffer, &surface->buffer_damage)) {
+            wlr_buffer_unlock(surface->current.buffer);
+            surface->current.buffer = NULL;
+            return;
+        }
+    }
 
-	if (surface->compositor->renderer == NULL) {
-		return;
-	}
+    if (surface->compositor->renderer == NULL) {
+        return;
+    }
 
-	struct wlr_client_buffer *buffer = wlr_client_buffer_create(
-			surface->current.buffer, surface->compositor->renderer);
+    struct wlr_client_buffer *buffer = wlr_client_buffer_create(
+            surface->current.buffer, surface->compositor->renderer);
 
-	if (buffer == NULL) {
-		wlr_log(WLR_ERROR, "Failed to upload buffer");
-		return;
-	}
+    if (buffer == NULL) {
+        wlr_log(WLR_ERROR, "Failed to upload buffer");
+        return;
+    }
 
-	if (surface->buffer != NULL) {
-		wlr_buffer_unlock(&surface->buffer->base);
-	}
-	surface->buffer = buffer;
+    // RDP backend integration (from 0.16.2)
+    freerdp_peer *current_peer = get_global_rdp_peer();
+    if (current_peer && surface->current.buffer != NULL) {
+        struct rdp_peer_context *peer_ctx = (struct rdp_peer_context *)current_peer->context;
+        if (peer_ctx->compositor == surface->compositor && peer_ctx->current_output != NULL) {
+            rdp_transmit_surface(surface->current.buffer);
+            if (!peer_ctx->frame_ack_pending) {
+                peer_ctx->frame_ack_pending = true;
+                wlr_output_send_frame(peer_ctx->current_output);
+            }
+        }
+    }
+
+    if (surface->buffer != NULL) {
+        wlr_buffer_unlock(&surface->buffer->base);
+    }
+    surface->buffer = buffer;
 }
+
+static void surface_commit_state(struct wlr_surface *surface,
+        struct wlr_surface_state *next) {
+    assert(next->cached_state_locks == 0);
+
+    bool invalid_buffer = next->committed & WLR_SURFACE_STATE_BUFFER;
+
+    if (invalid_buffer && next->buffer == NULL) {
+        surface->unmap_commit = surface->mapped;
+        wlr_surface_unmap(surface);
+    } else {
+        surface->unmap_commit = false;
+    }
+
+    surface_update_damage(&surface->buffer_damage, &surface->current, next);
+
+    // RDP backend integration (from 0.16.2)
+    if (next->buffer != NULL) {
+        freerdp_peer *current_peer = get_global_rdp_peer();
+        if (current_peer) {
+            struct rdp_peer_context *peer_ctx = (struct rdp_peer_context *)current_peer->context;
+            if (peer_ctx->compositor == surface->compositor) {
+                rdp_transmit_surface(next->buffer);
+            }
+        }
+    }
+
+    surface->previous.scale = surface->current.scale;
+    surface->previous.transform = surface->current.transform;
+    surface->previous.width = surface->current.width;
+    surface->previous.height = surface->current.height;
+    surface->previous.buffer_width = surface->current.buffer_width;
+    surface->previous.buffer_height = surface->current.buffer_height;
+
+    surface_state_move(&surface->current, next, surface);
+
+    if (invalid_buffer) {
+        surface_apply_damage(surface);
+    }
+    surface_update_opaque_region(surface);
+    surface_update_input_region(surface);
+
+    struct wlr_subsurface *subsurface;
+    wl_list_for_each(subsurface, &surface->current.subsurfaces_below, current.link) {
+        subsurface_handle_parent_commit(subsurface);
+    }
+    wl_list_for_each(subsurface, &surface->current.subsurfaces_above, current.link) {
+        subsurface_handle_parent_commit(subsurface);
+    }
+
+    if (next == &surface->pending) {
+        surface->pending.seq++;
+    }
+
+    struct wlr_surface_synced *synced;
+    wl_list_for_each(synced, &surface->synced, link) {
+        if (synced->impl->commit) {
+            synced->impl->commit(synced);
+        }
+    }
+
+    if (surface->role != NULL && surface->role->commit != NULL &&
+            (surface->role_resource != NULL || surface->role->no_object)) {
+        surface->role->commit(surface);
+    }
+
+    wl_signal_emit_mutable(&surface->events.commit, surface);
+
+    wlr_buffer_unlock(surface->current.buffer);
+    surface->current.buffer = NULL;
+}
+
 
 static void surface_update_opaque_region(struct wlr_surface *surface) {
 	if (!wlr_surface_has_buffer(surface)) {
@@ -508,70 +627,7 @@ error:
 	wl_resource_post_no_memory(surface->resource);
 }
 
-static void surface_commit_state(struct wlr_surface *surface,
-		struct wlr_surface_state *next) {
-	assert(next->cached_state_locks == 0);
 
-	bool invalid_buffer = next->committed & WLR_SURFACE_STATE_BUFFER;
-
-	if (invalid_buffer && next->buffer == NULL) {
-		surface->unmap_commit = surface->mapped;
-		wlr_surface_unmap(surface);
-	} else {
-		surface->unmap_commit = false;
-	}
-
-	surface_update_damage(&surface->buffer_damage, &surface->current, next);
-
-	surface->previous.scale = surface->current.scale;
-	surface->previous.transform = surface->current.transform;
-	surface->previous.width = surface->current.width;
-	surface->previous.height = surface->current.height;
-	surface->previous.buffer_width = surface->current.buffer_width;
-	surface->previous.buffer_height = surface->current.buffer_height;
-
-	surface_state_move(&surface->current, next, surface);
-
-	if (invalid_buffer) {
-		surface_apply_damage(surface);
-	}
-	surface_update_opaque_region(surface);
-	surface_update_input_region(surface);
-
-	struct wlr_subsurface *subsurface;
-	wl_list_for_each(subsurface, &surface->current.subsurfaces_below, current.link) {
-		subsurface_handle_parent_commit(subsurface);
-	}
-	wl_list_for_each(subsurface, &surface->current.subsurfaces_above, current.link) {
-		subsurface_handle_parent_commit(subsurface);
-	}
-
-	// If we're committing the pending state, bump the pending sequence number
-	// here, to allow commit listeners to lock the new pending state.
-	if (next == &surface->pending) {
-		surface->pending.seq++;
-	}
-
-	struct wlr_surface_synced *synced;
-	wl_list_for_each(synced, &surface->synced, link) {
-		if (synced->impl->commit) {
-			synced->impl->commit(synced);
-		}
-	}
-
-	if (surface->role != NULL && surface->role->commit != NULL &&
-			(surface->role_resource != NULL || surface->role->no_object)) {
-		surface->role->commit(surface);
-	}
-
-	wl_signal_emit_mutable(&surface->events.commit, surface);
-
-	// Release the buffer after emitting the commit event, so that listeners can
-	// access it. Don't leave the buffer locked so that wl_shm buffers can be
-	// released immediately on commit when they are uploaded to the GPU.
-	wlr_buffer_unlock(surface->current.buffer);
-	surface->current.buffer = NULL;
-}
 
 static void surface_handle_commit(struct wl_client *client,
 		struct wl_resource *resource) {

@@ -1,7 +1,4 @@
-/*
- * This an unstable interface of wlroots. No guarantees are made regarding the
- * future consistency of this API.
- */
+
 #ifndef WLR_USE_UNSTABLE
 #error "Add -DWLR_USE_UNSTABLE to enable unstable wlroots features"
 #endif
@@ -9,8 +6,8 @@
 #ifndef WLR_RENDER_EGL_H
 #define WLR_RENDER_EGL_H
 
-#ifndef EGL_NO_X11
-#define EGL_NO_X11
+#ifndef EGL_NO_RDP
+#define EGL_NO_RDP
 #endif
 #ifndef EGL_NO_PLATFORM_SPECIFIC_TYPES
 #define EGL_NO_PLATFORM_SPECIFIC_TYPES
@@ -52,5 +49,13 @@ EGLDisplay wlr_egl_get_display(struct wlr_egl *egl);
  * operations.
  */
 EGLContext wlr_egl_get_context(struct wlr_egl *egl);
+
+
+/**
+ * Create a struct wlr_egl for a surfaceless renderer.
+ *
+ * This is used for GPU-accelerated rendering without a display device, e.g., with FreeRDP.
+ */
+struct wlr_egl *wlr_egl_create_surfaceless(void);
 
 #endif

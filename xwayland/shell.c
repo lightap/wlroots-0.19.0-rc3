@@ -82,7 +82,7 @@ static void xwl_surface_handle_set_serial(struct wl_client *client,
 	if (xwl_surface->serial != 0) {
 		wl_resource_post_error(resource,
 			XWAYLAND_SURFACE_V1_ERROR_ALREADY_ASSOCIATED,
-			"xwayland_surface_v1 is already associated with another X11 serial");
+			"xwayland_surface_v1 is already associated with another RDP serial");
 		return;
 	}
 

@@ -1088,7 +1088,7 @@ static void read_surface_property(struct wlr_xwm *xwm,
 		read_surface_opacity(xwm, xsurface, reply);
 	} else if (wlr_log_get_verbosity() >= WLR_DEBUG) {
 		char *prop_name = xwm_get_atom_name(xwm, property);
-		wlr_log(WLR_DEBUG, "unhandled X11 property %" PRIu32 " (%s) for window %" PRIu32,
+		wlr_log(WLR_DEBUG, "unhandled RDP property %" PRIu32 " (%s) for window %" PRIu32,
 			property, prop_name ? prop_name : "(null)", xsurface->window_id);
 		free(prop_name);
 	}
@@ -1301,7 +1301,7 @@ void wlr_xwayland_surface_restack(struct wlr_xwayland_surface *xsurface,
 
 	assert(!xsurface->override_redirect);
 
-	// X11 clients expect their override_redirect windows to stay on top.
+	// RDP clients expect their override_redirect windows to stay on top.
 	// Avoid interfering by restacking above the topmost managed surface.
 	if (mode == XCB_STACK_MODE_ABOVE && !sibling) {
 		sibling = wl_container_of(xwm->surfaces_in_stack_order.prev, sibling, stack_link);
@@ -1429,13 +1429,13 @@ static void xwm_handle_surface_serial_message(struct wlr_xwm *xwm,
 	struct wlr_xwayland_surface *xsurface = lookup_surface(xwm, ev->window);
 	if (xsurface == NULL) {
 		wlr_log(WLR_DEBUG,
-			"Received client message WL_SURFACE_SERIAL but no X11 window %u",
+			"Received client message WL_SURFACE_SERIAL but no RDP window %u",
 			ev->window);
 		return;
 	}
 	if (xsurface->serial != 0) {
 		wlr_log(WLR_DEBUG, "Received multiple client messages WL_SURFACE_SERIAL "
-			"for the same X11 window %u", ev->window);
+			"for the same RDP window %u", ev->window);
 		return;
 	}
 
@@ -1821,7 +1821,7 @@ static void xwm_handle_client_message(struct wlr_xwm *xwm,
 	} else if (!xwm_handle_selection_client_message(xwm, ev) &&
 			wlr_log_get_verbosity() >= WLR_DEBUG) {
 		char *type_name = xwm_get_atom_name(xwm, ev->type);
-		wlr_log(WLR_DEBUG, "unhandled x11 client message %" PRIu32 " (%s)", ev->type,
+		wlr_log(WLR_DEBUG, "unhandled RDP client message %" PRIu32 " (%s)", ev->type,
 			type_name ? type_name : "(null)");
 		free(type_name);
 	}
@@ -1845,7 +1845,7 @@ static void xwm_handle_focus_in(struct wlr_xwm *xwm,
 	}
 
 	// Do not interfere with keyboard grabs, but notify the
-	// compositor. Note that many legitimate X11 applications use
+	// compositor. Note that many legitimate RDP applications use
 	// keyboard grabs to "steal" focus for e.g. popup menus.
 	struct wlr_xwayland_surface *xsurface = lookup_surface(xwm, ev->event);
 	if (ev->mode == XCB_NOTIFY_MODE_GRAB) {
@@ -1930,13 +1930,13 @@ static void xwm_handle_unhandled_event(struct wlr_xwm *xwm, xcb_generic_event_t 
 		return;
 	}
 
-	wlr_log(WLR_DEBUG, "unhandled X11 event: %s (%u)", event_name, ev->response_type);
+	wlr_log(WLR_DEBUG, "unhandled RDP event: %s (%u)", event_name, ev->response_type);
 #else
-	wlr_log(WLR_DEBUG, "unhandled X11 event: %u", ev->response_type);
+	wlr_log(WLR_DEBUG, "unhandled RDP event: %u", ev->response_type);
 #endif
 }
 
-static int read_x11_events(struct wlr_xwm *xwm) {
+static int read_RDP_events(struct wlr_xwm *xwm) {
 	int count = 0;
 
 	xcb_generic_event_t *event;
@@ -2001,7 +2001,7 @@ static int read_x11_events(struct wlr_xwm *xwm) {
 	return count;
 }
 
-static int x11_event_handler(int fd, uint32_t mask, void *data) {
+static int RDP_event_handler(int fd, uint32_t mask, void *data) {
 	struct wlr_xwm *xwm = data;
 
 	if ((mask & WL_EVENT_HANGUP) || (mask & WL_EVENT_ERROR)) {
@@ -2011,7 +2011,7 @@ static int x11_event_handler(int fd, uint32_t mask, void *data) {
 
 	int count = 0;
 	if (mask & WL_EVENT_READABLE) {
-		count = read_x11_events(xwm);
+		count = read_RDP_events(xwm);
 		if (count) {
 			xwm_schedule_flush(xwm);
 		}
@@ -2248,7 +2248,7 @@ static void xwm_get_resources(struct wlr_xwm *xwm) {
 		free(reply);
 
 		if (error) {
-			wlr_log(WLR_ERROR, "could not resolve atom %s, x11 error code %d",
+			wlr_log(WLR_ERROR, "could not resolve atom %s, RDP error code %d",
 				atom_map[i], error->error_code);
 			free(error);
 			return;
@@ -2494,7 +2494,7 @@ struct wlr_xwm *xwm_create(struct wlr_xwayland *xwayland, int wm_fd) {
 	struct wl_event_loop *event_loop =
 		wl_display_get_event_loop(xwayland->wl_display);
 	xwm->event_source = wl_event_loop_add_fd(event_loop, wm_fd,
-		WL_EVENT_READABLE, x11_event_handler, xwm);
+		WL_EVENT_READABLE, RDP_event_handler, xwm);
 	wl_event_source_check(xwm->event_source);
 
 	xwm_get_resources(xwm);

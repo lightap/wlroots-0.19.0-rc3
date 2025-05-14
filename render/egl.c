@@ -12,6 +12,22 @@
 #include "render/egl.h"
 #include "util/env.h"
 
+#define _POSIX_C_SOURCE 200809L
+#include <assert.h>
+#include <drm_fourcc.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <gbm.h>
+#include <wlr/render/egl.h>
+#include <wlr/util/log.h>
+#include <wlr/util/region.h>
+#include <xf86drm.h>
+#include "util/env.h"
+
+static void init_dmabuf_formats(struct wlr_egl *egl);
+
 static enum wlr_log_importance egl_log_importance_to_wlr(EGLint type) {
 	switch (type) {
 	case EGL_DEBUG_MSG_CRITICAL_KHR: return WLR_ERROR;
@@ -24,40 +40,24 @@ static enum wlr_log_importance egl_log_importance_to_wlr(EGLint type) {
 
 static const char *egl_error_str(EGLint error) {
 	switch (error) {
-	case EGL_SUCCESS:
-		return "EGL_SUCCESS";
-	case EGL_NOT_INITIALIZED:
-		return "EGL_NOT_INITIALIZED";
-	case EGL_BAD_ACCESS:
-		return "EGL_BAD_ACCESS";
-	case EGL_BAD_ALLOC:
-		return "EGL_BAD_ALLOC";
-	case EGL_BAD_ATTRIBUTE:
-		return "EGL_BAD_ATTRIBUTE";
-	case EGL_BAD_CONTEXT:
-		return "EGL_BAD_CONTEXT";
-	case EGL_BAD_CONFIG:
-		return "EGL_BAD_CONFIG";
-	case EGL_BAD_CURRENT_SURFACE:
-		return "EGL_BAD_CURRENT_SURFACE";
-	case EGL_BAD_DISPLAY:
-		return "EGL_BAD_DISPLAY";
-	case EGL_BAD_DEVICE_EXT:
-		return "EGL_BAD_DEVICE_EXT";
-	case EGL_BAD_SURFACE:
-		return "EGL_BAD_SURFACE";
-	case EGL_BAD_MATCH:
-		return "EGL_BAD_MATCH";
-	case EGL_BAD_PARAMETER:
-		return "EGL_BAD_PARAMETER";
-	case EGL_BAD_NATIVE_PIXMAP:
-		return "EGL_BAD_NATIVE_PIXMAP";
-	case EGL_BAD_NATIVE_WINDOW:
-		return "EGL_BAD_NATIVE_WINDOW";
-	case EGL_CONTEXT_LOST:
-		return "EGL_CONTEXT_LOST";
+	case EGL_SUCCESS: return "EGL_SUCCESS";
+	case EGL_NOT_INITIALIZED: return "EGL_NOT_INITIALIZED";
+	case EGL_BAD_ACCESS: return "EGL_BAD_ACCESS";
+	case EGL_BAD_ALLOC: return "EGL_BAD_ALLOC";
+	case EGL_BAD_ATTRIBUTE: return "EGL_BAD_ATTRIBUTE";
+	case EGL_BAD_CONTEXT: return "EGL_BAD_CONTEXT";
+	case EGL_BAD_CONFIG: return "EGL_BAD_CONFIG";
+	case EGL_BAD_CURRENT_SURFACE: return "EGL_BAD_CURRENT_SURFACE";
+	case EGL_BAD_DISPLAY: return "EGL_BAD_DISPLAY";
+	case EGL_BAD_DEVICE_EXT: return "EGL_BAD_DEVICE_EXT";
+	case EGL_BAD_SURFACE: return "EGL_BAD_SURFACE";
+	case EGL_BAD_MATCH: return "EGL_BAD_MATCH";
+	case EGL_BAD_PARAMETER: return "EGL_BAD_PARAMETER";
+	case EGL_BAD_NATIVE_PIXMAP: return "EGL_BAD_NATIVE_PIXMAP";
+	case EGL_BAD_NATIVE_WINDOW: return "EGL_BAD_NATIVE_WINDOW";
+	case EGL_CONTEXT_LOST: return "EGL_CONTEXT_LOST";
+	default: return "unknown error";
 	}
-	return "unknown error";
 }
 
 static void egl_log(EGLenum error, const char *command, EGLint msg_type,
@@ -93,6 +93,212 @@ static void load_egl_proc(void *proc_ptr, const char *name) {
 	}
 	*(void **)proc_ptr = proc;
 }
+
+static struct wlr_egl *egl_create(void) {
+	const char *client_exts_str = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
+	if (client_exts_str == NULL) {
+		wlr_log(WLR_ERROR, "Failed to query EGL client extensions: %s", egl_error_str(eglGetError()));
+		return NULL;
+	}
+
+	wlr_log(WLR_INFO, "Supported EGL client extensions: %s", client_exts_str);
+	if (!check_egl_ext(client_exts_str, "EGL_EXT_platform_base")) {
+		wlr_log(WLR_ERROR, "EGL_EXT_platform_base not supported");
+		return NULL;
+	}
+
+	struct wlr_egl *egl = calloc(1, sizeof(struct wlr_egl));
+	if (egl == NULL) {
+		wlr_log_errno(WLR_ERROR, "Allocation failed");
+		return NULL;
+	}
+
+	if (check_egl_ext(client_exts_str, "EGL_KHR_debug")) {
+		PFNEGLDEBUGMESSAGECONTROLKHRPROC eglDebugMessageControlKHR;
+		load_egl_proc(&eglDebugMessageControlKHR, "eglDebugMessageControlKHR");
+		static const EGLAttrib debug_attribs[] = {
+			EGL_DEBUG_MSG_CRITICAL_KHR, EGL_TRUE,
+			EGL_DEBUG_MSG_ERROR_KHR, EGL_TRUE,
+			EGL_DEBUG_MSG_WARN_KHR, EGL_TRUE,
+			EGL_DEBUG_MSG_INFO_KHR, EGL_TRUE,
+			EGL_NONE,
+		};
+		eglDebugMessageControlKHR(egl_log, debug_attribs);
+	}
+
+	if (eglBindAPI(EGL_OPENGL_ES_API) == EGL_FALSE) {
+		wlr_log(WLR_ERROR, "Failed to bind to the OpenGL ES API");
+		free(egl);
+		return NULL;
+	}
+
+	return egl;
+}
+
+static bool egl_init_display(struct wlr_egl *egl, EGLDisplay display) {
+	egl->display = display;
+
+	EGLint major, minor;
+	if (eglInitialize(egl->display, &major, &minor) == EGL_FALSE) {
+		wlr_log(WLR_ERROR, "Failed to initialize EGL: %s", egl_error_str(eglGetError()));
+		return false;
+	}
+
+	const char *display_exts_str = eglQueryString(egl->display, EGL_EXTENSIONS);
+	if (display_exts_str == NULL) {
+		wlr_log(WLR_ERROR, "Failed to query EGL display extensions: %s", egl_error_str(eglGetError()));
+		return false;
+	}
+
+	bool KHR_surfaceless_context = check_egl_ext(display_exts_str, "EGL_KHR_surfaceless_context");
+	if (!KHR_surfaceless_context) {
+		wlr_log(WLR_ERROR, "EGL_KHR_surfaceless_context not supported");
+		return false;
+	}
+
+	bool KHR_no_config_context = check_egl_ext(display_exts_str, "EGL_KHR_no_config_context") ||
+	                             check_egl_ext(display_exts_str, "EGL_MESA_configless_context");
+	if (!KHR_no_config_context) {
+		wlr_log(WLR_ERROR, "EGL_KHR_no_config_context or EGL_MESA_configless_context not supported");
+		return false;
+	}
+
+	wlr_log(WLR_INFO, "Using EGL %d.%d", (int)major, (int)minor);
+	wlr_log(WLR_INFO, "Supported EGL display extensions: %s", display_exts_str);
+	wlr_log(WLR_INFO, "EGL vendor: %s", eglQueryString(egl->display, EGL_VENDOR));
+
+
+	init_dmabuf_formats(egl);
+	return true;
+}
+
+static bool egl_init(struct wlr_egl *egl, EGLenum platform, void *remote_display) {
+	PFNEGLGETPLATFORMDISPLAYEXTPROC eglGetPlatformDisplayEXT;
+	load_egl_proc(&eglGetPlatformDisplayEXT, "eglGetPlatformDisplayEXT");
+
+	EGLDisplay display = eglGetPlatformDisplayEXT(platform, remote_display, NULL);
+	if (display == EGL_NO_DISPLAY) {
+		wlr_log(WLR_ERROR, "Failed to create EGL display for platform %d: %s",
+			platform, egl_error_str(eglGetError()));
+		return false;
+	}
+
+	if (!egl_init_display(egl, display)) {
+		eglTerminate(display);
+		return false;
+	}
+
+	EGLint attribs[] = {
+		EGL_CONTEXT_CLIENT_VERSION, 2,
+		EGL_NONE
+	};
+
+	egl->context = eglCreateContext(egl->display, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, attribs);
+	if (egl->context == EGL_NO_CONTEXT) {
+		wlr_log(WLR_ERROR, "Failed to create EGL context: %s", egl_error_str(eglGetError()));
+		eglTerminate(display);
+		return false;
+	}
+
+	return true;
+}
+
+struct wlr_egl *wlr_egl_create_surfaceless(void) {
+	const char *client_exts_str = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
+	if (!check_egl_ext(client_exts_str, "EGL_MESA_platform_surfaceless")) {
+		wlr_log(WLR_ERROR, "EGL_MESA_platform_surfaceless not supported");
+		return NULL;
+	}
+
+	struct wlr_egl *egl = egl_create();
+	if (egl == NULL) {
+		wlr_log(WLR_ERROR, "Failed to create EGL context");
+		return NULL;
+	}
+
+	if (egl_init(egl, EGL_PLATFORM_SURFACELESS_MESA, NULL)) {
+		wlr_log(WLR_DEBUG, "Using EGL_PLATFORM_SURFACELESS_MESA");
+		return egl;
+	}
+	wlr_log(WLR_ERROR, "Failed to initialize surfaceless EGL context: %s", egl_error_str(eglGetError()));
+
+	/* Placeholder for FreeRDP-provided EGL display */
+	/* TODO: Integrate FreeRDP's EGL display */
+	/* Example:
+	EGLDisplay freerdp_display = freerdp_get_egl_display(); // Replace with actual FreeRDP function
+	if (freerdp_display != EGL_NO_DISPLAY) {
+		if (egl_init_display(egl, freerdp_display)) {
+			EGLint attribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+			egl->context = eglCreateContext(freerdp_display, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, attribs);
+			if (egl->context != EGL_NO_CONTEXT) {
+				wlr_log(WLR_DEBUG, "Using FreeRDP-provided EGL display");
+				return egl;
+			}
+		}
+	}
+	*/
+
+	wlr_log(WLR_ERROR, "FreeRDP EGL display not available");
+	eglTerminate(egl->display);
+	free(egl);
+	return NULL;
+}
+
+struct wlr_egl *wlr_egl_create_with_context(EGLDisplay display, EGLContext context) {
+	EGLint client_type;
+	if (!eglQueryContext(display, context, EGL_CONTEXT_CLIENT_TYPE, &client_type) ||
+			client_type != EGL_OPENGL_ES_API) {
+		wlr_log(WLR_ERROR, "Unsupported EGL context client type (need OpenGL ES)");
+		return NULL;
+	}
+
+	EGLint client_version;
+	if (!eglQueryContext(display, context, EGL_CONTEXT_CLIENT_VERSION, &client_version) ||
+			client_version < 2) {
+		wlr_log(WLR_ERROR, "Unsupported EGL context client version (need OpenGL ES >= 2)");
+		return NULL;
+	}
+
+	struct wlr_egl *egl = egl_create();
+	if (egl == NULL) {
+		return NULL;
+	}
+
+	if (!egl_init_display(egl, display)) {
+		free(egl);
+		return NULL;
+	}
+
+	egl->context = context;
+	return egl;
+}
+
+void wlr_egl_destroy(struct wlr_egl *egl) {
+	if (egl == NULL) {
+		return;
+	}
+
+	eglMakeCurrent(egl->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+	eglDestroyContext(egl->display, egl->context);
+	eglTerminate(egl->display);
+	eglReleaseThread();
+
+	free(egl);
+}
+
+EGLDisplay wlr_egl_get_display(struct wlr_egl *egl) {
+	return egl->display;
+}
+
+EGLContext wlr_egl_get_context(struct wlr_egl *egl) {
+	return egl->context;
+}
+
+
+
+
+
+
 
 static int get_egl_dmabuf_formats(struct wlr_egl *egl, EGLint **formats);
 static int get_egl_dmabuf_modifiers(struct wlr_egl *egl, EGLint format,
@@ -191,267 +397,10 @@ static void init_dmabuf_formats(struct wlr_egl *egl) {
 	}
 }
 
-static struct wlr_egl *egl_create(void) {
-	const char *client_exts_str = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
-	if (client_exts_str == NULL) {
-		if (eglGetError() == EGL_BAD_DISPLAY) {
-			wlr_log(WLR_ERROR, "EGL_EXT_client_extensions not supported");
-		} else {
-			wlr_log(WLR_ERROR, "Failed to query EGL client extensions");
-		}
-		return NULL;
-	}
 
-	wlr_log(WLR_INFO, "Supported EGL client extensions: %s", client_exts_str);
 
-	if (!check_egl_ext(client_exts_str, "EGL_EXT_platform_base")) {
-		wlr_log(WLR_ERROR, "EGL_EXT_platform_base not supported");
-		return NULL;
-	}
 
-	struct wlr_egl *egl = calloc(1, sizeof(*egl));
-	if (egl == NULL) {
-		wlr_log_errno(WLR_ERROR, "Allocation failed");
-		return NULL;
-	}
 
-	load_egl_proc(&egl->procs.eglGetPlatformDisplayEXT,
-		"eglGetPlatformDisplayEXT");
-
-	egl->exts.KHR_platform_gbm = check_egl_ext(client_exts_str,
-			"EGL_KHR_platform_gbm");
-	egl->exts.EXT_platform_device = check_egl_ext(client_exts_str,
-			"EGL_EXT_platform_device");
-	egl->exts.KHR_display_reference = check_egl_ext(client_exts_str,
-			"EGL_KHR_display_reference");
-
-	if (check_egl_ext(client_exts_str, "EGL_EXT_device_base") || check_egl_ext(client_exts_str, "EGL_EXT_device_enumeration")) {
-		load_egl_proc(&egl->procs.eglQueryDevicesEXT, "eglQueryDevicesEXT");
-	}
-
-	if (check_egl_ext(client_exts_str, "EGL_EXT_device_base") || check_egl_ext(client_exts_str, "EGL_EXT_device_query")) {
-		egl->exts.EXT_device_query = true;
-		load_egl_proc(&egl->procs.eglQueryDeviceStringEXT,
-			"eglQueryDeviceStringEXT");
-		load_egl_proc(&egl->procs.eglQueryDisplayAttribEXT,
-			"eglQueryDisplayAttribEXT");
-	}
-
-	if (check_egl_ext(client_exts_str, "EGL_KHR_debug")) {
-		load_egl_proc(&egl->procs.eglDebugMessageControlKHR,
-			"eglDebugMessageControlKHR");
-
-		static const EGLAttrib debug_attribs[] = {
-			EGL_DEBUG_MSG_CRITICAL_KHR, EGL_TRUE,
-			EGL_DEBUG_MSG_ERROR_KHR, EGL_TRUE,
-			EGL_DEBUG_MSG_WARN_KHR, EGL_TRUE,
-			EGL_DEBUG_MSG_INFO_KHR, EGL_TRUE,
-			EGL_NONE,
-		};
-		egl->procs.eglDebugMessageControlKHR(egl_log, debug_attribs);
-	}
-
-	if (eglBindAPI(EGL_OPENGL_ES_API) == EGL_FALSE) {
-		wlr_log(WLR_ERROR, "Failed to bind to the OpenGL ES API");
-		free(egl);
-		return NULL;
-	}
-
-	return egl;
-}
-
-static bool egl_init_display(struct wlr_egl *egl, EGLDisplay display) {
-	egl->display = display;
-
-	EGLint major, minor;
-	if (eglInitialize(egl->display, &major, &minor) == EGL_FALSE) {
-		wlr_log(WLR_ERROR, "Failed to initialize EGL");
-		return false;
-	}
-
-	const char *display_exts_str = eglQueryString(egl->display, EGL_EXTENSIONS);
-	if (display_exts_str == NULL) {
-		wlr_log(WLR_ERROR, "Failed to query EGL display extensions");
-		return false;
-	}
-
-	if (check_egl_ext(display_exts_str, "EGL_KHR_image_base")) {
-		egl->exts.KHR_image_base = true;
-		load_egl_proc(&egl->procs.eglCreateImageKHR, "eglCreateImageKHR");
-		load_egl_proc(&egl->procs.eglDestroyImageKHR, "eglDestroyImageKHR");
-	}
-
-	egl->exts.EXT_image_dma_buf_import =
-		check_egl_ext(display_exts_str, "EGL_EXT_image_dma_buf_import");
-	if (check_egl_ext(display_exts_str,
-			"EGL_EXT_image_dma_buf_import_modifiers")) {
-		egl->exts.EXT_image_dma_buf_import_modifiers = true;
-		load_egl_proc(&egl->procs.eglQueryDmaBufFormatsEXT,
-			"eglQueryDmaBufFormatsEXT");
-		load_egl_proc(&egl->procs.eglQueryDmaBufModifiersEXT,
-			"eglQueryDmaBufModifiersEXT");
-	}
-
-	egl->exts.EXT_create_context_robustness =
-		check_egl_ext(display_exts_str, "EGL_EXT_create_context_robustness");
-
-	const char *device_exts_str = NULL, *driver_name = NULL;
-	if (egl->exts.EXT_device_query) {
-		EGLAttrib device_attrib;
-		if (!egl->procs.eglQueryDisplayAttribEXT(egl->display,
-				EGL_DEVICE_EXT, &device_attrib)) {
-			wlr_log(WLR_ERROR, "eglQueryDisplayAttribEXT(EGL_DEVICE_EXT) failed");
-			return false;
-		}
-		egl->device = (EGLDeviceEXT)device_attrib;
-
-		device_exts_str =
-			egl->procs.eglQueryDeviceStringEXT(egl->device, EGL_EXTENSIONS);
-		if (device_exts_str == NULL) {
-			wlr_log(WLR_ERROR, "eglQueryDeviceStringEXT(EGL_EXTENSIONS) failed");
-			return false;
-		}
-
-#ifdef EGL_DRIVER_NAME_EXT
-		if (check_egl_ext(device_exts_str, "EGL_EXT_device_persistent_id")) {
-			driver_name = egl->procs.eglQueryDeviceStringEXT(egl->device,
-				EGL_DRIVER_NAME_EXT);
-		}
-#endif
-
-		egl->exts.EXT_device_drm =
-			check_egl_ext(device_exts_str, "EGL_EXT_device_drm");
-		egl->exts.EXT_device_drm_render_node =
-			check_egl_ext(device_exts_str, "EGL_EXT_device_drm_render_node");
-
-		// The only way a non-DRM device is selected is when the user
-		// explicitly picks software rendering
-		if (check_egl_ext(device_exts_str, "EGL_MESA_device_software") &&
-				egl->exts.EXT_device_drm) {
-			if (env_parse_bool("WLR_RENDERER_ALLOW_SOFTWARE")) {
-				wlr_log(WLR_INFO, "Using software rendering");
-			} else {
-				wlr_log(WLR_ERROR, "Software rendering detected, please use "
-					"the WLR_RENDERER_ALLOW_SOFTWARE environment variable "
-					"to proceed");
-				return false;
-			}
-		}
-	}
-
-	if (!check_egl_ext(display_exts_str, "EGL_KHR_no_config_context") &&
-			!check_egl_ext(display_exts_str, "EGL_MESA_configless_context")) {
-		wlr_log(WLR_ERROR, "EGL_KHR_no_config_context or "
-			"EGL_MESA_configless_context not supported");
-		return false;
-	}
-
-	if (!check_egl_ext(display_exts_str, "EGL_KHR_surfaceless_context")) {
-		wlr_log(WLR_ERROR, "EGL_KHR_surfaceless_context not supported");
-		return false;
-	}
-
-	if (check_egl_ext(display_exts_str, "EGL_KHR_fence_sync") &&
-			check_egl_ext(display_exts_str, "EGL_ANDROID_native_fence_sync")) {
-		load_egl_proc(&egl->procs.eglCreateSyncKHR, "eglCreateSyncKHR");
-		load_egl_proc(&egl->procs.eglDestroySyncKHR, "eglDestroySyncKHR");
-		load_egl_proc(&egl->procs.eglDupNativeFenceFDANDROID,
-			"eglDupNativeFenceFDANDROID");
-	}
-
-	if (check_egl_ext(display_exts_str, "EGL_KHR_wait_sync")) {
-		load_egl_proc(&egl->procs.eglWaitSyncKHR, "eglWaitSyncKHR");
-	}
-
-	egl->exts.IMG_context_priority =
-		check_egl_ext(display_exts_str, "EGL_IMG_context_priority");
-
-	wlr_log(WLR_INFO, "Using EGL %d.%d", (int)major, (int)minor);
-	wlr_log(WLR_INFO, "Supported EGL display extensions: %s", display_exts_str);
-	if (device_exts_str != NULL) {
-		wlr_log(WLR_INFO, "Supported EGL device extensions: %s", device_exts_str);
-	}
-	wlr_log(WLR_INFO, "EGL vendor: %s", eglQueryString(egl->display, EGL_VENDOR));
-	if (driver_name != NULL) {
-		wlr_log(WLR_INFO, "EGL driver name: %s", driver_name);
-	}
-
-	init_dmabuf_formats(egl);
-
-	return true;
-}
-
-static bool egl_init(struct wlr_egl *egl, EGLenum platform,
-		void *remote_display) {
-	EGLint display_attribs[3] = {0};
-	size_t display_attribs_len = 0;
-
-	if (egl->exts.KHR_display_reference) {
-		display_attribs[display_attribs_len++] = EGL_TRACK_REFERENCES_KHR;
-		display_attribs[display_attribs_len++] = EGL_TRUE;
-	}
-
-	display_attribs[display_attribs_len++] = EGL_NONE;
-	assert(display_attribs_len <= sizeof(display_attribs) / sizeof(display_attribs[0]));
-
-	EGLDisplay display = egl->procs.eglGetPlatformDisplayEXT(platform,
-		remote_display, display_attribs);
-	if (display == EGL_NO_DISPLAY) {
-		wlr_log(WLR_ERROR, "Failed to create EGL display");
-		return false;
-	}
-
-	if (!egl_init_display(egl, display)) {
-		if (egl->exts.KHR_display_reference) {
-			eglTerminate(display);
-		}
-		return false;
-	}
-
-	size_t atti = 0;
-	EGLint attribs[7];
-	attribs[atti++] = EGL_CONTEXT_CLIENT_VERSION;
-	attribs[atti++] = 2;
-
-	// Request a high priority context if possible
-	// TODO: only do this if we're running as the DRM master
-	bool request_high_priority = egl->exts.IMG_context_priority;
-
-	// Try to reschedule all of our rendering to be completed first. If it
-	// fails, it will fallback to the default priority (MEDIUM).
-	if (request_high_priority) {
-		attribs[atti++] = EGL_CONTEXT_PRIORITY_LEVEL_IMG;
-		attribs[atti++] = EGL_CONTEXT_PRIORITY_HIGH_IMG;
-	}
-
-	if (egl->exts.EXT_create_context_robustness) {
-		attribs[atti++] = EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY_EXT;
-		attribs[atti++] = EGL_LOSE_CONTEXT_ON_RESET_EXT;
-	}
-
-	attribs[atti++] = EGL_NONE;
-	assert(atti <= sizeof(attribs)/sizeof(attribs[0]));
-
-	egl->context = eglCreateContext(egl->display, EGL_NO_CONFIG_KHR,
-		EGL_NO_CONTEXT, attribs);
-	if (egl->context == EGL_NO_CONTEXT) {
-		wlr_log(WLR_ERROR, "Failed to create EGL context");
-		return false;
-	}
-
-	if (request_high_priority) {
-		EGLint priority = EGL_CONTEXT_PRIORITY_MEDIUM_IMG;
-		eglQueryContext(egl->display, egl->context,
-			EGL_CONTEXT_PRIORITY_LEVEL_IMG, &priority);
-		if (priority != EGL_CONTEXT_PRIORITY_HIGH_IMG) {
-			wlr_log(WLR_INFO, "Failed to obtain a high priority context");
-		} else {
-			wlr_log(WLR_DEBUG, "Obtained high priority context");
-		}
-	}
-
-	return true;
-}
 
 static bool device_has_name(const drmDevice *device, const char *name);
 
@@ -612,70 +561,10 @@ error:
 	return NULL;
 }
 
-struct wlr_egl *wlr_egl_create_with_context(EGLDisplay display,
-		EGLContext context) {
-	EGLint client_type;
-	if (!eglQueryContext(display, context, EGL_CONTEXT_CLIENT_TYPE, &client_type) ||
-			client_type != EGL_OPENGL_ES_API) {
-		wlr_log(WLR_ERROR, "Unsupported EGL context client type (need OpenGL ES)");
-		return NULL;
-	}
 
-	EGLint client_version;
-	if (!eglQueryContext(display, context, EGL_CONTEXT_CLIENT_VERSION, &client_version) ||
-			client_version < 2) {
-		wlr_log(WLR_ERROR, "Unsupported EGL context client version (need OpenGL ES >= 2)");
-		return NULL;
-	}
 
-	struct wlr_egl *egl = egl_create();
-	if (egl == NULL) {
-		return NULL;
-	}
 
-	if (!egl_init_display(egl, display)) {
-		free(egl);
-		return NULL;
-	}
 
-	egl->context = context;
-
-	return egl;
-}
-
-void wlr_egl_destroy(struct wlr_egl *egl) {
-	if (egl == NULL) {
-		return;
-	}
-
-	wlr_drm_format_set_finish(&egl->dmabuf_render_formats);
-	wlr_drm_format_set_finish(&egl->dmabuf_texture_formats);
-
-	eglMakeCurrent(egl->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-	eglDestroyContext(egl->display, egl->context);
-
-	if (egl->exts.KHR_display_reference) {
-		eglTerminate(egl->display);
-	}
-
-	eglReleaseThread();
-
-	if (egl->gbm_device) {
-		int gbm_fd = gbm_device_get_fd(egl->gbm_device);
-		gbm_device_destroy(egl->gbm_device);
-		close(gbm_fd);
-	}
-
-	free(egl);
-}
-
-EGLDisplay wlr_egl_get_display(struct wlr_egl *egl) {
-	return egl->display;
-}
-
-EGLContext wlr_egl_get_context(struct wlr_egl *egl) {
-	return egl->context;
-}
 
 bool wlr_egl_destroy_image(struct wlr_egl *egl, EGLImage image) {
 	if (!egl->exts.KHR_image_base) {

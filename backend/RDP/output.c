@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 
 #include <assert.h>
 #include <stdlib.h>
@@ -16,55 +17,40 @@
 #include <wlr/interfaces/wlr_pointer.h>
 #include <wlr/interfaces/wlr_touch.h>
 #include <wlr/render/wlr_renderer.h>
+#include <wlr/types/wlr_matrix.h>
 #include <wlr/util/log.h>
 
 #include "backend/RDP.h"
+#include "util/signal.h"
 #include "util/time.h"
-#include "types/wlr_output.h"
 
 static const uint32_t SUPPORTED_OUTPUT_STATE =
 	WLR_OUTPUT_STATE_BACKEND_OPTIONAL |
 	WLR_OUTPUT_STATE_BUFFER |
-	WLR_OUTPUT_STATE_ENABLED |
-	WLR_OUTPUT_STATE_MODE |
-	WLR_OUTPUT_STATE_ADAPTIVE_SYNC_ENABLED;
-
-static size_t last_output_num = 0;
+	WLR_OUTPUT_STATE_MODE;
 
 static void parse_xcb_setup(struct wlr_output *output,
 		xcb_connection_t *xcb) {
 	const xcb_setup_t *xcb_setup = xcb_get_setup(xcb);
 
-	output->make = calloc(1, xcb_setup_vendor_length(xcb_setup) + 1);
-	if (output->make == NULL) {
-		wlr_log_errno(WLR_ERROR, "Allocation failed");
-		return;
-	}
-	memcpy(output->make, xcb_setup_vendor(xcb_setup),
-		xcb_setup_vendor_length(xcb_setup));
-
-	char model[64];
-	snprintf(model, sizeof(model), "%"PRIu16".%"PRIu16,
-		xcb_setup->protocol_major_version,
-		xcb_setup->protocol_minor_version);
-	output->model = strdup(model);
+	snprintf(output->make, sizeof(output->make), "%.*s",
+			xcb_setup_vendor_length(xcb_setup),
+			xcb_setup_vendor(xcb_setup));
+	snprintf(output->model, sizeof(output->model), "%"PRIu16".%"PRIu16,
+			xcb_setup->protocol_major_version,
+			xcb_setup->protocol_minor_version);
 }
 
 static struct wlr_RDP_output *get_RDP_output_from_output(
 		struct wlr_output *wlr_output) {
 	assert(wlr_output_is_RDP(wlr_output));
-	struct wlr_RDP_output *output = wl_container_of(wlr_output, output, wlr_output);
-	return output;
+	return (struct wlr_RDP_output *)wlr_output;
 }
 
 static bool output_set_custom_mode(struct wlr_output *wlr_output,
 		int32_t width, int32_t height, int32_t refresh) {
 	struct wlr_RDP_output *output = get_RDP_output_from_output(wlr_output);
 	struct wlr_RDP_backend *RDP = output->RDP;
-
-	if (width == output->win_width && height == output->win_height) {
-		return true;
-	}
 
 	const uint32_t values[] = { width, height };
 	xcb_void_cookie_t cookie = xcb_configure_window_checked(
@@ -79,12 +65,6 @@ static bool output_set_custom_mode(struct wlr_output *wlr_output,
 		return false;
 	}
 
-	output->win_width = width;
-	output->win_height = height;
-
-	// Move the pointer to its new location
-	update_RDP_pointer_position(output, output->RDP->time);
-
 	return true;
 }
 
@@ -94,12 +74,10 @@ static void output_destroy(struct wlr_output *wlr_output) {
 	struct wlr_RDP_output *output = get_RDP_output_from_output(wlr_output);
 	struct wlr_RDP_backend *RDP = output->RDP;
 
-	wlr_output_finish(wlr_output);
-
 	pixman_region32_fini(&output->exposed);
 
-	wlr_pointer_finish(&output->pointer);
-	wlr_touch_finish(&output->touch);
+	wlr_input_device_destroy(&output->pointer_dev);
+	wlr_input_device_destroy(&output->touch_dev);
 
 	struct wlr_RDP_buffer *buffer, *buffer_tmp;
 	wl_list_for_each_safe(buffer, buffer_tmp, &output->buffers, link) {
@@ -119,74 +97,17 @@ static void output_destroy(struct wlr_output *wlr_output) {
 	free(output);
 }
 
-static bool output_test(struct wlr_output *wlr_output,
-		const struct wlr_output_state *state) {
-	struct wlr_RDP_output *output = get_RDP_output_from_output(wlr_output);
-	struct wlr_RDP_backend *RDP = output->RDP;
-
-	uint32_t unsupported = state->committed & ~SUPPORTED_OUTPUT_STATE;
+static bool output_test(struct wlr_output *wlr_output) {
+	uint32_t unsupported =
+		wlr_output->pending.committed & ~SUPPORTED_OUTPUT_STATE;
 	if (unsupported != 0) {
 		wlr_log(WLR_DEBUG, "Unsupported output state fields: 0x%"PRIx32,
 			unsupported);
 		return false;
 	}
 
-	if (state->committed & WLR_OUTPUT_STATE_BUFFER) {
-		// If the size doesn't match, reject buffer (scaling is not supported)
-		int pending_width, pending_height;
-		output_pending_resolution(wlr_output, state,
-			&pending_width, &pending_height);
-		if (state->buffer->width != pending_width ||
-				state->buffer->height != pending_height) {
-			wlr_log(WLR_DEBUG, "Primary buffer size mismatch");
-			return false;
-		}
-		// Source crop is not supported
-		struct wlr_fbox src_box;
-		output_state_get_buffer_src_box(state, &src_box);
-		if (src_box.x != 0.0 || src_box.y != 0.0 ||
-				src_box.width != (double)state->buffer->width ||
-				src_box.height != (double)state->buffer->height) {
-			wlr_log(WLR_DEBUG, "Source crop not supported in RDP output");
-			return false;
-		}
-	}
-
-	// All we can do to influence adaptive sync on the RDP backend is set the
-	// _VARIABLE_REFRESH window property like mesa automatically does. We don't
-	// have any control beyond that, so we set the state to enabled on creating
-	// the output and never allow changing it (just like the Wayland backend).
-	assert(wlr_output->adaptive_sync_status == WLR_OUTPUT_ADAPTIVE_SYNC_ENABLED);
-	if (state->committed & WLR_OUTPUT_STATE_ADAPTIVE_SYNC_ENABLED) {
-		if (!state->adaptive_sync_enabled) {
-			wlr_log(WLR_DEBUG, "Disabling adaptive sync is not supported");
-			return false;
-		}
-	}
-
-	if (state->committed & WLR_OUTPUT_STATE_BUFFER) {
-		struct wlr_buffer *buffer = state->buffer;
-		struct wlr_dmabuf_attributes dmabuf_attrs;
-		struct wlr_shm_attributes shm_attrs;
-		uint32_t format = DRM_FORMAT_INVALID;
-		if (wlr_buffer_get_dmabuf(buffer, &dmabuf_attrs)) {
-			format = dmabuf_attrs.format;
-		} else if (wlr_buffer_get_shm(buffer, &shm_attrs)) {
-			format = shm_attrs.format;
-		}
-		if (format != RDP->RDP_format->drm) {
-			wlr_log(WLR_DEBUG, "Unsupported buffer format");
-			return false;
-		}
-	}
-
-	if (state->committed & WLR_OUTPUT_STATE_MODE) {
-		assert(state->mode_type == WLR_OUTPUT_STATE_MODE_CUSTOM);
-
-		if (state->custom_mode.refresh != 0) {
-			wlr_log(WLR_DEBUG, "Refresh rates are not supported");
-			return false;
-		}
+	if (wlr_output->pending.committed & WLR_OUTPUT_STATE_MODE) {
+		assert(wlr_output->pending.mode_type == WLR_OUTPUT_STATE_MODE_CUSTOM);
 	}
 
 	return true;
@@ -199,9 +120,6 @@ static void destroy_RDP_buffer(struct wlr_RDP_buffer *buffer) {
 	wl_list_remove(&buffer->buffer_destroy.link);
 	wl_list_remove(&buffer->link);
 	xcb_free_pixmap(buffer->RDP->xcb, buffer->pixmap);
-	for (size_t i = 0; i < buffer->n_busy; i++) {
-		wlr_buffer_unlock(buffer->buffer);
-	}
 	free(buffer);
 }
 
@@ -219,6 +137,10 @@ static xcb_pixmap_t import_dmabuf(struct wlr_RDP_output *output,
 	if (dmabuf->format != RDP->RDP_format->drm) {
 		// The pixmap's depth must match the window's depth, otherwise Present
 		// will throw a Match error
+		return XCB_PIXMAP_NONE;
+	}
+
+	if (dmabuf->flags != 0) {
 		return XCB_PIXMAP_NONE;
 	}
 
@@ -303,13 +225,12 @@ static struct wlr_RDP_buffer *create_RDP_buffer(struct wlr_RDP_output *output,
 		return NULL;
 	}
 
-	struct wlr_RDP_buffer *buffer = calloc(1, sizeof(*buffer));
+	struct wlr_RDP_buffer *buffer = calloc(1, sizeof(struct wlr_RDP_buffer));
 	if (!buffer) {
 		xcb_free_pixmap(RDP->xcb, pixmap);
 		return NULL;
 	}
 	buffer->buffer = wlr_buffer_lock(wlr_buffer);
-	buffer->n_busy = 1;
 	buffer->pixmap = pixmap;
 	buffer->RDP = RDP;
 	wl_list_insert(&output->buffers, &buffer->link);
@@ -326,7 +247,6 @@ static struct wlr_RDP_buffer *get_or_create_RDP_buffer(
 	wl_list_for_each(buffer, &output->buffers, link) {
 		if (buffer->buffer == wlr_buffer) {
 			wlr_buffer_lock(buffer->buffer);
-			buffer->n_busy++;
 			return buffer;
 		}
 	}
@@ -334,11 +254,10 @@ static struct wlr_RDP_buffer *get_or_create_RDP_buffer(
 	return create_RDP_buffer(output, wlr_buffer);
 }
 
-static bool output_commit_buffer(struct wlr_RDP_output *output,
-		const struct wlr_output_state *state) {
+static bool output_commit_buffer(struct wlr_RDP_output *output) {
 	struct wlr_RDP_backend *RDP = output->RDP;
 
-	struct wlr_buffer *buffer = state->buffer;
+	struct wlr_buffer *buffer = output->wlr_output.pending.buffer;
 	struct wlr_RDP_buffer *RDP_buffer =
 		get_or_create_RDP_buffer(output, buffer);
 	if (!RDP_buffer) {
@@ -346,11 +265,11 @@ static bool output_commit_buffer(struct wlr_RDP_output *output,
 	}
 
 	xcb_xfixes_region_t region = XCB_NONE;
-	if (state->committed & WLR_OUTPUT_STATE_DAMAGE) {
-		pixman_region32_union(&output->exposed, &output->exposed, &state->damage);
+	if (output->wlr_output.pending.committed & WLR_OUTPUT_STATE_DAMAGE) {
+		pixman_region32_union(&output->exposed, &output->exposed, &output->wlr_output.pending.damage);
 
 		int rects_len = 0;
-		const pixman_box32_t *rects = pixman_region32_rectangles(&output->exposed, &rects_len);
+		pixman_box32_t *rects = pixman_region32_rectangles(&output->exposed, &rects_len);
 
 		xcb_rectangle_t *xcb_rects = calloc(rects_len, sizeof(xcb_rectangle_t));
 		if (!xcb_rects) {
@@ -358,7 +277,7 @@ static bool output_commit_buffer(struct wlr_RDP_output *output,
 		}
 
 		for (int i = 0; i < rects_len; i++) {
-			const pixman_box32_t *box = &rects[i];
+			pixman_box32_t *box = &rects[i];
 			xcb_rects[i] = (struct xcb_rectangle_t){
 				.x = box->x1,
 				.y = box->y1,
@@ -393,40 +312,42 @@ error:
 	return false;
 }
 
-static bool output_commit(struct wlr_output *wlr_output,
-		const struct wlr_output_state *state) {
+static bool output_commit(struct wlr_output *wlr_output) {
 	struct wlr_RDP_output *output = get_RDP_output_from_output(wlr_output);
 	struct wlr_RDP_backend *RDP = output->RDP;
 
-	if (!output_test(wlr_output, state)) {
+	if (!output_test(wlr_output)) {
 		return false;
 	}
 
-	if (state->committed & WLR_OUTPUT_STATE_ENABLED) {
-		if (state->enabled) {
-			xcb_map_window(RDP->xcb, output->win);
-		} else {
-			xcb_unmap_window(RDP->xcb, output->win);
-		}
-	}
-
-	if (state->committed & WLR_OUTPUT_STATE_MODE) {
+	if (wlr_output->pending.committed & WLR_OUTPUT_STATE_MODE) {
 		if (!output_set_custom_mode(wlr_output,
-				state->custom_mode.width,
-				state->custom_mode.height,
-				state->custom_mode.refresh)) {
+				wlr_output->pending.custom_mode.width,
+				wlr_output->pending.custom_mode.height,
+				wlr_output->pending.custom_mode.refresh)) {
 			return false;
 		}
 	}
 
-	if (state->committed & WLR_OUTPUT_STATE_BUFFER) {
-		if (!output_commit_buffer(output, state)) {
+	if (wlr_output->pending.committed & WLR_OUTPUT_STATE_ADAPTIVE_SYNC_ENABLED &&
+			RDP->atoms.variable_refresh != XCB_ATOM_NONE) {
+		if (wlr_output->pending.adaptive_sync_enabled) {
+			uint32_t enabled = 1;
+			xcb_change_property(RDP->xcb, XCB_PROP_MODE_REPLACE, output->win,
+				RDP->atoms.variable_refresh, XCB_ATOM_CARDINAL, 32, 1,
+				&enabled);
+			wlr_output->adaptive_sync_status = WLR_OUTPUT_ADAPTIVE_SYNC_UNKNOWN;
+		} else {
+			xcb_delete_property(RDP->xcb, output->win,
+				RDP->atoms.variable_refresh);
+			wlr_output->adaptive_sync_status = WLR_OUTPUT_ADAPTIVE_SYNC_DISABLED;
+		}
+	}
+
+	if (wlr_output->pending.committed & WLR_OUTPUT_STATE_BUFFER) {
+		if (!output_commit_buffer(output)) {
 			return false;
 		}
-	} else if (output_pending_enabled(wlr_output, state)) {
-		uint32_t serial = output->wlr_output.commit_seq;
-		uint64_t target_msc = output->last_msc ? output->last_msc + 1 : 0;
-		xcb_present_notify_msc(RDP->xcb, output->win, serial, target_msc, 0, 0);
 	}
 
 	xcb_flush(RDP->xcb);
@@ -459,7 +380,7 @@ static void update_RDP_output_cursor(struct wlr_RDP_output *output,
 static bool output_cursor_to_picture(struct wlr_RDP_output *output,
 		struct wlr_buffer *buffer) {
 	struct wlr_RDP_backend *RDP = output->RDP;
-	struct wlr_renderer *renderer = output->wlr_output.renderer;
+	struct wlr_renderer *renderer = wlr_backend_get_renderer(&RDP->backend);
 
 	if (output->cursor.pic != XCB_NONE) {
 		xcb_render_free_picture(RDP->xcb, output->cursor.pic);
@@ -470,26 +391,25 @@ static bool output_cursor_to_picture(struct wlr_RDP_output *output,
 		return true;
 	}
 
-	struct wlr_texture *texture = wlr_texture_from_buffer(renderer, buffer);
-	if (!texture) {
-		return false;
-	}
-
 	int depth = 32;
-	int stride = texture->width * 4;
-	uint8_t *data = malloc(texture->height * stride);
+	int stride = buffer->width * 4;
+
+	uint8_t *data = malloc(buffer->height * stride);
 	if (data == NULL) {
-		wlr_texture_destroy(texture);
 		return false;
 	}
 
-	bool result = wlr_texture_read_pixels(texture, &(struct wlr_texture_read_pixels_options) {
-		.format = DRM_FORMAT_ARGB8888,
-		.stride = stride,
-		.data = data,
-	});
+	if (!wlr_renderer_begin_with_buffer(renderer, buffer)) {
+		free(data);
+		return false;
+	}
 
-	wlr_texture_destroy(texture);
+	bool result = wlr_renderer_read_pixels(
+		renderer, DRM_FORMAT_ARGB8888, NULL,
+		stride, buffer->width, buffer->height, 0, 0, 0, 0,
+		data);
+
+	wlr_renderer_end(renderer);
 
 	if (!result) {
 		free(data);
@@ -583,7 +503,7 @@ struct wlr_output *wlr_RDP_output_create(struct wlr_backend *backend) {
 		return NULL;
 	}
 
-	struct wlr_RDP_output *output = calloc(1, sizeof(*output));
+	struct wlr_RDP_output *output = calloc(1, sizeof(struct wlr_RDP_output));
 	if (output == NULL) {
 		return NULL;
 	}
@@ -592,24 +512,17 @@ struct wlr_output *wlr_RDP_output_create(struct wlr_backend *backend) {
 	pixman_region32_init(&output->exposed);
 
 	struct wlr_output *wlr_output = &output->wlr_output;
+	wlr_output_init(wlr_output, &RDP->backend, &output_impl, RDP->wl_display);
 
-	struct wlr_output_state state;
-	wlr_output_state_init(&state);
-	wlr_output_state_set_custom_mode(&state, 1024, 768, 0);
+	wlr_output_update_custom_mode(wlr_output, 1024, 768, 0);
 
-	wlr_output_init(wlr_output, &RDP->backend, &output_impl, RDP->event_loop, &state);
-	wlr_output_state_finish(&state);
-
-	size_t output_num = ++last_output_num;
-
-	char name[64];
-	snprintf(name, sizeof(name), "RDP-%zu", output_num);
-	wlr_output_set_name(wlr_output, name);
-
+	snprintf(wlr_output->name, sizeof(wlr_output->name), "RDP-%zd",
+		++RDP->last_output_num);
 	parse_xcb_setup(wlr_output, RDP->xcb);
 
 	char description[128];
-	snprintf(description, sizeof(description), "RDP output %zu", output_num);
+	snprintf(description, sizeof(description),
+		"RDP output %zd", RDP->last_output_num);
 	wlr_output_set_description(wlr_output, description);
 
 	// The RDP protocol requires us to set a colormap and border pixel if the
@@ -626,9 +539,6 @@ struct wlr_output *wlr_RDP_output_create(struct wlr_backend *backend) {
 	xcb_create_window(RDP->xcb, RDP->depth->depth, output->win,
 		RDP->screen->root, 0, 0, wlr_output->width, wlr_output->height, 0,
 		XCB_WINDOW_CLASS_INPUT_OUTPUT, RDP->visualid, mask, values);
-
-	output->win_width = wlr_output->width;
-	output->win_height = wlr_output->height;
 
 	struct {
 		xcb_input_event_mask_t head;
@@ -656,34 +566,41 @@ struct wlr_output *wlr_RDP_output_create(struct wlr_backend *backend) {
 		RDP->atoms.wm_protocols, XCB_ATOM_ATOM, 32, 1,
 		&RDP->atoms.wm_delete_window);
 
-	uint32_t enabled = 1;
-	xcb_change_property(RDP->xcb, XCB_PROP_MODE_REPLACE, output->win,
-		RDP->atoms.variable_refresh, XCB_ATOM_CARDINAL, 32, 1,
-		&enabled);
-	wlr_output->adaptive_sync_status = WLR_OUTPUT_ADAPTIVE_SYNC_ENABLED;
-
 	wlr_RDP_output_set_title(wlr_output, NULL);
 
+	xcb_map_window(RDP->xcb, output->win);
 	xcb_flush(RDP->xcb);
 
 	wl_list_insert(&RDP->outputs, &output->link);
 
-	wlr_pointer_init(&output->pointer, &RDP_pointer_impl, "RDP-pointer");
-	output->pointer.output_name = strdup(wlr_output->name);
+	wlr_output_update_enabled(wlr_output, true);
 
-	wlr_touch_init(&output->touch, &RDP_touch_impl, "RDP-touch");
-	output->touch.output_name = strdup(wlr_output->name);
+	wlr_input_device_init(&output->pointer_dev, WLR_INPUT_DEVICE_POINTER,
+		&input_device_impl, "RDP pointer", 0, 0);
+	wlr_pointer_init(&output->pointer, &pointer_impl);
+	output->pointer_dev.pointer = &output->pointer;
+	output->pointer_dev.output_name = strdup(wlr_output->name);
+
+	wlr_input_device_init(&output->touch_dev, WLR_INPUT_DEVICE_TOUCH,
+		&input_device_impl, "RDP touch", 0, 0);
+	wlr_touch_init(&output->touch, &touch_impl);
+	output->touch_dev.touch = &output->touch;
+	output->touch_dev.output_name = strdup(wlr_output->name);
 	wl_list_init(&output->touchpoints);
 
-	wl_signal_emit_mutable(&RDP->backend.events.new_output, wlr_output);
-	wl_signal_emit_mutable(&RDP->backend.events.new_input, &output->pointer.base);
-	wl_signal_emit_mutable(&RDP->backend.events.new_input, &output->touch.base);
+	wlr_signal_emit_safe(&RDP->backend.events.new_output, wlr_output);
+	wlr_signal_emit_safe(&RDP->backend.events.new_input, &output->pointer_dev);
+	wlr_signal_emit_safe(&RDP->backend.events.new_input, &output->touch_dev);
+
+	// Start the rendering loop by requesting the compositor to render a frame
+	wlr_output_schedule_frame(wlr_output);
 
 	return wlr_output;
 }
 
 void handle_RDP_configure_notify(struct wlr_RDP_output *output,
 		xcb_configure_notify_event_t *ev) {
+	// ignore events that set an invalid size:
 	if (ev->width == 0 || ev->height == 0) {
 		wlr_log(WLR_DEBUG,
 			"Ignoring RDP configure event for height=%d, width=%d",
@@ -691,14 +608,11 @@ void handle_RDP_configure_notify(struct wlr_RDP_output *output,
 		return;
 	}
 
-	output->win_width = ev->width;
-	output->win_height = ev->height;
+	wlr_output_update_custom_mode(&output->wlr_output, ev->width,
+		ev->height, 0);
 
-	struct wlr_output_state state;
-	wlr_output_state_init(&state);
-	wlr_output_state_set_custom_mode(&state, ev->width, ev->height, 0);
-	wlr_output_send_request_state(&output->wlr_output, &state);
-	wlr_output_state_finish(&state);
+	// Move the pointer to its new location
+	update_RDP_pointer_position(output, output->RDP->time);
 }
 
 bool wlr_output_is_RDP(struct wlr_output *wlr_output) {
@@ -754,8 +668,6 @@ void handle_RDP_present_event(struct wlr_RDP_backend *RDP,
 			return;
 		}
 
-		assert(buffer->n_busy > 0);
-		buffer->n_busy--;
 		wlr_buffer_unlock(buffer->buffer); // may destroy buffer
 		break;
 	case XCB_PRESENT_COMPLETE_NOTIFY:;
@@ -770,6 +682,9 @@ void handle_RDP_present_event(struct wlr_RDP_backend *RDP,
 
 		output->last_msc = complete_notify->msc;
 
+		struct timespec t;
+		timespec_from_nsec(&t, complete_notify->ust * 1000);
+
 		uint32_t flags = 0;
 		if (complete_notify->mode == XCB_PRESENT_COMPLETE_MODE_FLIP) {
 			flags |= WLR_OUTPUT_PRESENT_ZERO_COPY;
@@ -780,10 +695,10 @@ void handle_RDP_present_event(struct wlr_RDP_backend *RDP,
 			.output = &output->wlr_output,
 			.commit_seq = complete_notify->serial,
 			.presented = presented,
+			.when = &t,
 			.seq = complete_notify->msc,
 			.flags = flags,
 		};
-		timespec_from_nsec(&present_event.when, complete_notify->ust * 1000);
 		wlr_output_send_present(&output->wlr_output, &present_event);
 
 		wlr_output_send_frame(&output->wlr_output);

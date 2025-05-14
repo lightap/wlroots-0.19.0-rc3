@@ -1,3 +1,4 @@
+
 #include <assert.h>
 #include <drm_fourcc.h>
 #include <stdlib.h>
@@ -11,6 +12,22 @@
 #include "render/wlr_renderer.h"
 #include "render/pixel_format.h"
 #include "types/wlr_output.h"
+#include <assert.h>
+#include <drm_fourcc.h>
+#include <stdlib.h>
+#include <wlr/interfaces/wlr_output.h>
+#include <wlr/render/interface.h>
+#include <wlr/util/log.h>
+#include <xf86drm.h>
+#include "backend/backend.h"
+#include "render/allocator/RDP_allocator.h"
+#include "render/drm_format_set.h"
+#include "render/swapchain.h"
+#include "render/wlr_renderer.h"
+#include "render/pixel_format.h"
+#include "types/wlr_output.h"
+#include <unistd.h>
+#include <stdio.h>
 
 bool wlr_output_init_render(struct wlr_output *output,
 		struct wlr_allocator *allocator, struct wlr_renderer *renderer) {
@@ -143,7 +160,7 @@ void wlr_output_lock_attach_render(struct wlr_output *output, bool lock) {
 		lock ? "Disabling" : "Enabling", output->name,
 		output->attach_render_locks);
 }
-
+/*
 bool output_pick_format(struct wlr_output *output,
 		const struct wlr_drm_format_set *display_formats,
 		struct wlr_drm_format *format, uint32_t fmt) {
@@ -191,6 +208,60 @@ bool output_pick_format(struct wlr_output *output,
 		return false;
 	}
 
+	return true;
+}
+
+struct wlr_drm_format *output_pick_format(struct wlr_output *output,
+        const struct wlr_drm_format_set *display_formats,
+        uint32_t fmt) {
+    struct wlr_renderer *renderer = output->renderer;
+    struct wlr_allocator *allocator = output->allocator;
+    assert(renderer != NULL && allocator != NULL);
+
+    wlr_log(WLR_DEBUG, "Surfaceless format selection: Creating minimal format");
+
+    // Hardcode a format that matches the EGL config (8-bit RGB, no alpha)
+    struct wlr_drm_format *format = calloc(1, sizeof(struct wlr_drm_format) + sizeof(uint64_t));
+    if (!format) {
+        wlr_log(WLR_ERROR, "Failed to allocate drm format");
+        return NULL;
+    }
+
+    // Use the format that matches the allocator's request
+    format->format = DRM_FORMAT_XRGB8888;  // 0x34325258
+    format->modifiers[0] = DRM_FORMAT_MOD_INVALID;
+    format->len = 1;
+    format->capacity = 1;
+
+    wlr_log(WLR_DEBUG, "Surfaceless: Created format 0x%"PRIX32, format->format);
+    return format;
+}*/
+
+
+bool output_pick_format(struct wlr_output *output,
+		const struct wlr_drm_format_set *display_formats,
+		struct wlr_drm_format *format, uint32_t fmt) {
+	assert(output != NULL && output->renderer != NULL && output->allocator != NULL);
+
+	wlr_log(WLR_DEBUG, "Surfaceless format selection: Creating minimal format for output %s",
+		output->name ? output->name : "(null)");
+
+	// Initialize format with space for one modifier
+	*format = (struct wlr_drm_format){0};
+	format->capacity = 1;
+	format->modifiers = calloc(1, sizeof(uint64_t));
+	if (!format->modifiers) {
+		wlr_log(WLR_ERROR, "Failed to allocate drm format modifiers");
+		return false;
+	}
+
+	// Hardcode DRM_FORMAT_XRGB8888 for RDP backend
+	format->format = DRM_FORMAT_XRGB8888; // 0x34325258
+	format->modifiers[0] = DRM_FORMAT_MOD_INVALID;
+	format->len = 1;
+
+	wlr_log(WLR_DEBUG, "Surfaceless: Created format 0x%"PRIX32 " for output %s",
+		format->format, output->name ? output->name : "(null)");
 	return true;
 }
 

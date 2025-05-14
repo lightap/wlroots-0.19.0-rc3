@@ -16,12 +16,12 @@
  */
 #mesondefine WLR_HAS_LIBINPUT_BACKEND
 /**
- * Whether the X11 backend is compile-time enabled. Equivalent to the
- * pkg-config "have_x11_backend" variable.
+ * Whether the RDP backend is compile-time enabled. Equivalent to the
+ * pkg-config "have_RDP_backend" variable.
  *
- * Required for <wlr/backend/x11.h>.
+ * Required for <wlr/backend/RDP.h>.
  */
-#mesondefine WLR_HAS_X11_BACKEND
+#mesondefine WLR_HAS_RDP_BACKEND
 
 /**
  * Whether the GLES2 renderer is compile-time enabled. Equivalent to the
