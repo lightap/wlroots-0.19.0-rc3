@@ -1052,7 +1052,7 @@ static bool is_zink_renderer(struct wlr_backend *backend, struct wlr_renderer *r
 #endif
 
 struct wlr_egl *setup_surfaceless_egl(struct tinywl_server *server) {
-    wlr_log(WLR_INFO, "Starting surfaceless EGL setup");
+wlr_log(WLR_INFO, "Starting surfaceless EGL setup");
 
     // 1. Check for client extensions (can use EGL_NO_DISPLAY)
     const char *client_extensions = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
@@ -1097,7 +1097,7 @@ struct wlr_egl *setup_surfaceless_egl(struct tinywl_server *server) {
         return NULL;
     }
     wlr_log(WLR_INFO, "EGL initialized, version: %d.%d", major, minor);
-    
+
     // 5. Query display extensions (must use initialized display)
     const char *display_extensions = eglQueryString(display, EGL_EXTENSIONS);
     if (!display_extensions) {
@@ -1138,24 +1138,14 @@ struct wlr_egl *setup_surfaceless_egl(struct tinywl_server *server) {
     // 8. Create context with explicit version
     const EGLint ctx_attribs[] = {
         EGL_CONTEXT_CLIENT_VERSION, 2,
-        EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR,
-        EGL_NONE
+        EGL_NONE // Remove profile mask to avoid compatibility issues
     };
-    
+
     EGLContext context = eglCreateContext(display, config, EGL_NO_CONTEXT, ctx_attribs);
     if (context == EGL_NO_CONTEXT) {
-        // Try without profile mask if it failed
-        const EGLint simple_ctx_attribs[] = {
-            EGL_CONTEXT_CLIENT_VERSION, 2,
-            EGL_NONE
-        };
-        
-        context = eglCreateContext(display, config, EGL_NO_CONTEXT, simple_ctx_attribs);
-        if (context == EGL_NO_CONTEXT) {
-            wlr_log(WLR_ERROR, "Failed to create EGL context. Error: 0x%x", eglGetError());
-            eglTerminate(display);
-            return NULL;
-        }
+        wlr_log(WLR_ERROR, "Failed to create EGL context. Error: 0x%x", eglGetError());
+        eglTerminate(display);
+        return NULL;
     }
     wlr_log(WLR_INFO, "Created EGL context");
 
@@ -1167,12 +1157,11 @@ struct wlr_egl *setup_surfaceless_egl(struct tinywl_server *server) {
         wlr_log(WLR_INFO, "EGL_CONTEXT_CLIENT_TYPE: 0x%x", client_type);
         if (client_type == EGL_OPENGL_ES_API) {
             wlr_log(WLR_INFO, "Context client type is EGL_OPENGL_ES_API");
-        } else if (client_type == EGL_OPENGL_API) {
-            wlr_log(WLR_INFO, "Context client type is EGL_OPENGL_API");
-        } else if (client_type == EGL_OPENVG_API) {
-            wlr_log(WLR_INFO, "Context client type is EGL_OPENVG_API");
         } else {
-            wlr_log(WLR_INFO, "Unknown context client type: 0x%x", client_type);
+            wlr_log(WLR_ERROR, "Unexpected context client type: 0x%x", client_type);
+            eglDestroyContext(display, context);
+            eglTerminate(display);
+            return NULL;
         }
     }
 
@@ -1182,7 +1171,7 @@ struct wlr_egl *setup_surfaceless_egl(struct tinywl_server *server) {
         EGL_HEIGHT, 16,
         EGL_NONE
     };
-    
+
     EGLSurface surface = eglCreatePbufferSurface(display, config, pbuffer_attribs);
     if (surface == EGL_NO_SURFACE) {
         wlr_log(WLR_ERROR, "Failed to create pbuffer surface. Error: 0x%x", eglGetError());
@@ -1209,33 +1198,28 @@ struct wlr_egl *setup_surfaceless_egl(struct tinywl_server *server) {
     wlr_log(WLR_INFO, "OpenGL ES Vendor: %s", gl_vendor ? gl_vendor : "Unknown");
     wlr_log(WLR_INFO, "OpenGL ES Renderer: %s", gl_renderer ? gl_renderer : "Unknown");
     wlr_log(WLR_INFO, "OpenGL ES Version: %s", gl_version ? gl_version : "Unknown");
-    
-    // 13. Clear context before passing to wlroots
-    eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-    wlr_log(WLR_INFO, "Cleared EGL context before passing to wlroots");
 
-    // 14. Store EGL resources in server structure
+    // 13. Store EGL resources in server structure
     server->egl_display = display;
     server->egl_config = config;
     server->egl_context = context;
     server->egl_surface = surface;
 
-    // 15. Now let wlroots create its wrapper with our context
+    // 14. Create wlr_egl with the valid context
     wlr_log(WLR_INFO, "Creating wlr_egl with context");
-    struct wlr_egl *wlr_egl = wlr_egl_create_with_context(display, config);
-    
+    struct wlr_egl *wlr_egl = wlr_egl_create_with_context(display, context);
     if (!wlr_egl) {
         wlr_log(WLR_ERROR, "Failed to create wlr_egl with context");
+        eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         eglDestroySurface(display, surface);
         eglDestroyContext(display, context);
         eglTerminate(display);
         return NULL;
     }
-    
+
     wlr_log(WLR_INFO, "Successfully created wlr_egl");
     return wlr_egl;
 }
-
 void cleanup_egl(struct tinywl_server *server) {
     printf("Cleaning up EGL resources\n");
     if (server->egl_display != EGL_NO_DISPLAY) {
