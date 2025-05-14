@@ -1042,131 +1042,211 @@ static bool is_zink_renderer(struct wlr_backend *backend, struct wlr_renderer *r
 #endif
 
 struct wlr_egl *setup_surfaceless_egl(struct tinywl_server *server) {
-    printf("Setting up surfaceless EGL display\n");
+    wlr_log(WLR_INFO, "Starting surfaceless EGL setup");
+
+    // 1. Check for required EGL extensions
+    const char *egl_vendor = eglQueryString(EGL_NO_DISPLAY, EGL_VENDOR);
+    const char *egl_version = eglQueryString(EGL_NO_DISPLAY, EGL_VERSION);
+    wlr_log(WLR_INFO, "EGL Vendor: %s", egl_vendor ? egl_vendor : "Unknown");
+    wlr_log(WLR_INFO, "EGL Version: %s", egl_version ? egl_version : "Unknown");
 
     const char *extensions = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
     if (!extensions) {
-        fprintf(stderr, "Could not query EGL extensions\n");
+        wlr_log(WLR_ERROR, "Could not query EGL extensions");
         return NULL;
     }
-    printf("Client EGL Extensions: %s\n", extensions);
+    wlr_log(WLR_INFO, "EGL extensions: %s", extensions);
 
     bool has_surfaceless = strstr(extensions, "EGL_MESA_platform_surfaceless") != NULL;
     bool has_platform_base = strstr(extensions, "EGL_EXT_platform_base") != NULL;
+    wlr_log(WLR_INFO, "Surfaceless platform support: %s", has_surfaceless ? "YES" : "NO");
+    wlr_log(WLR_INFO, "Platform base extension: %s", has_platform_base ? "YES" : "NO");
+
     if (!has_surfaceless || !has_platform_base) {
-        fprintf(stderr, "Required EGL extensions not available\n");
+        wlr_log(WLR_ERROR, "Required EGL extensions not available");
         return NULL;
     }
 
+    // 2. Get platform display function
     PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display =
         (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
     if (!get_platform_display) {
-        fprintf(stderr, "Platform display function not available\n");
+        wlr_log(WLR_ERROR, "Platform display function not available");
         return NULL;
     }
+    wlr_log(WLR_INFO, "Retrieved eglGetPlatformDisplayEXT");
 
-    server->egl_display = get_platform_display(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
-    if (server->egl_display == EGL_NO_DISPLAY) {
-        fprintf(stderr, "Failed to create surfaceless display\n");
+    // 3. Create surfaceless display
+    EGLDisplay display = get_platform_display(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
+    if (display == EGL_NO_DISPLAY) {
+        wlr_log(WLR_ERROR, "Failed to create surfaceless display. EGL error: 0x%x", eglGetError());
         return NULL;
     }
+    wlr_log(WLR_INFO, "Created surfaceless display: %p", (void*)display);
 
+    // 4. Initialize EGL
     EGLint major, minor;
-    if (!eglInitialize(server->egl_display, &major, &minor)) {
-        fprintf(stderr, "EGL initialization failed. Error: 0x%x\n", eglGetError());
+    if (!eglInitialize(display, &major, &minor)) {
+        wlr_log(WLR_ERROR, "EGL initialization failed. Error: 0x%x", eglGetError());
+        eglTerminate(display);
         return NULL;
     }
-    printf("EGL initialized, version: %d.%d\n", major, minor);
+    wlr_log(WLR_INFO, "EGL initialized, version: %d.%d", major, minor);
+    server->egl_display = display;
 
-    const EGLint config_attribs[] = {
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
-        EGL_RED_SIZE, 8,
-        EGL_GREEN_SIZE, 8,
-        EGL_BLUE_SIZE, 8,
-        EGL_ALPHA_SIZE, 8,
-        EGL_DEPTH_SIZE, 16,
-        EGL_STENCIL_SIZE, 8,
-        EGL_NONE
+    // 5. Multiple configuration attempts
+    const EGLint config_attempts[][20] = {
+        {
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+            EGL_SURFACE_TYPE, EGL_PBUFFER_BIT | EGL_WINDOW_BIT | EGL_PIXMAP_BIT,
+            EGL_RED_SIZE, 8,
+            EGL_GREEN_SIZE, 8,
+            EGL_BLUE_SIZE, 8,
+            EGL_ALPHA_SIZE, 8,
+            EGL_DEPTH_SIZE, EGL_DONT_CARE,
+            EGL_STENCIL_SIZE, EGL_DONT_CARE,
+            EGL_NONE
+        },
+        {
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+            EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+            EGL_RED_SIZE, 8,
+            EGL_GREEN_SIZE, 8,
+            EGL_BLUE_SIZE, 8,
+            EGL_ALPHA_SIZE, 8,
+            EGL_NONE
+        },
+        {
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+            EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+            EGL_RED_SIZE, 1,
+            EGL_GREEN_SIZE, 1,
+            EGL_BLUE_SIZE, 1,
+            EGL_NONE
+        }
     };
 
+    EGLConfig config = NULL;
     EGLint num_config = 0;
-    if (!eglChooseConfig(server->egl_display, config_attribs, &server->egl_config, 1, &num_config) || num_config == 0) {
-        fprintf(stderr, "EGL config selection failed. Error code: 0x%x\n", eglGetError());
-        eglTerminate(server->egl_display);
+
+    // Try different configurations
+    for (size_t i = 0; i < sizeof(config_attempts) / sizeof(config_attempts[0]); i++) {
+        wlr_log(WLR_INFO, "Attempting EGL configuration attempt %zu", i);
+        
+        if (eglChooseConfig(display, config_attempts[i], &config, 1, &num_config)) {
+            if (num_config > 0) {
+                wlr_log(WLR_INFO, "Successfully found EGL configuration");
+                break;
+            }
+        } else {
+            wlr_log(WLR_ERROR, "EGL config selection failed. Error code: 0x%x", eglGetError());
+        }
+    }
+
+    if (num_config == 0) {
+        wlr_log(WLR_ERROR, "No matching EGL configurations found after multiple attempts");
+        eglTerminate(display);
         return NULL;
     }
-    printf("Found suitable EGL configuration\n");
+    server->egl_config = config;
+    wlr_log(WLR_INFO, "Found suitable EGL configuration");
 
+    // Log selected config attributes
+    EGLint renderable_type, surface_type;
+    eglGetConfigAttrib(display, server->egl_config, EGL_RENDERABLE_TYPE, &renderable_type);
+    eglGetConfigAttrib(display, server->egl_config, EGL_SURFACE_TYPE, &surface_type);
+    wlr_log(WLR_INFO, "Selected config: Renderable Type=0x%x, Surface Type=0x%x",
+            renderable_type, surface_type);
+    if (!(renderable_type & EGL_OPENGL_ES2_BIT)) {
+        wlr_log(WLR_ERROR, "Selected config does not support EGL_OPENGL_ES2_BIT");
+        eglTerminate(display);
+        return NULL;
+    }
+
+    // 6. Bind OpenGL ES API
     if (!eglBindAPI(EGL_OPENGL_ES_API)) {
-        fprintf(stderr, "Failed to bind OpenGL ES API. Error: 0x%x\n", eglGetError());
-        eglTerminate(server->egl_display);
+        wlr_log(WLR_ERROR, "Failed to bind OpenGL ES API. Error: 0x%x", eglGetError());
+        eglTerminate(display);
         return NULL;
     }
+    EGLint current_api = eglQueryAPI();
+    if (current_api != EGL_OPENGL_ES_API) {
+        wlr_log(WLR_ERROR, "EGL API is not OpenGL ES (got 0x%x)", current_api);
+        eglTerminate(display);
+        return NULL;
+    }
+    wlr_log(WLR_INFO, "EGL API bound to OpenGL ES");
 
+    // 7. Create EGL context
     EGLint ctx_attribs[] = {
         EGL_CONTEXT_CLIENT_VERSION, 2,
         EGL_NONE
     };
-    server->egl_context = eglCreateContext(server->egl_display, server->egl_config, EGL_NO_CONTEXT, ctx_attribs);
+    server->egl_context = eglCreateContext(display, server->egl_config, EGL_NO_CONTEXT, ctx_attribs);
     if (server->egl_context == EGL_NO_CONTEXT) {
-        fprintf(stderr, "Context creation failed. Error: 0x%x\n", eglGetError());
-        eglTerminate(server->egl_display);
+        wlr_log(WLR_ERROR, "Context creation failed. Error: 0x%x", eglGetError());
+        eglTerminate(display);
         return NULL;
     }
-    printf("Created EGL context\n");
+    wlr_log(WLR_INFO, "Created EGL context");
 
+    // 8. Create Pbuffer surface
     EGLint pbuffer_attribs[] = {
         EGL_WIDTH, 16,
         EGL_HEIGHT, 16,
         EGL_NONE
     };
-    server->egl_surface = eglCreatePbufferSurface(server->egl_display, server->egl_config, pbuffer_attribs);
+    server->egl_surface = eglCreatePbufferSurface(display, server->egl_config, pbuffer_attribs);
     if (server->egl_surface == EGL_NO_SURFACE) {
-        fprintf(stderr, "Failed to create PBuffer surface. Error: 0x%x\n", eglGetError());
-        eglDestroyContext(server->egl_display, server->egl_context);
-        eglTerminate(server->egl_display);
+        wlr_log(WLR_ERROR, "Failed to create PBuffer surface. Error: 0x%x", eglGetError());
+        eglDestroyContext(display, server->egl_context);
+        eglTerminate(display);
         return NULL;
     }
 
-    if (!eglMakeCurrent(server->egl_display, server->egl_surface, server->egl_surface, server->egl_context)) {
-        fprintf(stderr, "Failed to make context current. Error: 0x%x\n", eglGetError());
-        eglDestroySurface(server->egl_display, server->egl_surface);
-        eglDestroyContext(server->egl_display, server->egl_context);
-        eglTerminate(server->egl_display);
+    // 9. Make context current
+    if (!eglMakeCurrent(display, server->egl_surface, server->egl_surface, server->egl_context)) {
+        wlr_log(WLR_ERROR, "Failed to make context current. Error: 0x%x", eglGetError());
+        eglDestroySurface(display, server->egl_surface);
+        eglDestroyContext(display, server->egl_context);
+        eglTerminate(display);
         return NULL;
     }
-    printf("EGL context made current\n");
+    wlr_log(WLR_INFO, "EGL context made current");
 
-    struct wlr_egl *wlr_egl = wlr_egl_create_with_context(server->egl_display, server->egl_config);
+    // 10. Create wlr_egl
+    struct wlr_egl *wlr_egl = wlr_egl_create_with_context(display, server->egl_config);
     if (!wlr_egl) {
-        fprintf(stderr, "Failed to create wlr_egl\n");
-        eglMakeCurrent(server->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        eglDestroySurface(server->egl_display, server->egl_surface);
-        eglDestroyContext(server->egl_display, server->egl_context);
-        eglTerminate(server->egl_display);
+        wlr_log(WLR_ERROR, "Failed to create wlr_egl");
+        eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        eglDestroySurface(display, server->egl_surface);
+        eglDestroyContext(display, server->egl_context);
+        eglTerminate(display);
         return NULL;
     }
 
+    // 11. Log OpenGL ES information
     const char *gl_vendor = (const char *)glGetString(GL_VENDOR);
     const char *gl_renderer = (const char *)glGetString(GL_RENDERER);
     const char *gl_version = (const char *)glGetString(GL_VERSION);
-    printf("OpenGL ES Vendor: %s\n", gl_vendor ? gl_vendor : "Unknown");
-    printf("OpenGL ES Renderer: %s\n", gl_renderer ? gl_renderer : "Unknown");
-    printf("OpenGL ES Version: %s\n", gl_version ? gl_version : "Unknown");
+    wlr_log(WLR_INFO, "OpenGL ES Vendor: %s", gl_vendor ? gl_vendor : "Unknown");
+    wlr_log(WLR_INFO, "OpenGL ES Renderer: %s", gl_renderer ? gl_renderer : "Unknown");
+    wlr_log(WLR_INFO, "OpenGL ES Version: %s", gl_version ? gl_version : "Unknown");
 
+    // 12. Test OpenGL ES
     glClearColor(0.2f, 0.3f, 0.8f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     GLenum error = glGetError();
     if (error != GL_NO_ERROR) {
-        fprintf(stderr, "OpenGL ES error: 0x%x\n", error);
-        eglDestroySurface(server->egl_display, server->egl_surface);
-        eglDestroyContext(server->egl_display, server->egl_context);
-        eglTerminate(server->egl_display);
+        wlr_log(WLR_ERROR, "OpenGL ES error: 0x%x", error);
+        eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        eglDestroySurface(display, server->egl_surface);
+        eglDestroyContext(display, server->egl_context);
+        eglTerminate(display);
         return NULL;
     }
 
-    eglMakeCurrent(server->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     return wlr_egl;
 }
 
@@ -1191,7 +1271,7 @@ void cleanup_egl(struct tinywl_server *server) {
 /* Updated main function */
 int main(int argc, char *argv[]) {
     printf("Starting compositor with surfaceless EGL display\n");
- 
+ /*
 
     // Set Mesa environment variables for Zink
     setenv("MESA_VK_VERSION_OVERRIDE", "1.2", 1);
@@ -1202,7 +1282,7 @@ int main(int argc, char *argv[]) {
     setenv("ZINK_DESCRIPTORS", "lazy", 1);
     setenv("ZINK_NO_TIMELINES", "1", 1);
     setenv("ZINK_NO_DECOMPRESS", "1", 1);
-
+*/
     // Print environment variables
     printf("VK_ICD_FILENAMES=%s\n", getenv("VK_ICD_FILENAMES"));
     printf("MESA_LOADER_DRIVER_OVERRIDE=%s\n", getenv("MESA_LOADER_DRIVER_OVERRIDE"));
