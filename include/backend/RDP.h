@@ -44,7 +44,7 @@ struct wlr_RDP_backend {
     struct wl_list peers;
 };*/
 
-ba
+
 
 /**
  * Our per-output structure: one RDP "virtual monitor."
@@ -65,7 +65,7 @@ void rdp_transmit_surface(struct wlr_buffer *buffer);
 /**
  * Entry point: create an RDP backend
  */
-struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display);
+//struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display);
 struct wlr_RDP_output *wlr_RDP_output_create(
     struct wlr_RDP_backend *backend, const char *name,
     int width, int height, int refresh_hz);
@@ -74,8 +74,7 @@ struct wlr_RDP_output *wlr_RDP_output_create(
 bool wlr_backend_is_RDP(struct wlr_backend *backend);
 
 // Function to cast a wlr_backend to wlr_RDP_backend
-struct wlr_RDP_backend *RDP_backend_from_backend(struct wlr_backend *backend);
-
+struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display, struct wlr_egl *egl, const char *RDP_display);
 
 extern freerdp_peer *global_rdp_peer;
 

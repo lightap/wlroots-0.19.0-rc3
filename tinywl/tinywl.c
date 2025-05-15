@@ -34,6 +34,7 @@
 #include <EGL/egl.h>
 #include <wlr/render/egl.h>
 #include <wlr/render/gles2.h>
+#include <wlr/render/egl.h>
 
 #include <render/allocator/RDP_allocator.h>
 #include <wlr/backend/RDP.h>
@@ -241,8 +242,8 @@ struct tinywl_keyboard {
 
 
 /* Function declarations */
-struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display);
-struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void);
+//struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display, struct wlr_egl *egl);
+//struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void);
 struct wlr_allocator *wlr_rdp_allocator_create(struct wlr_renderer *renderer);
 void rdp_transmit_surface(struct wlr_buffer *buffer);
 //freerdp_peer *get_global_rdp_peer(void);
@@ -992,7 +993,7 @@ static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
     wl_signal_add(&xdg_popup->events.destroy, &popup->destroy);
 }
 
-/*
+
 static bool is_zink_renderer(struct wlr_backend *backend, struct wlr_renderer *renderer, struct wlr_allocator *allocator) {
     if (!renderer) {
         wlr_log(WLR_ERROR, "No renderer available to check type");
@@ -1038,7 +1039,7 @@ static bool is_zink_renderer(struct wlr_backend *backend, struct wlr_renderer *r
     eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
 
     return is_zink;
-}*/
+}
 
 #ifndef EGL_PLATFORM_SURFACELESS_MESA
 #define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
@@ -1240,6 +1241,9 @@ void cleanup_egl(struct tinywl_server *server) {
 
 /* Updated main function */
 int main(int argc, char *argv[]) {
+    
+
+
     printf("Starting compositor with surfaceless EGL display\n");
 
     // Print environment variables
@@ -1283,10 +1287,25 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+
+
+wlr_log(WLR_INFO, "Setting compositor display");
+wlr_backend_set_compositor_display(server.wl_display);
     const char *backends_env = getenv("WLR_BACKENDS");
     if (backends_env && strcmp(backends_env, "RDP") == 0) {
         wlr_log(WLR_INFO, "Creating RDP backend");
-        server.backend = wlr_RDP_backend_create(server.wl_display);
+//        server.backend = wlr_RDP_backend_create(server.wl_display);
+
+
+ setenv("WLR_BACKENDS", "RDP",1);
+
+server.backend = wlr_RDP_backend_create(server.wl_display, wlr_egl, NULL);
+if (!server.backend) {
+    wlr_log(WLR_ERROR, "Failed to create RDP backend");
+ //   wlr_egl_free(wlr_egl);
+    wl_display_destroy(server.wl_display);
+    return 1;
+}
     } else {
         server.backend = wlr_backend_autocreate(wl_display_get_event_loop(server.wl_display), NULL);
     }
@@ -1296,12 +1315,27 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    server.renderer = wlr_gles2_renderer_create_surfaceless();
-    if (!server.renderer) {
-        wlr_log(WLR_ERROR, "Failed to create renderer");
-        server_destroy(&server);
+    server.renderer = wlr_renderer_autocreate(server.backend);
+    if (server.renderer == NULL) {
+        wlr_log(WLR_ERROR, "failed to create wlr_renderer");
         return 1;
     }
+
+
+// Check if the renderer is Zink
+    if (!is_zink_renderer(server.backend, server.renderer, NULL)) {
+        wlr_log(WLR_ERROR, "Renderer is not using Zink (Vulkan). Performance may be suboptimal.");
+        // Optionally, you can exit here if Zink is required:
+        // wlr_egl_free(wlr_egl);
+        // cleanup_egl(&server);
+        // wlr_renderer_destroy(server.renderer);
+        // wlr_backend_destroy(server.backend);
+        // wl_display_destroy(server.wl_display);
+        // return 1;
+    } else {
+        wlr_log(WLR_INFO, "Confirmed Zink (Vulkan) renderer in use.");
+    }
+
     wlr_renderer_init_wl_display(server.renderer, server.wl_display);
 
     server.allocator = wlr_allocator_autocreate(server.backend, server.renderer);

@@ -16,6 +16,8 @@
 
 #include <wlr/config.h>
 
+#include "render/gles2.h"
+
 #if WLR_HAS_GLES2_RENDERER
 #include <wlr/render/egl.h>
 #include <wlr/render/gles2.h>
@@ -29,6 +31,7 @@
 #include "util/env.h"
 #include "backend/backend.h"
 #include <drm_fourcc.h>
+#include <stdio.h>
 
 void wlr_renderer_init(struct wlr_renderer *renderer,
 		const struct wlr_renderer_impl *impl, uint32_t render_buffer_caps) {
@@ -119,6 +122,15 @@ bool wlr_renderer_init_wl_display(struct wlr_renderer *r,
 
 struct wlr_renderer *renderer_autocreate_with_drm_fd(int drm_fd) {
 	const char *renderer_env = getenv("WLR_RENDERER");
+
+
+// Direct surfaceless path - no fallbacks when surfaceless is requested
+    //if (egl_platform && strcmp(egl_platform, "surfaceless") == 0)
+     {
+        wlr_log(WLR_INFO, "Creating surfaceless GLES2 renderer");
+        return wlr_gles2_renderer_create_surfaceless();
+    }
+
 	if (renderer_env != NULL) {
 		if (strcmp(renderer_env, "gles2") == 0) {
 			if (drm_fd >= 0) {

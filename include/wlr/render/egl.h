@@ -25,6 +25,8 @@
 
 struct wlr_egl;
 
+
+
 /**
  * Create a struct wlr_egl with an existing EGL display and context.
  *
@@ -57,5 +59,12 @@ EGLContext wlr_egl_get_context(struct wlr_egl *egl);
  * This is used for GPU-accelerated rendering without a display device, e.g., with FreeRDP.
  */
 struct wlr_egl *wlr_egl_create_surfaceless(void);
+
+//struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display, struct wlr_egl *egl);
+
+struct wlr_egl *wlr_egl_create(EGLint platform, void *remote_display, EGLint *config_attribs, EGLint visual_id);
+void wlr_egl_free(struct wlr_egl *egl);
+struct wlr_renderer *wlr_gles2_renderer_create(struct wlr_egl *egl);
+struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display, struct wlr_egl *egl, const char *RDP_display);
 
 #endif

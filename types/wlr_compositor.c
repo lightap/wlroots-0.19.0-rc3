@@ -28,6 +28,9 @@
 #include <freerdp/codec/nsc.h>
 #include <freerdp/locale/keyboard.h>
 #include <wlr/backend/RDP.h>
+#include <wlr/backend.h>
+#include <wlr/render/egl.h>
+#include <wlr/backend/RDP.h>
 
 #define COMPOSITOR_VERSION 6
 #define CALLBACK_VERSION 1

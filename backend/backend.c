@@ -15,6 +15,17 @@
 #include "util/env.h"
 #include "util/time.h"
 #include "render/allocator/RDP_allocator.h"
+#include <wlr/backend.h>
+#include <wlr/render/egl.h>
+#include <wlr/backend/RDP.h>
+#include <wlr/util/log.h>
+#include <stdlib.h>
+#include <string.h>
+#include "backend/backend.h"
+#include "render/egl.h"
+#include <wlr/backend/RDP.h>
+#include <wlr/render/egl.h>
+#include <wlr/util/log.h>
 
 #if WLR_HAS_SESSION
 #include <wlr/backend/session.h>
@@ -34,6 +45,8 @@
 #endif
 
 struct wlr_allocator *backend_get_allocator(struct wlr_backend *backend);
+
+struct wlr_backend *attempt_RDP_backend(struct wl_display *display, struct wlr_egl *egl) ;
 
 
 /* Global display set by compositor (e.g., tinywl.c) */
@@ -211,43 +224,120 @@ static struct wlr_backend *attempt_wl_backend(struct wl_event_loop *loop) {
 }
 
 
-static struct wlr_backend *attempt_RDP_backend(struct wl_display *display) {
-#if WLR_HAS_RDP_BACKEND
+
+struct wlr_backend *attempt_RDP_backend(struct wl_display *display, struct wlr_egl *egl) {
     if (!display) {
-        wlr_log(WLR_ERROR, "No display available for RDP backend");
+        wlr_log(WLR_ERROR, "Invalid Wayland display");
         return NULL;
     }
 
-    wlr_log(WLR_INFO, "Creating RDP backend");
+    struct wlr_egl *local_egl = egl;
+    EGLDisplay egl_display = EGL_NO_DISPLAY;
+    EGLContext context = EGL_NO_CONTEXT;
+    EGLConfig config = NULL;
 
-  
-    
-    // Try different graphics drivers in order of preference
-    const char* preferred_driver = getenv("WLR_RENDERER");
-    if (!preferred_driver) {
-        // First try llvmpipe for software rendering
-        setenv("GALLIUM_DRIVER", "zink", 1);
-       
+    // If no EGL context is provided, create a surfaceless one
+    if (!local_egl) {
+        wlr_log(WLR_INFO, "No EGL context provided, creating surfaceless EGL");
+
+        // Check for required extensions
+        const char *client_extensions = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
+        if (!client_extensions) {
+            wlr_log(WLR_ERROR, "Failed to query EGL client extensions: 0x%x", eglGetError());
+            return NULL;
+        }
+        if (!strstr(client_extensions, "EGL_MESA_platform_surfaceless") ||
+            !strstr(client_extensions, "EGL_EXT_platform_base")) {
+            wlr_log(WLR_ERROR, "Required EGL extensions (EGL_MESA_platform_surfaceless, EGL_EXT_platform_base) not available");
+            return NULL;
+        }
+
+        // Get platform display function
+        PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display =
+            (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+        if (!get_platform_display) {
+            wlr_log(WLR_ERROR, "Failed to get eglGetPlatformDisplayEXT: 0x%x", eglGetError());
+            return NULL;
+        }
+
+        // Create surfaceless display
+        egl_display = get_platform_display(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
+        if (egl_display == EGL_NO_DISPLAY) {
+            wlr_log(WLR_ERROR, "Failed to create surfaceless EGL display: 0x%x", eglGetError());
+            return NULL;
+        }
+
+        // Initialize EGL
+        EGLint major, minor;
+        if (!eglInitialize(egl_display, &major, &minor)) {
+            wlr_log(WLR_ERROR, "Failed to initialize EGL: 0x%x", eglGetError());
+            eglTerminate(egl_display);
+            return NULL;
+        }
+        wlr_log(WLR_INFO, "EGL initialized, version: %d.%d", major, minor);
+
+        // Bind OpenGL ES API
+        if (!eglBindAPI(EGL_OPENGL_ES_API)) {
+            wlr_log(WLR_ERROR, "Failed to bind OpenGL ES API: 0x%x", eglGetError());
+            eglTerminate(egl_display);
+            return NULL;
+        }
+
+        // Choose config
+        const EGLint config_attribs[] = {
+            EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+            EGL_RED_SIZE, 8,
+            EGL_GREEN_SIZE, 8,
+            EGL_BLUE_SIZE, 8,
+            EGL_ALPHA_SIZE, 8,
+            EGL_NONE
+        };
+        EGLint num_config;
+        if (!eglChooseConfig(egl_display, config_attribs, &config, 1, &num_config) || num_config < 1) {
+            wlr_log(WLR_ERROR, "Failed to choose EGL config: 0x%x", eglGetError());
+            eglTerminate(egl_display);
+            return NULL;
+        }
+
+        // Create context
+        const EGLint ctx_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+        context = eglCreateContext(egl_display, config, EGL_NO_CONTEXT, ctx_attribs);
+        if (context == EGL_NO_CONTEXT) {
+            wlr_log(WLR_ERROR, "Failed to create EGL context: 0x%x", eglGetError());
+            eglTerminate(egl_display);
+            return NULL;
+        }
+
+        // Create wlr_egl
+        local_egl = wlr_egl_create_with_context(egl_display, config);
+        if (!local_egl) {
+            wlr_log(WLR_ERROR, "Failed to create wlr_egl");
+            eglDestroyContext(egl_display, context);
+            eglTerminate(egl_display);
+            return NULL;
+        }
+
+        wlr_log(WLR_INFO, "Created surfaceless EGL context");
     }
 
-    struct wlr_backend *backend = wlr_RDP_backend_create(display);
+    wlr_log(WLR_INFO, "Attempting to create RDP backend");
+    struct wlr_backend *backend = wlr_RDP_backend_create(display, local_egl, NULL);
     if (!backend) {
         wlr_log(WLR_ERROR, "Failed to create RDP backend");
+        if (!egl && local_egl) {
+            wlr_egl_destroy(local_egl);
+        }
         return NULL;
     }
 
-    size_t outputs = parse_outputs_env("WLR_RDP_OUTPUTS");
-    if (outputs > 0) {
-        wlr_log(WLR_INFO, "RDP backend will use default output configuration");
+    wlr_log(WLR_INFO, "RDP backend created successfully");
+    if (!egl && local_egl) {
+        wlr_egl_destroy(local_egl);
     }
-
-    
     return backend;
-#else
-    wlr_log(WLR_ERROR, "RDP backend not enabled during compilation");
-    return NULL;
-#endif
 }
+
 
 
 static struct wlr_backend *attempt_headless_backend(struct wl_event_loop *loop) {
@@ -310,6 +400,9 @@ static struct wlr_backend *attempt_drm_backend(struct wlr_backend *backend, stru
 #endif
 }
 
+
+
+
 static struct wlr_backend *attempt_libinput_backend(struct wlr_session *session) {
 #if WLR_HAS_LIBINPUT_BACKEND
 	return wlr_libinput_backend_create(session);
@@ -330,7 +423,7 @@ static bool attempt_backend_by_name(struct wl_event_loop *loop,
 			wlr_log(WLR_ERROR, "Compositor display not set for RDP backend");
 			return false;
 		}
-		backend = attempt_RDP_backend(compositor_display);
+		backend = attempt_RDP_backend(compositor_display, NULL);
 	} else if (strcmp(name, "headless") == 0) {
 		backend = attempt_headless_backend(loop);
 	} else if (strcmp(name, "drm") == 0 || strcmp(name, "libinput") == 0) {
@@ -420,7 +513,7 @@ struct wlr_backend *wlr_backend_autocreate(struct wl_event_loop *loop,
 			wlr_log(WLR_ERROR, "Compositor display not set for RDP backend");
 			goto error;
 		}
-		struct wlr_backend *RDP_backend = attempt_RDP_backend(compositor_display);
+		struct wlr_backend *RDP_backend = attempt_RDP_backend(compositor_display, NULL);
 		if (!RDP_backend) {
 			goto error;
 		}

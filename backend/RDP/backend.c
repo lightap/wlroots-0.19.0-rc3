@@ -173,11 +173,12 @@ void rdp_transmit_surface(struct wlr_buffer *buffer);
 
 /* This is our backend’s public constructor */
 //struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display);
-struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display); 
+// /struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display); 
+struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display, struct wlr_egl *egl, const char *RDP_display);
 struct wlr_allocator *wlr_rdp_allocator_create(struct wlr_renderer *renderer);
 
 // Function declarations
-struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void);
+//struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void);
 struct wlr_egl *wlr_gles2_renderer_get_egl(struct wlr_renderer *renderer);
 bool wlr_egl_make_current(struct wlr_egl *egl);
 
@@ -455,26 +456,30 @@ static BOOL rdp_peer_activate(freerdp_peer *client) {
     return TRUE;
 }
 
-
+/*
 struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display) {
-    wlr_log(WLR_ERROR, "RDP Backend Creation - START");
+    wlr_log(WLR_INFO, "Creating RDP backend (surfaceless approach)");
 
+    // Initialize peer manager and clear global peer
     set_global_rdp_peer(NULL);
     rdp_connection_established = false;
     init_rdp_peer_manager();
 
+    // Allocate backend structure
     struct wlr_RDP_backend *backend = calloc(1, sizeof(*backend));
     if (!backend) {
-        wlr_log(WLR_ERROR, "RDP Backend: Failed to allocate memory");
+        wlr_log(WLR_ERROR, "Failed to allocate RDP backend");
         return NULL;
     }
 
+    // Initialize backend
     wlr_backend_init(&backend->backend, &rdp_backend_impl);
     backend->backend.buffer_caps = WLR_BUFFER_CAP_DATA_PTR | WLR_BUFFER_CAP_SHM;
     backend->display = display;
     wl_list_init(&backend->outputs);
     wl_list_init(&backend->peers);
 
+    // Get event loop
     backend->event_loop = wl_display_get_event_loop(display);
     if (!backend->event_loop) {
         wlr_log(WLR_ERROR, "Failed to get event loop");
@@ -482,6 +487,7 @@ struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display) {
         return NULL;
     }
 
+    // Create FreeRDP listener
     backend->listener = freerdp_listener_new();
     if (!backend->listener) {
         wlr_log(WLR_ERROR, "RDP Backend: Failed to create listener");
@@ -499,9 +505,9 @@ struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display) {
         return NULL;
     }
 
-    void* rfds[32] = {0};
+    // Get file descriptors for the listener
+    void *rfds[32] = {0};
     int rcount = 0;
-    
     if (!backend->listener->GetFileDescriptor(backend->listener, rfds, &rcount)) {
         wlr_log(WLR_ERROR, "Failed to get RDP file descriptors");
         freerdp_listener_free(backend->listener);
@@ -509,12 +515,13 @@ struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display) {
         return NULL;
     }
 
+    // Add file descriptors to event loop
     backend->fd_count = 0;
     for (int i = 0; i < rcount; i++) {
         int fd = (int)(intptr_t)rfds[i];
         struct wl_event_source *source = wl_event_loop_add_fd(
             backend->event_loop, fd, WL_EVENT_READABLE,
-            rdp_listener_activity, backend->listener); // Line ~625
+            rdp_listener_activity, backend->listener);
         if (!source) {
             wlr_log(WLR_ERROR, "Failed to add fd %d to event loop", fd);
             for (int j = 0; j < backend->fd_count; j++) {
@@ -528,8 +535,13 @@ struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display) {
         wlr_log(WLR_DEBUG, "Added RDP listener fd %d to event loop", fd);
     }
 
-    // Initialize renderer
-    backend->renderer = wlr_gles2_renderer_create_surfaceless();
+    // Set environment variables for surfaceless rendering
+    setenv("MESA_LOADER_DRIVER_OVERRIDE", "zink", 1);
+    setenv("EGL_PLATFORM", "surfaceless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+
+    // Create renderer
+    backend->renderer = wlr_renderer_autocreate(&backend->backend);
     if (!backend->renderer) {
         wlr_log(WLR_ERROR, "Failed to create RDP renderer");
         for (int i = 0; i < backend->fd_count; i++) {
@@ -539,8 +551,11 @@ struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display) {
         free(backend);
         return NULL;
     }
+
+    // Initialize renderer for Wayland display
     wlr_renderer_init_wl_display(backend->renderer, display);
-    // Initialize allocator
+
+    // Create allocator
     backend->allocator = wlr_allocator_autocreate(&backend->backend, backend->renderer);
     if (!backend->allocator) {
         wlr_log(WLR_ERROR, "Failed to create RDP allocator");
@@ -553,7 +568,133 @@ struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display) {
         return NULL;
     }
 
-    wlr_log(WLR_ERROR, "RDP Backend Creation - COMPLETE");
+    wlr_log(WLR_INFO, "RDP backend created successfully with surfaceless renderer");
+    return &backend->backend;
+}*/
+
+struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display, struct wlr_egl *egl, const char *RDP_display) {
+    wlr_log(WLR_INFO, "Creating RDP backend (surfaceless approach)");
+
+    // Initialize peer manager and clear global peer
+    set_global_rdp_peer(NULL);
+    rdp_connection_established = false;
+    init_rdp_peer_manager();
+
+    // Allocate backend structure
+    struct wlr_RDP_backend *backend = calloc(1, sizeof(*backend));
+    if (!backend) {
+        wlr_log(WLR_ERROR, "Failed to allocate RDP backend");
+        return NULL;
+    }
+
+    // Initialize backend
+    wlr_backend_init(&backend->backend, &rdp_backend_impl);
+    backend->backend.buffer_caps = WLR_BUFFER_CAP_DATA_PTR | WLR_BUFFER_CAP_SHM;
+    backend->display = display;
+    wl_list_init(&backend->outputs);
+    wl_list_init(&backend->peers);
+
+    // Get event loop
+    backend->event_loop = wl_display_get_event_loop(display);
+    if (!backend->event_loop) {
+        wlr_log(WLR_ERROR, "Failed to get event loop");
+        free(backend);
+        return NULL;
+    }
+
+    // Create FreeRDP listener
+    backend->listener = freerdp_listener_new();
+    if (!backend->listener) {
+        wlr_log(WLR_ERROR, "RDP Backend: Failed to create listener");
+        free(backend);
+        return NULL;
+    }
+
+    backend->listener->info = backend;
+    backend->listener->PeerAccepted = rdp_incoming_peer;
+
+    if (!backend->listener->Open(backend->listener, NULL, 3389)) {
+        wlr_log(WLR_ERROR, "RDP Backend: Failed to open listener");
+        freerdp_listener_free(backend->listener);
+        free(backend);
+        return NULL;
+    }
+
+    // Get file descriptors for the listener
+    void *rfds[32] = {0};
+    int rcount = 0;
+    if (!backend->listener->GetFileDescriptor(backend->listener, rfds, &rcount)) {
+        wlr_log(WLR_ERROR, "Failed to get RDP file descriptors");
+        freerdp_listener_free(backend->listener);
+        free(backend);
+        return NULL;
+    }
+
+    // Add file descriptors to event loop
+    backend->fd_count = 0;
+    for (int i = 0; i < rcount; i++) {
+        int fd = (int)(intptr_t)rfds[i];
+        struct wl_event_source *source = wl_event_loop_add_fd(
+            backend->event_loop, fd, WL_EVENT_READABLE,
+            rdp_listener_activity, backend->listener);
+        if (!source) {
+            wlr_log(WLR_ERROR, "Failed to add fd %d to event loop", fd);
+            for (int j = 0; j < backend->fd_count; j++) {
+                wl_event_source_remove(backend->fd_event_sources[j]);
+            }
+            freerdp_listener_free(backend->listener);
+            free(backend);
+            return NULL;
+        }
+        backend->fd_event_sources[backend->fd_count++] = source;
+        wlr_log(WLR_DEBUG, "Added RDP listener fd %d to event loop", fd);
+    }
+
+    // Set environment variables for surfaceless rendering
+    setenv("MESA_LOADER_DRIVER_OVERRIDE", "zink", 1);
+    setenv("EGL_PLATFORM", "surfaceless", 1);
+    setenv("WLR_RENDERER", "gles2", 1);
+
+    // Try creating GLES2 renderer
+    wlr_log(WLR_INFO, "Attempting to create GLES2 renderer with surfaceless EGL");
+    backend->renderer = wlr_renderer_autocreate(&backend->backend);
+    if (!backend->renderer) {
+        wlr_log(WLR_ERROR, "Failed to create GLES2 renderer, falling back to Pixman");
+        // Fallback to Pixman renderer
+        setenv("WLR_RENDERER", "pixman", 1);
+        backend->renderer = wlr_renderer_autocreate(&backend->backend);
+        if (!backend->renderer) {
+            wlr_log(WLR_ERROR, "Failed to create Pixman renderer");
+            for (int i = 0; i < backend->fd_count; i++) {
+                wl_event_source_remove(backend->fd_event_sources[i]);
+            }
+            freerdp_listener_free(backend->listener);
+            free(backend);
+            return NULL;
+        }
+        wlr_log(WLR_INFO, "Successfully created Pixman renderer");
+    } else {
+        wlr_log(WLR_INFO, "Successfully created GLES2 renderer");
+    }
+
+    // Initialize renderer for Wayland display
+    wlr_renderer_init_wl_display(backend->renderer, display);
+
+    // Create allocator
+    backend->allocator = wlr_allocator_autocreate(&backend->backend, backend->renderer);
+    if (!backend->allocator) {
+        wlr_log(WLR_ERROR, "Failed to create RDP allocator");
+        wlr_renderer_destroy(backend->renderer);
+        for (int i = 0; i < backend->fd_count; i++) {
+            wl_event_source_remove(backend->fd_event_sources[i]);
+        }
+        freerdp_listener_free(backend->listener);
+        free(backend);
+        return NULL;
+    }
+
+//printf( "RDP backend created successfully with %s renderer",
+  //          backend->renderer->impl);
     return &backend->backend;
 }
 
@@ -1457,7 +1598,7 @@ static struct wlr_RDP_output *rdp_output_create(
 static bool rdp_backend_start(struct wlr_backend *wlr_backend) {
     struct wlr_RDP_backend *backend = RDP_backend_from_backend(wlr_backend);
     wlr_log(WLR_INFO, "Starting RDP backend");
-    struct wlr_RDP_output *out = rdp_output_create(backend, "rdp-0", 1280, 720, 60);
+    struct wlr_RDP_output *out = rdp_output_create(backend, "rdp-0", 1024, 768, 60);
     if (!out) {
         wlr_log(WLR_ERROR, "Failed to create RDP output");
         return false;

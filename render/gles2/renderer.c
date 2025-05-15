@@ -55,6 +55,8 @@ static bool gles2_read_pixels(struct wlr_renderer *wlr_renderer,
 
 
 
+//struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void);
+
 struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void);
 
 
@@ -1486,38 +1488,37 @@ struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void) {
         return NULL;
     }
 
-    // Log system EGL information
-    const char *egl_vendor = eglQueryString(EGL_NO_DISPLAY, EGL_VENDOR);
-    const char *egl_version = eglQueryString(EGL_NO_DISPLAY, EGL_VERSION);
-    wlr_log(WLR_INFO, "EGL Vendor: %s", egl_vendor ? egl_vendor : "Unknown");
-    wlr_log(WLR_INFO, "EGL Version: %s", egl_version ? egl_version : "Unknown");
-
+    // Check client extensions without a display
     const char *extensions = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
     wlr_log(WLR_INFO, "Client EGL Extensions: %s", extensions ? extensions : "NULL");
 
     // Check for surfaceless support
-    bool has_surfaceless = strstr(extensions, "EGL_MESA_platform_surfaceless") != NULL;
-    bool has_platform_base = strstr(extensions, "EGL_EXT_platform_base") != NULL;
+    bool has_surfaceless = extensions && strstr(extensions, "EGL_MESA_platform_surfaceless") != NULL;
+    bool has_platform_base = extensions && strstr(extensions, "EGL_EXT_platform_base") != NULL;
     wlr_log(WLR_INFO, "Surfaceless platform support: %s", has_surfaceless ? "YES" : "NO");
     wlr_log(WLR_INFO, "Platform base extension: %s", has_platform_base ? "YES" : "NO");
 
-    // Use platform display function if available
-    PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display = 
-        (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+    if (!has_surfaceless || !has_platform_base) {
+        wlr_log(WLR_ERROR, "Required EGL extensions not supported");
+        free(egl);
+        return NULL;
+    }
 
+    // Use platform display function
+    PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display =
+        (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
     if (!get_platform_display) {
         wlr_log(WLR_ERROR, "Platform display function not available");
         free(egl);
         return NULL;
     }
 
-    // Try creating display with surfaceless platform
+    // Create surfaceless display
     EGLDisplay display = get_platform_display(
-        EGL_PLATFORM_SURFACELESS_MESA, 
-        EGL_DEFAULT_DISPLAY, 
+        EGL_PLATFORM_SURFACELESS_MESA,
+        EGL_DEFAULT_DISPLAY,
         NULL
     );
-
     if (display == EGL_NO_DISPLAY) {
         wlr_log(WLR_ERROR, "Failed to create surfaceless display");
         free(egl);
@@ -1533,6 +1534,12 @@ struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void) {
         return NULL;
     }
     wlr_log(WLR_INFO, "EGL initialized, version: %d.%d", major, minor);
+
+    // Query EGL vendor and version after display initialization
+    const char *egl_vendor = eglQueryString(display, EGL_VENDOR);
+    const char *egl_version = eglQueryString(display, EGL_VERSION);
+    wlr_log(WLR_INFO, "EGL Vendor: %s", egl_vendor ? egl_vendor : "Unknown");
+    wlr_log(WLR_INFO, "EGL Version: %s", egl_version ? egl_version : "Unknown");
 
     // Diagnostic: Get number of EGL configurations
     EGLint num_config_total = 0;
@@ -1635,8 +1642,8 @@ struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void) {
         wlr_log(WLR_INFO, "Using Zink (Vulkan) driver for hardware acceleration");
     }
 
-//    wlr_renderer_init(&renderer->wlr_renderer, &renderer_impl);
- wlr_renderer_init(&renderer->wlr_renderer, &renderer_impl, WLR_BUFFER_CAP_DMABUF);
-   
+    // Initialize renderer with DMABUF capability
+    wlr_renderer_init(&renderer->wlr_renderer, &renderer_impl, WLR_BUFFER_CAP_DMABUF);
+
     return &renderer->wlr_renderer;
 }
