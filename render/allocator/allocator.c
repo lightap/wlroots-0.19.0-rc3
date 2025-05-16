@@ -370,7 +370,7 @@ static struct rdp_buffer_pool *rdp_get_pool(struct rdp_allocator *alloc,
     wlr_log(WLR_DEBUG, "Created new buffer pool for %dx%d", width, height);
     return pool;
 }
-
+/*
 // Create or reuse a buffer
 static struct wlr_buffer *rdp_allocator_create_buffer(
     struct wlr_allocator *wlr_alloc,
@@ -421,6 +421,69 @@ static struct wlr_buffer *rdp_allocator_create_buffer(
         free(buffer);
         return NULL;
     }
+
+    buffer->stride = stride;
+    buffer->in_use = true;
+    buffer->last_used = now;
+    buffer->pool = pool;
+    wl_list_insert(&pool->buffers, &buffer->link);
+
+    wlr_log(WLR_INFO, "RDP buffer created successfully: %p", buffer);
+    return &buffer->base;
+}*/
+
+static struct wlr_buffer *rdp_allocator_create_buffer(
+    struct wlr_allocator *wlr_alloc,
+    int width, int height,
+    const struct wlr_drm_format *format) {
+    struct rdp_allocator *alloc = wl_container_of(wlr_alloc, alloc, base);
+    wlr_log(WLR_INFO, "RDP allocator: requesting buffer %dx%d, format: 0x%x",
+            width, height, format ? format->format : 0);
+
+    if (!format || format->format != DRM_FORMAT_XRGB8888) {
+        wlr_log(WLR_ERROR, "Unsupported format 0x%x, only XRGB8888 supported", 
+                format ? format->format : 0);
+        return NULL;
+    }
+
+    struct rdp_buffer_pool *pool = rdp_get_pool(alloc, width, height);
+    if (!pool) {
+        return NULL;
+    }
+
+    // Check for reusable buffers
+    struct rdp_buffer *buffer;
+    time_t now = time(NULL);
+    wl_list_for_each(buffer, &pool->buffers, link) {
+        if (!buffer->in_use && (now - buffer->last_used >= 5)) {
+            wlr_log(WLR_DEBUG, "Reusing buffer %p from pool %dx%d", buffer, width, height);
+            memset(buffer->data, 0, buffer->stride * height);  // Reinitialize data
+            wlr_buffer_init(&buffer->base, &rdp_buffer_impl, width, height);
+            buffer->in_use = true;
+            buffer->last_used = now;
+            return &buffer->base;
+        }
+    }
+
+    // Create new buffer if no reusable ones are available
+    buffer = calloc(1, sizeof(struct rdp_buffer));
+    if (!buffer) {
+        wlr_log(WLR_ERROR, "Failed to allocate RDP buffer");
+        return NULL;
+    }
+
+    wlr_buffer_init(&buffer->base, &rdp_buffer_impl, width, height);
+    size_t stride = width * 4; // XRGB8888 = 4 bytes
+    size_t size = stride * height;
+    wlr_log(WLR_INFO, "RDP buffer: Allocating %zu bytes", size);
+
+    buffer->data = calloc(1, size);
+    if (!buffer->data) {
+        wlr_log(WLR_ERROR, "Failed to allocate buffer data");
+        free(buffer);
+        return NULL;
+    }
+    // No need for memset since calloc zeroes the memory
 
     buffer->stride = stride;
     buffer->in_use = true;

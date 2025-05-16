@@ -65,6 +65,6 @@ struct wlr_egl *wlr_egl_create_surfaceless(void);
 struct wlr_egl *wlr_egl_create(EGLint platform, void *remote_display, EGLint *config_attribs, EGLint visual_id);
 void wlr_egl_free(struct wlr_egl *egl);
 struct wlr_renderer *wlr_gles2_renderer_create(struct wlr_egl *egl);
-struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display, struct wlr_egl *egl, const char *RDP_display);
+struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display);
 
 #endif

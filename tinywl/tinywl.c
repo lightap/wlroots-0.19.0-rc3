@@ -1,249 +1,12 @@
+#include "tinywl/tinywl.h"
 
-#include <assert.h>
-#include <getopt.h>
-#include <stdbool.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <time.h>
-#include <unistd.h>
-#include <wayland-server-core.h>
-#include <wlr/backend.h>
-#include <wlr/backend/RDP.h>
-#include <wlr/render/allocator.h>
-#include <wlr/render/wlr_renderer.h>
-#include <wlr/types/wlr_cursor.h>
-#include <wlr/types/wlr_compositor.h>
-#include <wlr/types/wlr_data_device.h>
-#include <wlr/types/wlr_input_device.h>
-#include <wlr/types/wlr_keyboard.h>
-#include <wlr/types/wlr_output.h>
-#include <wlr/types/wlr_output_layout.h>
-#include <wlr/types/wlr_pointer.h>
-#include <wlr/types/wlr_scene.h>
-#include <wlr/types/wlr_seat.h>
-#include <wlr/types/wlr_subcompositor.h>
-#include <wlr/types/wlr_xcursor_manager.h>
-#include <wlr/types/wlr_xdg_shell.h>
-#include <wlr/util/log.h>
-#include <xkbcommon/xkbcommon.h>
-#include <wlr/render/gles2.h>
-#include <wlr/render/drm_format_set.h>
-#include <wayland-server-protocol.h>
-#include <drm_fourcc.h>
-#include <string.h>
-#include <EGL/egl.h>
-#include <wlr/render/egl.h>
-#include <wlr/render/gles2.h>
-#include <wlr/render/egl.h>
-
-#include <render/allocator/RDP_allocator.h>
-#include <wlr/backend/RDP.h>
-
-
-
-/* RDP backend access */
-struct wlr_rdp_backend {
-    struct wlr_backend backend;
-    freerdp_peer *global_rdp_peer;
-    bool started;
-    /* Other fields may exist, but we only need these */
-};
-
-/* Global backend for get_global_rdp_peer */
-//static struct wlr_backend *backend = NULL;
-
-/* Implementation of get_global_rdp_peer 
-freerdp_peer *get_global_rdp_peer(void) {
-    if (!backend) {
-        wlr_log(WLR_ERROR, "get_global_rdp_peer: Backend not set");
-        return NULL;
-    }
-    struct wlr_rdp_backend *rdp_backend = wl_container_of(backend, rdp_backend, backend);
-    wlr_log(WLR_DEBUG, "get_global_rdp_peer: backend=%p, rdp_backend=%p, global_rdp_peer=%p",
-            (void*)backend, (void*)rdp_backend, (void*)rdp_backend->global_rdp_peer);
-    if (!rdp_backend->global_rdp_peer) {
-        wlr_log(WLR_DEBUG, "No global RDP peer available");
-        return NULL;
-    }
-    wlr_log(WLR_DEBUG, "Retrieved global RDP peer: %p", (void*)rdp_backend->global_rdp_peer);
-    return rdp_backend->global_rdp_peer;
-}*/
-
-
-/* Implementation of rdp_transmit_surface 
-void rdp_transmit_surface(struct wlr_buffer *buffer) {
-    if (!buffer) {
-        wlr_log(WLR_ERROR, "rdp_transmit_surface: NULL buffer");
-        return;
-    }
-
-    wlr_log(WLR_DEBUG, "rdp_transmit_surface: buffer=%p, width=%d, height=%d",
-            (void*)buffer, buffer->width, buffer->height);
-
-    freerdp_peer *peer = get_global_rdp_peer();
-    if (!peer) {
-        wlr_log(WLR_DEBUG, "rdp_transmit_surface: No peer available");
-        return;
-    }
-
-    if (!peer->context) {
-        wlr_log(WLR_ERROR, "rdp_transmit_surface: NULL peer context for peer %p", (void*)peer);
-        return;
-    }
-    if (!peer->update || !peer->update->BeginPaint) {
-        wlr_log(WLR_ERROR, "rdp_transmit_surface: Invalid update interface for peer %p", (void*)peer);
-        return;
-    }
-
-    struct wlr_buffer *locked_buffer = wlr_buffer_lock(buffer);
-    if (!locked_buffer) {
-        wlr_log(WLR_ERROR, "Failed to lock buffer");
-        return;
-    }
-
-    void *data;
-    uint32_t format;
-    size_t stride;
-    if (!wlr_buffer_begin_data_ptr_access(locked_buffer, WLR_BUFFER_DATA_PTR_ACCESS_READ, &data, &format, &stride)) {
-        wlr_log(WLR_ERROR, "Failed to access buffer data, format=%u", format);
-        wlr_buffer_unlock(locked_buffer);
-        return;
-    }
-
-    if (format != DRM_FORMAT_ARGB8888 && format != DRM_FORMAT_XRGB8888) {
-        wlr_log(WLR_ERROR, "Unsupported buffer format: 0x%x", format);
-        wlr_buffer_end_data_ptr_access(locked_buffer);
-        wlr_buffer_unlock(locked_buffer);
-        return;
-    }
-
-    rdpContext *context = peer->context;
-    rdpUpdate *update = peer->update;
-
-    update->BeginPaint(context);
-
-    BITMAP_UPDATE bitmap_update = {0};
-    BITMAP_DATA bitmap_data = {0};
-    bitmap_update.number = 1;
-    bitmap_update.rectangles = &bitmap_data;
-
-    bitmap_data.destLeft = 0;
-    bitmap_data.destTop = 0;
-    bitmap_data.destRight = buffer->width - 1;
-    bitmap_data.destBottom = buffer->height - 1;
-    bitmap_data.width = buffer->width;
-    bitmap_data.height = buffer->height;
-    bitmap_data.bitsPerPixel = 32;
-    bitmap_data.compressed = FALSE;
-    bitmap_data.bitmapDataStream = data;
-    bitmap_data.bitmapLength = stride * buffer->height;
-
-    update->BitmapUpdate(context, &bitmap_update);
-    update->EndPaint(context);
-
-    wlr_buffer_end_data_ptr_access(locked_buffer);
-    wlr_buffer_unlock(locked_buffer);
-    wlr_log(WLR_DEBUG, "Transmitted bitmap update: %dx%d, stride=%zu, format=0x%x",
-            buffer->width, buffer->height, stride, format);
-}*/
-
-
-/* Structures */
-enum tinywl_cursor_mode {
-    TINYWL_CURSOR_PASSTHROUGH,
-    TINYWL_CURSOR_MOVE,
-    TINYWL_CURSOR_RESIZE,
-};
-
-
-
-struct tinywl_server {
-    struct wl_display *wl_display;
-    struct wlr_backend *backend;
-    struct wlr_renderer *renderer;
-    struct wlr_allocator *allocator;
-    struct wlr_scene *scene;
-    struct wlr_scene_output_layout *scene_layout;
-
-    struct wlr_xdg_shell *xdg_shell;
-    struct wl_listener new_xdg_toplevel;
-    struct wl_listener new_xdg_popup;
-    struct wl_list toplevels;
-
-    struct wlr_cursor *cursor;
-    struct wlr_xcursor_manager *cursor_mgr;
-    struct wl_listener cursor_motion;
-    struct wl_listener cursor_motion_absolute;
-    struct wl_listener cursor_button;
-    struct wl_listener cursor_axis;
-    struct wl_listener cursor_frame;
-
-    struct wlr_seat *seat;
-    struct wl_listener new_input;
-    struct wl_listener request_cursor;
-    struct wl_listener request_set_selection;
-    struct wl_list keyboards;
-    enum tinywl_cursor_mode cursor_mode;
-    struct tinywl_toplevel *grabbed_toplevel;
-    double grab_x, grab_y;
-    struct wlr_box grab_geobox;
-    uint32_t resize_edges;
-
-    struct wlr_output_layout *output_layout;
-    struct wl_list outputs;
-    struct wl_listener new_output;
-      EGLDisplay egl_display;
-    EGLConfig egl_config;
-    EGLContext egl_context;
-   EGLSurface egl_surface;
-};
-
-/* Updated tinywl_output struct to store timer */
-struct tinywl_output {
-    struct wl_list link;
-    struct tinywl_server *server;
-    struct wlr_output *wlr_output;
-    struct wl_listener frame;
-    struct wl_listener request_state;
-    struct wl_listener destroy;
-    struct wl_event_source *timer; /* Added for timer access */
-};
-
-struct tinywl_toplevel {
-    struct wl_list link;
-    struct tinywl_server *server;
-    struct wlr_xdg_toplevel *xdg_toplevel;
-    struct wlr_scene_tree *scene_tree;
-    struct wl_listener map;
-    struct wl_listener unmap;
-    struct wl_listener commit;
-    struct wl_listener destroy;
-    struct wl_listener request_move;
-    struct wl_listener request_resize;
-    struct wl_listener request_maximize;
-    struct wl_listener request_fullscreen;
-};
-
-struct tinywl_popup {
-    struct wlr_xdg_popup *xdg_popup;
-    struct wl_listener commit;
-    struct wl_listener destroy;
-};
-
-struct tinywl_keyboard {
-    struct wl_list link;
-    struct tinywl_server *server;
-    struct wlr_keyboard *wlr_keyboard;
-    struct wl_listener modifiers;
-    struct wl_listener key;
-    struct wl_listener destroy;
-};
 
 
 
 /* Function declarations */
 //struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display, struct wlr_egl *egl);
-//struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void);
+struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void);
+
 struct wlr_allocator *wlr_rdp_allocator_create(struct wlr_renderer *renderer);
 void rdp_transmit_surface(struct wlr_buffer *buffer);
 //freerdp_peer *get_global_rdp_peer(void);
@@ -324,6 +87,11 @@ static void server_destroy(struct tinywl_server *server) {
     if (server->seat) {
         wlr_seat_destroy(server->seat);
     }
+    if (server->wl_display) {
+        wl_display_destroy(server->wl_display);
+    }
+
+    cleanup_egl(server);
     if (server->wl_display) {
         wl_display_destroy(server->wl_display);
     }
@@ -643,64 +411,92 @@ static int schedule_frame_timer(void *data) {
 
     /* Rearm the timer */
     if (output->timer) {
-        wl_event_source_timer_update(output->timer, 100); /* 100ms = 10 FPS */
+        wl_event_source_timer_update(output->timer, 1); /* 100ms = 10 FPS */
     }
 
     return 1; /* Keep timer alive */
 }
 
 /* Unchanged output_frame with debug logging */
-static void output_frame(struct wl_listener *listener, void *data) {
-    wlr_log(WLR_DEBUG, "output_frame called for output");
-    struct tinywl_output *output = wl_container_of(listener, output, frame);
-    struct tinywl_server *server = output->server;
-    struct wlr_scene *scene = server->scene;
-    struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(scene, output->wlr_output);
+#include <GLES2/gl2.h> // Add this at the top of tinywl.c if not already present
+// In tinywl.c, around the output_frame function
 
-    if (!scene_output) {
-        wlr_log(WLR_ERROR, "No scene_output found for this output");
-        return;
-    }
-    wlr_log(WLR_DEBUG, "Scene output found for output %s", output->wlr_output->name);
-
-    /* Lock the output for rendering */
-    wlr_output_lock_attach_render(output->wlr_output, true);
-
-    /* Commit the scene output to render the frame */
-    struct wlr_scene_output_state_options opts = {0};
-    if (!wlr_scene_output_commit(scene_output, &opts)) {
-        wlr_log(WLR_ERROR, "wlr_scene_output_commit failed");
-        wlr_output_lock_attach_render(output->wlr_output, false);
-        return;
-    }
-    wlr_log(WLR_DEBUG, "Scene output committed successfully");
-
-    /* Take screenshot automatically */
-    int width = output->wlr_output->width;
-    int height = output->wlr_output->height;
-
-    /* Read pixels for screenshot */
-    size_t stride = width * 4; /* 4 bytes per pixel (RGBA) */
-    size_t size = stride * height;
-    uint8_t *pixels = malloc(size);
-    if (!pixels) {
-        wlr_log(WLR_ERROR, "Failed to allocate memory for pixels");
-        wlr_output_lock_attach_render(output->wlr_output, false);
-        return;
-    }
-
-    /* Capture the rendered frame */
-    glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+// Frame handler for output
 
 
-
-    wlr_output_lock_attach_render(output->wlr_output, false);
-
-    /* Send frame done event */
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    wlr_scene_output_send_frame_done(scene_output, &now);
+static int retry_frame_timer(void *data) {
+    struct wlr_output *output = data;
+    wlr_log(WLR_INFO, "Retrying frame for output %s via timer", output->name);
+    wlr_output_schedule_frame(output);
+    return 0; // One-shot timer
 }
+
+
+
+static void output_frame(struct wl_listener *listener, void *data) {
+    struct tinywl_server *server = wl_container_of(listener, server, output_frame);
+    struct wlr_output *output = data;
+    wlr_log(WLR_INFO, "Output frame triggered for %s", output->name);
+    
+    if (!output->swapchain) {
+        wlr_log(WLR_INFO, "Swapchain not initialized for %s", output->name);
+        return;
+    }
+    wlr_log(WLR_INFO, "Swapchain active with format 0x%x", output->swapchain->format.format);
+    
+/*
+if (!is_zink_renderer(server.backend, server.renderer, NULL)) {
+        wlr_log(WLR_ERROR, "Renderer is not using Zink (Vulkan). Performance may be suboptimal.");
+        // Optionally, you can exit here if Zink is required:
+        // wlr_egl_free(wlr_egl);
+        // cleanup_egl(&server);
+        // wlr_renderer_destroy(server.renderer);
+        // wlr_backend_destroy(server.backend);
+        // wl_display_destroy(server.wl_display);
+        // return 1;
+    } else {
+        wlr_log(WLR_INFO, "Confirmed Zink (Vulkan) renderer in use.");
+    }
+*/
+    struct wlr_renderer *renderer = server->renderer;
+    if (!renderer) {
+        wlr_log(WLR_ERROR, "No renderer available for rendering");
+        return;
+    }
+
+    struct wlr_buffer *buffer = wlr_swapchain_acquire(output->swapchain);
+    if (!buffer) {
+        wlr_log(WLR_INFO, "No free swapchain buffer for %s, scheduling retry in 100ms", output->name);
+        if (!server->frame_timer) {
+            struct wl_event_loop *loop = wl_display_get_event_loop(server->wl_display);
+            server->frame_timer = wl_event_loop_add_timer(loop, retry_frame_timer, output);
+            wl_event_source_timer_update(server->frame_timer, 100); // 100ms delay
+        }
+        return;
+    }
+
+    if (server->frame_timer) {
+        wl_event_source_remove(server->frame_timer);
+        server->frame_timer = NULL;
+    }
+
+  //  wlr_renderer_begin(renderer, output->width, output->height);
+  //  float clear_color[4] = {0.2f, 0.3f, 0.8f, 1.0f};
+    //wlr_renderer_clear(renderer, clear_color);
+    //wlr_renderer_end(renderer);
+
+    struct wlr_output_state state;
+    wlr_output_state_init(&state);
+    wlr_output_state_set_enabled(&state, true);
+    wlr_output_state_set_buffer(&state, buffer);
+    if (!wlr_output_commit_state(output, &state)) {
+        wlr_log(WLR_ERROR, "Failed to commit output state");
+        wlr_buffer_unlock(buffer);
+    }
+    wlr_output_state_finish(&state);
+    wlr_buffer_unlock(buffer); // Release the buffer after commit
+}
+
 
 
 static void output_request_state(struct wl_listener *listener, void *data) {
@@ -994,52 +790,7 @@ static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
 }
 
 
-static bool is_zink_renderer(struct wlr_backend *backend, struct wlr_renderer *renderer, struct wlr_allocator *allocator) {
-    if (!renderer) {
-        wlr_log(WLR_ERROR, "No renderer available to check type");
-        return false;
-    }
 
-    struct wlr_egl *egl = wlr_gles2_renderer_get_egl(renderer);
-    if (!egl) {
-        wlr_log(WLR_ERROR, "No EGL context available to check renderer");
-        return false;
-    }
-
-    // Get the EGL display and context from wlr_egl
-    EGLDisplay egl_display = wlr_egl_get_display(egl);
-    EGLContext egl_context = wlr_egl_get_context(egl);
-    if (!egl_display || !egl_context) {
-        wlr_log(WLR_ERROR, "Invalid EGL display or context");
-        return false;
-    }
-
-    // Make the EGL context current
-    if (!eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, egl_context)) {
-        wlr_log(WLR_ERROR, "Failed to make EGL context current: 0x%x", eglGetError());
-        return false;
-    }
-
-    // Query the GL_RENDERER string
-    const char *gl_renderer = (const char *)glGetString(GL_RENDERER);
-    if (!gl_renderer) {
-        wlr_log(WLR_ERROR, "Failed to query GL_RENDERER");
-        eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        return false;
-    }
-
-    // Check if the renderer is Zink
-    bool is_zink = strstr(gl_renderer, "Zink") != NULL;
-    wlr_log(WLR_DEBUG, "Renderer check: is_zink=%d, GL_RENDERER=%s", is_zink, gl_renderer);
-    if (!is_zink) {
-        wlr_log(WLR_DEBUG, "Renderer is not Zink: %s", gl_renderer);
-    }
-
-    // Unset the current EGL context
-    eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-
-    return is_zink;
-}
 
 #ifndef EGL_PLATFORM_SURFACELESS_MESA
 #define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
@@ -1208,8 +959,8 @@ wlr_log(WLR_INFO, "Starting surfaceless EGL setup");
 
     // 14. Create wlr_egl with the valid context
     wlr_log(WLR_INFO, "Creating wlr_egl with context");
-    struct wlr_egl *wlr_egl = wlr_egl_create_with_context(display, context);
-    if (!wlr_egl) {
+    server->egl = wlr_egl_create_with_context(display, context);
+    if (!server->egl) {
         wlr_log(WLR_ERROR, "Failed to create wlr_egl with context");
         eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         eglDestroySurface(display, surface);
@@ -1219,7 +970,7 @@ wlr_log(WLR_INFO, "Starting surfaceless EGL setup");
     }
 
     wlr_log(WLR_INFO, "Successfully created wlr_egl");
-    return wlr_egl;
+    return server->egl;
 }
 void cleanup_egl(struct tinywl_server *server) {
     printf("Cleaning up EGL resources\n");
@@ -1270,11 +1021,22 @@ int main(int argc, char *argv[]) {
     }
 
     struct tinywl_server server = {0};
- struct wlr_egl *wlr_egl = NULL;
+/*
 
     // Setup EGL surfaceless display
-    wlr_egl = setup_surfaceless_egl(&server);
-    if (!wlr_egl) {
+    server.egl = setup_surfaceless_egl(&server);
+    if (!server.egl) {
+        fprintf(stderr, "Failed to setup surfaceless EGL display\n");
+        cleanup_egl(&server);
+        return 1;
+    }
+*/
+
+
+
+    // Setup EGL surfaceless display
+    server.egl = setup_surfaceless_egl(&server);
+    if (!server.egl) {
         fprintf(stderr, "Failed to setup surfaceless EGL display\n");
         cleanup_egl(&server);
         return 1;
@@ -1294,12 +1056,12 @@ wlr_backend_set_compositor_display(server.wl_display);
     const char *backends_env = getenv("WLR_BACKENDS");
     if (backends_env && strcmp(backends_env, "RDP") == 0) {
         wlr_log(WLR_INFO, "Creating RDP backend");
-//        server.backend = wlr_RDP_backend_create(server.wl_display);
+       server.backend = wlr_RDP_backend_create(server.wl_display);
 
 
  setenv("WLR_BACKENDS", "RDP",1);
 
-server.backend = wlr_RDP_backend_create(server.wl_display, wlr_egl, NULL);
+//server.backend = wlr_RDP_backend_create(server.wl_display, wlr_egl, NULL);
 if (!server.backend) {
     wlr_log(WLR_ERROR, "Failed to create RDP backend");
  //   wlr_egl_free(wlr_egl);
@@ -1315,14 +1077,18 @@ if (!server.backend) {
         return 1;
     }
 
-    server.renderer = wlr_renderer_autocreate(server.backend);
-    if (server.renderer == NULL) {
-        wlr_log(WLR_ERROR, "failed to create wlr_renderer");
+
+ 
+   server.renderer = wlr_gles2_renderer_create(server.egl);
+    if (!server.renderer) {
+        wlr_log(WLR_ERROR, "Failed to create GLES2 renderer: EGL error 0x%x", eglGetError());
+      //  wlr_egl_free(server.egl);
+        cleanup_egl(&server);
+        wlr_backend_destroy(server.backend);
+        wl_display_destroy(server.wl_display);
         return 1;
     }
-
-
-// Check if the renderer is Zink
+/* Check if the renderer is Zink
     if (!is_zink_renderer(server.backend, server.renderer, NULL)) {
         wlr_log(WLR_ERROR, "Renderer is not using Zink (Vulkan). Performance may be suboptimal.");
         // Optionally, you can exit here if Zink is required:
@@ -1335,8 +1101,13 @@ if (!server.backend) {
     } else {
         wlr_log(WLR_INFO, "Confirmed Zink (Vulkan) renderer in use.");
     }
+*/
+
+
 
     wlr_renderer_init_wl_display(server.renderer, server.wl_display);
+
+
 
     server.allocator = wlr_allocator_autocreate(server.backend, server.renderer);
     if (!server.allocator) {
@@ -1417,7 +1188,21 @@ if (!server.backend) {
         }
     }
 
+
+
     wlr_log(WLR_INFO, "Running Wayland compositor on WAYLAND_DISPLAY=%s", socket);
+
+const char *vendor = (const char *)glGetString(GL_VENDOR);
+    const char *renderer = (const char *)glGetString(GL_RENDERER);
+    const char *version = (const char *)glGetString(GL_VERSION);
+    const char *shading_lang = (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
+
+    wlr_log(WLR_INFO, "GL_VENDOR: %s", vendor);
+    wlr_log(WLR_INFO, "GL_RENDERER: %s", renderer);
+    wlr_log(WLR_INFO, "GL_VERSION: %s", version);
+    wlr_log(WLR_INFO, "GL_SHADING_LANGUAGE_VERSION: %s", shading_lang);
+
+
     wl_display_run(server.wl_display);
 
     wl_display_destroy_clients(server.wl_display);

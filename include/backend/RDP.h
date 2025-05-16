@@ -74,7 +74,7 @@ struct wlr_RDP_output *wlr_RDP_output_create(
 bool wlr_backend_is_RDP(struct wlr_backend *backend);
 
 // Function to cast a wlr_backend to wlr_RDP_backend
-struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display, struct wlr_egl *egl, const char *RDP_display);
+struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display, struct wlr_egl *egl);
 
 extern freerdp_peer *global_rdp_peer;
 

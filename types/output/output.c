@@ -139,7 +139,7 @@ void wlr_output_create_global(struct wlr_output *output, struct wl_display *disp
 	output->global = wl_global_create(display,
 		&wl_output_interface, OUTPUT_VERSION, output, output_bind);
 	if (output->global == NULL) {
-		wlr_log(WLR_ERROR, "Failed to allocate wl_output global");
+		// wlr_log(WLR_ERROR, "Failed to allocate wl_output global");
 		return;
 	}
 
@@ -363,7 +363,7 @@ void wlr_output_init(struct wlr_output *output, struct wlr_backend *backend,
 
 	output->software_cursor_locks = env_parse_bool("WLR_NO_HARDWARE_CURSORS");
 	if (output->software_cursor_locks) {
-		wlr_log(WLR_DEBUG, "WLR_NO_HARDWARE_CURSORS set, forcing software cursors");
+		// wlr_log(WLR_DEBUG, "WLR_NO_HARDWARE_CURSORS set, forcing software cursors");
 	}
 
 	wlr_addon_set_init(&output->addons);
@@ -569,14 +569,14 @@ static bool output_basic_test(struct wlr_output *output,
 		if (src_box.x < 0.0 || src_box.y < 0.0 ||
 				src_box.x + src_box.width > state->buffer->width ||
 				src_box.y + src_box.height > state->buffer->height) {
-			wlr_log(WLR_ERROR, "Tried to commit with invalid buffer_src_box");
+			// wlr_log(WLR_ERROR, "Tried to commit with invalid buffer_src_box");
 			return false;
 		}
 
 		// Source box must not be empty (but it can be smaller than 1 pixel,
 		// some DRM devices support sub-pixel crops)
 		if (wlr_fbox_empty(&src_box)) {
-			wlr_log(WLR_ERROR, "Tried to commit with an empty buffer_src_box");
+			// wlr_log(WLR_ERROR, "Tried to commit with an empty buffer_src_box");
 			return false;
 		}
 
@@ -592,20 +592,20 @@ static bool output_basic_test(struct wlr_output *output,
 		struct wlr_box dst_box;
 		output_state_get_buffer_dst_box(state, &dst_box);
 		if (!wlr_box_intersection(&output_box, &output_box, &dst_box)) {
-			wlr_log(WLR_ERROR, "Primary buffer is entirely off-screen or 0-sized");
+			// wlr_log(WLR_ERROR, "Primary buffer is entirely off-screen or 0-sized");
 			return false;
 		}
 	} else {
 		if (state->tearing_page_flip) {
-			wlr_log(WLR_ERROR, "Tried to commit a tearing page flip without a buffer");
+			// wlr_log(WLR_ERROR, "Tried to commit a tearing page flip without a buffer");
 			return false;
 		}
 		if (state->committed & WLR_OUTPUT_STATE_WAIT_TIMELINE) {
-			wlr_log(WLR_DEBUG, "Tried to set wait timeline without a buffer");
+			// wlr_log(WLR_DEBUG, "Tried to set wait timeline without a buffer");
 			return false;
 		}
 		if (state->committed & WLR_OUTPUT_STATE_SIGNAL_TIMELINE) {
-			wlr_log(WLR_DEBUG, "Tried to set signal timeline without a buffer");
+			// wlr_log(WLR_DEBUG, "Tried to set signal timeline without a buffer");
 			return false;
 		}
 	}
@@ -618,7 +618,7 @@ static bool output_basic_test(struct wlr_output *output,
 			wlr_output_get_primary_formats(output, allocator->buffer_caps);
 		struct wlr_drm_format format = {0};
 		if (!output_pick_format(output, display_formats, &format, state->render_format)) {
-			wlr_log(WLR_ERROR, "Failed to pick primary buffer format for output");
+			// wlr_log(WLR_ERROR, "Failed to pick primary buffer format for output");
 			return false;
 		}
 
@@ -633,39 +633,39 @@ static bool output_basic_test(struct wlr_output *output,
 		output_pending_resolution(output, state,
 			&pending_width, &pending_height);
 		if (pending_width == 0 || pending_height == 0) {
-			wlr_log(WLR_DEBUG, "Tried to enable an output with a zero mode");
+			// wlr_log(WLR_DEBUG, "Tried to enable an output with a zero mode");
 			return false;
 		}
 	}
 
 	if (!enabled && state->committed & WLR_OUTPUT_STATE_BUFFER) {
-		wlr_log(WLR_DEBUG, "Tried to commit a buffer on a disabled output");
+		// wlr_log(WLR_DEBUG, "Tried to commit a buffer on a disabled output");
 		return false;
 	}
 	if (!enabled && state->committed & WLR_OUTPUT_STATE_MODE) {
-		wlr_log(WLR_DEBUG, "Tried to modeset a disabled output");
+		// wlr_log(WLR_DEBUG, "Tried to modeset a disabled output");
 		return false;
 	}
 	if (!enabled && state->committed & WLR_OUTPUT_STATE_ADAPTIVE_SYNC_ENABLED) {
-		wlr_log(WLR_DEBUG, "Tried to enable adaptive sync on a disabled output");
+		// wlr_log(WLR_DEBUG, "Tried to enable adaptive sync on a disabled output");
 		return false;
 	}
 	if (!enabled && state->committed & WLR_OUTPUT_STATE_RENDER_FORMAT) {
-		wlr_log(WLR_DEBUG, "Tried to set format for a disabled output");
+		// wlr_log(WLR_DEBUG, "Tried to set format for a disabled output");
 		return false;
 	}
 	if (!enabled && state->committed & WLR_OUTPUT_STATE_GAMMA_LUT) {
-		wlr_log(WLR_DEBUG, "Tried to set the gamma lut on a disabled output");
+		// wlr_log(WLR_DEBUG, "Tried to set the gamma lut on a disabled output");
 		return false;
 	}
 	if (!enabled && state->committed & WLR_OUTPUT_STATE_SUBPIXEL) {
-		wlr_log(WLR_DEBUG, "Tried to set the subpixel layout on a disabled output");
+		// wlr_log(WLR_DEBUG, "Tried to set the subpixel layout on a disabled output");
 		return false;
 	}
 
 	if (state->committed & WLR_OUTPUT_STATE_LAYERS) {
 		if (state->layers_len != (size_t)wl_list_length(&output->layers)) {
-			wlr_log(WLR_DEBUG, "All output layers must be specified in wlr_output_state.layers");
+			// wlr_log(WLR_DEBUG, "All output layers must be specified in wlr_output_state.layers");
 			return false;
 		}
 
@@ -676,7 +676,7 @@ static bool output_basic_test(struct wlr_output *output,
 
 	if ((state->committed & (WLR_OUTPUT_STATE_WAIT_TIMELINE | WLR_OUTPUT_STATE_SIGNAL_TIMELINE)) &&
 			!output->backend->features.timeline) {
-		wlr_log(WLR_DEBUG, "Wait/signal timelines are not supported for this output");
+		// wlr_log(WLR_DEBUG, "Wait/signal timelines are not supported for this output");
 		return false;
 	}
 
@@ -713,7 +713,7 @@ bool wlr_output_test_state(struct wlr_output *output,
 
 bool output_prepare_commit(struct wlr_output *output, const struct wlr_output_state *state) {
 	if (!output_basic_test(output, state)) {
-		wlr_log(WLR_ERROR, "Basic output test failed for %s", output->name);
+		// wlr_log(WLR_ERROR, "Basic output test failed for %s", output->name);
 		return false;
 	}
 
@@ -756,42 +756,106 @@ void output_apply_commit(struct wlr_output *output, const struct wlr_output_stat
 	wl_signal_emit_mutable(&output->events.commit, &event);
 }
 
+#include <stdio.h> // Add this line
+#include "util/global.h"
+// Other existing includes...
+
 bool wlr_output_commit_state(struct wlr_output *output,
 		const struct wlr_output_state *state) {
-	uint32_t unchanged = output_compare_state(output, state);
+	// Debug entry point
+	// printf("[DEBUG] Entering wlr_output_commit_state - output: %p, state: %p\n",
+	//       output, state);
+	fflush(stdout);
+	// wlr_log(WLR_DEBUG, "Committing output state for %s", output->name);
 
-	// Create a shallow copy of the state with only the fields which have been
-	// changed and potentially a new buffer.
+	// Compare state and log unchanged fields
+	uint32_t unchanged = output_compare_state(output, state);
+	// printf("[DEBUG] Step 1: State comparison - unchanged flags: 0x%08x\n", unchanged);
+	fflush(stdout);
+	// wlr_log(WLR_DEBUG, "Unchanged state flags: 0x%08x", unchanged);
+
+	// Create a shallow copy of the state with only changed fields
 	struct wlr_output_state pending = *state;
 	pending.committed &= ~unchanged;
+	// printf("[DEBUG] Step 2: Created pending state - committed flags: 0x%08x\n",
+	//       pending.committed);
+	fflush(stdout);
+	// wlr_log(WLR_DEBUG, "Pending state committed flags: 0x%08x", pending.committed);
 
+	// Perform basic output test
+	// printf("[DEBUG] Step 3: Running basic output test\n");
+	fflush(stdout);
 	if (!output_basic_test(output, &pending)) {
-		wlr_log(WLR_ERROR, "Basic output test failed for %s", output->name);
+		// wlr_log(WLR_ERROR, "Basic output test failed for %s", output->name);
+		// printf("[DEBUG] Basic output test failed - output: %s\n", output->name);
+		fflush(stdout);
 		return false;
 	}
+	// wlr_log(WLR_DEBUG, "Basic output test passed");
 
+	// Ensure buffer allocation
 	bool new_back_buffer = false;
+	// printf("[DEBUG] Step 4: Ensuring buffer allocation\n");
+	fflush(stdout);
 	if (!output_ensure_buffer(output, &pending, &new_back_buffer)) {
+		// wlr_log(WLR_ERROR, "Failed to ensure buffer for %s", output->name);
+		// printf("[DEBUG] Buffer allocation failed - output: %s, new_back_buffer: %d\n",
+		 //      output->name, new_back_buffer);
+		fflush(stdout);
 		return false;
 	}
+	// printf("[DEBUG] Buffer allocated - new_back_buffer: %d\n", new_back_buffer);
+	fflush(stdout);
+	// wlr_log(WLR_DEBUG, "Buffer ensured, new_back_buffer: %d", new_back_buffer);
 
+	// Prepare commit
+	// printf("[DEBUG] Step 5: Preparing output commit\n");
+	fflush(stdout);
 	if (!output_prepare_commit(output, &pending)) {
+		// wlr_log(WLR_ERROR, "Output prepare commit failed for %s", output->name);
+		// printf("[DEBUG] Prepare commit failed - output: %s\n", output->name);
+		fflush(stdout);
 		return false;
 	}
+	// wlr_log(WLR_DEBUG, "Output prepare commit succeeded");
 
+	// Perform commit
+	// printf("[DEBUG] Step 6: Committing output state\n");
+	fflush(stdout);
 	if (!output->impl->commit(output, &pending)) {
+		// wlr_log(WLR_ERROR, "Output commit failed for %s", output->name);
+		// printf("[DEBUG] Commit failed - output: %s, new_back_buffer: %d, buffer: %p\n",
+		     //  output->name, new_back_buffer, pending.buffer);
+		fflush(stdout);
 		if (new_back_buffer) {
+			// wlr_log(WLR_DEBUG, "Unlocking pending buffer %p due to commit failure",
+			//	pending.buffer);
 			wlr_buffer_unlock(pending.buffer);
+			// printf("[DEBUG] Unlocked pending buffer %p\n", pending.buffer);
+			fflush(stdout);
 		}
 		return false;
 	}
+	// wlr_log(WLR_DEBUG, "Output commit succeeded");
 
+	// Apply commit
+	// printf("[DEBUG] Step 7: Applying commit\n");
+	fflush(stdout);
 	output_apply_commit(output, &pending);
+	// wlr_log(WLR_DEBUG, "Commit applied");
 
+	// Clean up new back buffer if allocated
 	if (new_back_buffer) {
+		// wlr_log(WLR_DEBUG, "Unlocking pending buffer %p", pending.buffer);
 		wlr_buffer_unlock(pending.buffer);
+		// printf("[DEBUG] Unlocked pending buffer %p\n", pending.buffer);
+		fflush(stdout);
 	}
 
+	// Debug exit
+	// printf("[DEBUG] Exiting wlr_output_commit_state - success\n");
+	fflush(stdout);
+	// wlr_log(WLR_DEBUG, "Successfully committed output state for %s", output->name);
 	return true;
 }
 
@@ -833,8 +897,8 @@ void wlr_output_send_present(struct wlr_output *output,
 
 	if (event->presented && (event->when.tv_sec == 0 && event->when.tv_nsec == 0)) {
 		if (clock_gettime(CLOCK_MONOTONIC, &event->when) != 0) {
-			wlr_log_errno(WLR_ERROR, "failed to send output present event: "
-				"failed to read clock");
+			// wlr_log_errno(WLR_ERROR, "failed to send output present event: "
+			//	"failed to read clock");
 			return;
 		}
 	}
@@ -955,7 +1019,7 @@ const struct wlr_drm_format_set *wlr_output_get_primary_formats(
 	const struct wlr_drm_format_set *formats =
 		output->impl->get_primary_formats(output, buffer_caps);
 	if (formats == NULL) {
-		wlr_log(WLR_ERROR, "Failed to get primary display formats");
+		// wlr_log(WLR_ERROR, "Failed to get primary display formats");
 
 		static const struct wlr_drm_format_set empty_format_set = {0};
 		return &empty_format_set;
@@ -966,7 +1030,7 @@ const struct wlr_drm_format_set *wlr_output_get_primary_formats(
 
 bool wlr_output_is_direct_scanout_allowed(struct wlr_output *output) {
 	if (output->attach_render_locks > 0) {
-		wlr_log(WLR_DEBUG, "Direct scan-out disabled by lock");
+		// wlr_log(WLR_DEBUG, "Direct scan-out disabled by lock");
 		return false;
 	}
 
@@ -975,8 +1039,8 @@ bool wlr_output_is_direct_scanout_allowed(struct wlr_output *output) {
 	wl_list_for_each(cursor, &output->cursors, link) {
 		if (cursor->enabled && cursor->visible &&
 				cursor != output->hardware_cursor) {
-			wlr_log(WLR_DEBUG,
-				"Direct scan-out disabled by software cursor");
+			// wlr_log(WLR_DEBUG,
+		//		"Direct scan-out disabled by software cursor");
 			return false;
 		}
 	}

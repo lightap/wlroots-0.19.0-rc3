@@ -8,6 +8,7 @@
 
 #include "render/drm_format_set.h"
 #include "types/wlr_output.h"
+#include <stdio.h>
 
 static struct wlr_swapchain *create_swapchain(struct wlr_output *output,
 		int width, int height, uint32_t render_format, bool allow_modifiers) {
@@ -83,9 +84,13 @@ static bool test_swapchain(struct wlr_output *output,
 	wlr_buffer_unlock(buffer);
 	return ok;
 }
-
 bool wlr_output_configure_primary_swapchain(struct wlr_output *output,
 		const struct wlr_output_state *state, struct wlr_swapchain **swapchain_ptr) {
+	wlr_log(WLR_DEBUG, "Configuring primary swapchain for '%s'", output->name);
+	printf("[DEBUG] Configuring swapchain - output: %s, swapchain_ptr: %p\n",
+	       output->name, *swapchain_ptr);
+	fflush(stdout);
+
 	struct wlr_output_state empty_state;
 	if (state == NULL) {
 		wlr_output_state_init(&empty_state);
@@ -94,17 +99,29 @@ bool wlr_output_configure_primary_swapchain(struct wlr_output *output,
 
 	int width, height;
 	output_pending_resolution(output, state, &width, &height);
+	wlr_log(WLR_DEBUG, "Pending resolution: %dx%d", width, height);
+	printf("[DEBUG] Pending resolution - width: %d, height: %d\n", width, height);
+	fflush(stdout);
 
 	uint32_t format = output->render_format;
 	if (state->committed & WLR_OUTPUT_STATE_RENDER_FORMAT) {
 		format = state->render_format;
+		wlr_log(WLR_DEBUG, "Using state render format: 0x%08x", format);
+	} else {
+		wlr_log(WLR_DEBUG, "Using output render format: 0x%08x", format);
 	}
+	printf("[DEBUG] Render format: 0x%08x\n", format);
+	fflush(stdout);
 
 	// Re-use the existing swapchain if possible
 	struct wlr_swapchain *old_swapchain = *swapchain_ptr;
 	if (old_swapchain != NULL &&
 			old_swapchain->width == width && old_swapchain->height == height &&
-			old_swapchain->format->format == format) {
+			old_swapchain->format.format == format) {
+		wlr_log(WLR_DEBUG, "Reusing existing swapchain for '%s'", output->name);
+		printf("[DEBUG] Reusing swapchain - output: %s, width: %d, height: %d, format: 0x%08x\n",
+		       output->name, width, height, format);
+		fflush(stdout);
 		return true;
 	}
 
@@ -112,6 +129,8 @@ bool wlr_output_configure_primary_swapchain(struct wlr_output *output,
 	struct wlr_swapchain *swapchain = create_swapchain(output, width, height, format, true);
 	if (swapchain == NULL && (output->allocator->buffer_caps & WLR_BUFFER_CAP_DMABUF)) {
 		wlr_log(WLR_ERROR, "Failed to create swapchain for output '%s'", output->name);
+		printf("[DEBUG] Swapchain creation failed with modifiers - output: %s\n", output->name);
+		fflush(stdout);
 		return false;
 	}
 
@@ -121,16 +140,25 @@ bool wlr_output_configure_primary_swapchain(struct wlr_output *output,
 		if (!test_swapchain(output, swapchain, state)) {
 			wlr_log(WLR_DEBUG, "Output test failed on '%s', retrying without modifiers",
 				output->name);
+			printf("[DEBUG] Swapchain test failed, retrying without modifiers - output: %s\n",
+			       output->name);
+			fflush(stdout);
 			wlr_swapchain_destroy(swapchain);
 			swapchain = create_swapchain(output, width, height, format, false);
 			if (swapchain == NULL) {
 				wlr_log(WLR_ERROR, "Failed to create modifier-less swapchain for output '%s'",
 					output->name);
+				printf("[DEBUG] Modifier-less swapchain creation failed - output: %s\n",
+				       output->name);
+				fflush(stdout);
 				return false;
 			}
 			wlr_log(WLR_DEBUG, "Testing modifier-less swapchain for output '%s'", output->name);
 			if (!test_swapchain(output, swapchain, state)) {
 				wlr_log(WLR_ERROR, "Swapchain for output '%s' failed test", output->name);
+				printf("[DEBUG] Modifier-less swapchain test failed - output: %s\n",
+				       output->name);
+				fflush(stdout);
 				wlr_swapchain_destroy(swapchain);
 				return false;
 			}
@@ -139,10 +167,17 @@ bool wlr_output_configure_primary_swapchain(struct wlr_output *output,
 
 	if (swapchain == NULL) {
 		wlr_log(WLR_ERROR, "Failed to create swapchain for output '%s'", output->name);
+		printf("[DEBUG] Swapchain creation failed - output: %s\n", output->name);
+		fflush(stdout);
 		return false;
 	}
 
-	wlr_swapchain_destroy(*swapchain_ptr);
+	wlr_log(WLR_DEBUG, "Swapchain configured for '%s', destroying old swapchain %p",
+		output->name, old_swapchain);
+	printf("[DEBUG] New swapchain created - output: %s, new: %p, old: %p\n",
+	       output->name, swapchain, old_swapchain);
+	fflush(stdout);
+	wlr_swapchain_destroy(old_swapchain);
 	*swapchain_ptr = swapchain;
 	return true;
 }

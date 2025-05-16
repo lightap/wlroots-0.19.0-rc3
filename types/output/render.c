@@ -50,6 +50,7 @@ bool wlr_output_init_render(struct wlr_output *output,
 	output->cursor_swapchain = NULL;
 
 	output->allocator = allocator;
+
 	output->renderer = renderer;
 
 	return true;
@@ -160,82 +161,7 @@ void wlr_output_lock_attach_render(struct wlr_output *output, bool lock) {
 		lock ? "Disabling" : "Enabling", output->name,
 		output->attach_render_locks);
 }
-/*
-bool output_pick_format(struct wlr_output *output,
-		const struct wlr_drm_format_set *display_formats,
-		struct wlr_drm_format *format, uint32_t fmt) {
-	struct wlr_renderer *renderer = output->renderer;
-	struct wlr_allocator *allocator = output->allocator;
-	assert(renderer != NULL && allocator != NULL);
 
-	const struct wlr_drm_format_set *render_formats =
-		wlr_renderer_get_render_formats(renderer);
-	if (render_formats == NULL) {
-		wlr_log(WLR_ERROR, "Failed to get render formats");
-		return false;
-	}
-
-	const struct wlr_drm_format *render_format =
-		wlr_drm_format_set_get(render_formats, fmt);
-	if (render_format == NULL) {
-		wlr_log(WLR_DEBUG, "Renderer doesn't support format 0x%"PRIX32, fmt);
-		return false;
-	}
-
-	if (display_formats != NULL) {
-		const struct wlr_drm_format *display_format =
-			wlr_drm_format_set_get(display_formats, fmt);
-		if (display_format == NULL) {
-			wlr_log(WLR_DEBUG, "Output doesn't support format 0x%"PRIX32, fmt);
-			return false;
-		}
-		if (!wlr_drm_format_intersect(format, display_format, render_format)) {
-			wlr_log(WLR_DEBUG, "Failed to intersect display and render "
-				"modifiers for format 0x%"PRIX32 " on output %s",
-				fmt, output->name);
-			return false;
-		}
-	} else {
-		// The output can display any format
-		if (!wlr_drm_format_copy(format, render_format)) {
-			return false;
-		}
-	}
-
-	if (format->len == 0) {
-		wlr_drm_format_finish(format);
-		wlr_log(WLR_DEBUG, "Failed to pick output format");
-		return false;
-	}
-
-	return true;
-}
-
-struct wlr_drm_format *output_pick_format(struct wlr_output *output,
-        const struct wlr_drm_format_set *display_formats,
-        uint32_t fmt) {
-    struct wlr_renderer *renderer = output->renderer;
-    struct wlr_allocator *allocator = output->allocator;
-    assert(renderer != NULL && allocator != NULL);
-
-    wlr_log(WLR_DEBUG, "Surfaceless format selection: Creating minimal format");
-
-    // Hardcode a format that matches the EGL config (8-bit RGB, no alpha)
-    struct wlr_drm_format *format = calloc(1, sizeof(struct wlr_drm_format) + sizeof(uint64_t));
-    if (!format) {
-        wlr_log(WLR_ERROR, "Failed to allocate drm format");
-        return NULL;
-    }
-
-    // Use the format that matches the allocator's request
-    format->format = DRM_FORMAT_XRGB8888;  // 0x34325258
-    format->modifiers[0] = DRM_FORMAT_MOD_INVALID;
-    format->len = 1;
-    format->capacity = 1;
-
-    wlr_log(WLR_DEBUG, "Surfaceless: Created format 0x%"PRIX32, format->format);
-    return format;
-}*/
 
 
 bool output_pick_format(struct wlr_output *output,

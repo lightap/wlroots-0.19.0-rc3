@@ -114,6 +114,10 @@ struct wlr_gles2_buffer {
 	GLuint fbo;
 	GLuint tex;
 
+	GLuint texture;  // OpenGL texture ID
+ 
+ 
+
 	struct wlr_addon addon;
 };
 
@@ -178,8 +182,7 @@ struct wlr_gles2_render_pass *begin_gles2_buffer_pass(struct wlr_gles2_buffer *b
 	struct wlr_egl_context *prev_ctx, struct wlr_gles2_render_timer *timer,
 	struct wlr_drm_syncobj_timeline *signal_timeline, uint64_t signal_point);
 
-#if WLR_HAS_GLES2_RENDERER
-   struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void);
-#endif
+struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void);
+
 
 #endif

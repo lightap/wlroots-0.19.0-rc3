@@ -52,7 +52,7 @@ struct wlr_RDP_output {
  * Entry point: create an RDP backend
  */
 //struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display, struct wlr_egl *egl);
-struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display, struct wlr_egl *egl, const char *RDP_display);
+struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display);
 
 
 /**

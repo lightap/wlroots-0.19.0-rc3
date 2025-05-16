@@ -56,6 +56,7 @@
 #endif
 
 
+
 #define MAX_FREERDP_FDS 32  // Add this definition near the top of the file
 
 #define DEFAULT_PIXEL_FORMAT PIXEL_FORMAT_BGRX32
@@ -174,11 +175,11 @@ void rdp_transmit_surface(struct wlr_buffer *buffer);
 /* This is our backend’s public constructor */
 //struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display);
 // /struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display); 
-struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display, struct wlr_egl *egl, const char *RDP_display);
+struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display);
 struct wlr_allocator *wlr_rdp_allocator_create(struct wlr_renderer *renderer);
 
 // Function declarations
-//struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void);
+struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void);
 struct wlr_egl *wlr_gles2_renderer_get_egl(struct wlr_renderer *renderer);
 bool wlr_egl_make_current(struct wlr_egl *egl);
 
@@ -572,7 +573,7 @@ struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display) {
     return &backend->backend;
 }*/
 
-struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display, struct wlr_egl *egl, const char *RDP_display) {
+struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display) {
     wlr_log(WLR_INFO, "Creating RDP backend (surfaceless approach)");
 
     // Initialize peer manager and clear global peer
@@ -651,13 +652,15 @@ struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display, struct wl
     }
 
     // Set environment variables for surfaceless rendering
-    setenv("MESA_LOADER_DRIVER_OVERRIDE", "zink", 1);
-    setenv("EGL_PLATFORM", "surfaceless", 1);
-    setenv("WLR_RENDERER", "gles2", 1);
+  //  setenv("MESA_LOADER_DRIVER_OVERRIDE", "zink", 1);
+   // setenv("EGL_PLATFORM", "surfaceless", 1);
+   // setenv("WLR_RENDERER", "gles2", 1);
 
     // Try creating GLES2 renderer
     wlr_log(WLR_INFO, "Attempting to create GLES2 renderer with surfaceless EGL");
     backend->renderer = wlr_renderer_autocreate(&backend->backend);
+ 
+/*
     if (!backend->renderer) {
         wlr_log(WLR_ERROR, "Failed to create GLES2 renderer, falling back to Pixman");
         // Fallback to Pixman renderer
@@ -676,9 +679,11 @@ struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display, struct wl
     } else {
         wlr_log(WLR_INFO, "Successfully created GLES2 renderer");
     }
-
+*/
     // Initialize renderer for Wayland display
     wlr_renderer_init_wl_display(backend->renderer, display);
+
+wlr_log(WLR_INFO, "Successfully created GLES2 renderer");
 
     // Create allocator
     backend->allocator = wlr_allocator_autocreate(&backend->backend, backend->renderer);
@@ -921,19 +926,20 @@ BOOL rdp_peer_context_new(freerdp_peer *client, rdpContext *context) {
 
 void rdp_peer_context_free(freerdp_peer *client, rdpContext *ctx) {
     struct rdp_peer_context *context = (struct rdp_peer_context *)ctx;
-
     wlr_log(WLR_INFO, "RDP: free peer context");
-
     if (global_rdp_peer == client) {
         global_rdp_peer = NULL;
     }
-
-    // Free resources if they exist
+    for (int i = 0; i < MAX_FREERDP_FDS; i++) {
+        if (context->events[i]) {
+            wl_event_source_remove(context->events[i]);
+            context->events[i] = NULL;
+        }
+    }
     if (context->nsc_context) {
         nsc_context_free(context->nsc_context);
         context->nsc_context = NULL;
     }
-
     if (context->encode_stream) {
         Stream_Free(context->encode_stream, TRUE);
         context->encode_stream = NULL;
@@ -1182,8 +1188,12 @@ static struct wlr_RDP_output *RDP_output_from_output(struct wlr_output *output) 
 
 static bool rdp_output_test(struct wlr_output *wlr_output, const struct wlr_output_state *state) {
     struct wlr_RDP_output *output = RDP_output_from_output(wlr_output);
-    wlr_log(WLR_DEBUG, "Testing output %s: backend->started=%d, state->committed=0x%x",
-            wlr_output->name ? wlr_output->name : "(null)", output->backend->started, state->committed);
+fprintf(stderr, "Output name: %s\n", wlr_output->name ? wlr_output->name : "(null)");
+fprintf(stderr, "Backend started: %d\n", output->backend->started);
+fprintf(stderr, "Committed state ptr: %p\n", state);
+
+
+
     if (state->committed & WLR_OUTPUT_STATE_MODE) {
         const struct wlr_output_mode *mode = state->mode;
         if (!mode) {
@@ -1209,55 +1219,47 @@ static bool rdp_output_test(struct wlr_output *wlr_output, const struct wlr_outp
 
 
 
-static BOOL rdp_suppress_output(rdpContext *context, BYTE allow, const RECTANGLE_16 *area) {
+static BOOL rdp_suppress_output(rdpContext *context, BYTE allow, 
+                              const RECTANGLE_16 *area) {
     struct rdp_peer_context *peerCtx = (struct rdp_peer_context *)context;
-    rdpSettings *settings = context->settings;
-
-    wlr_log(WLR_DEBUG, "RDP: Output suppression called: allow=%d, area=(%d,%d,%d,%d)",
-            allow, area ? area->left : 0, area ? area->top : 0,
-            area ? area->right : 0, area ? area->bottom : 0);
-    wlr_log(WLR_DEBUG, "RDP: Client settings: DesktopWidth=%d, DesktopHeight=%d, MonitorCount=%d",
-            settings->DesktopWidth, settings->DesktopHeight, settings->MonitorCount);
-
-    // Force output enabled for testing
-    peerCtx->item.flags |= RDP_PEER_OUTPUT_ENABLED;
-    wlr_log(WLR_DEBUG, "RDP: Forcing output enabled for peerCtx->item.flags=0x%x", peerCtx->item.flags);
-
+    
+    wlr_log(WLR_DEBUG, "RDP: Output suppression changed: allow=%d", allow);
+    
     if (allow) {
-        wlr_log(WLR_DEBUG, "RDP: Output allowed by client");
-        // Already forced above, but keep for clarity
         peerCtx->item.flags |= RDP_PEER_OUTPUT_ENABLED;
+        
+        // If we have a pending frame, send it now
         if (peerCtx->frame_ack_pending && peerCtx->current_output) {
             wlr_output_send_frame(peerCtx->current_output);
             peerCtx->frame_ack_pending = false;
-            wlr_log(WLR_DEBUG, "RDP: Sent pending frame for output");
         }
     } else {
-        wlr_log(WLR_DEBUG, "RDP: Client requested output suppression");
-        // Not clearing RDP_PEER_OUTPUT_ENABLED to force rendering
+        peerCtx->item.flags &= (~RDP_PEER_OUTPUT_ENABLED);
     }
-
+    
     return TRUE;
 }
 
 
 /* backend.c: rdp_output_commit */
-static bool rdp_output_commit(struct wlr_output *wlr_output, const struct wlr_output_state *state) {
+
+
+// In rdp_output_commit
+
+#include <wlr/types/wlr_output.h>
+#include <wlr/util/log.h>
+
+static bool rdp_output_commit(struct wlr_output *wlr_output,
+        const struct wlr_output_state *state) {
     struct wlr_RDP_output *output = RDP_output_from_output(wlr_output);
     struct wlr_RDP_backend *backend = output->backend;
 
     wlr_log(WLR_DEBUG, "Committing output %s: backend->started=%d, state->committed=0x%x",
             wlr_output->name ? wlr_output->name : "(null)", backend->started, state->committed);
-    wlr_log(WLR_DEBUG, "Commit state: enabled=%d, mode=%d, buffer=%d, render_format=%d",
-            (state->committed & WLR_OUTPUT_STATE_ENABLED) ? 1 : 0,
-            (state->committed & WLR_OUTPUT_STATE_MODE) ? 1 : 0,
-            (state->committed & WLR_OUTPUT_STATE_BUFFER) ? 1 : 0,
-            (state->committed & WLR_OUTPUT_STATE_RENDER_FORMAT) ? 1 : 0);
 
+    // Allow commits during initialization if backend not started
     if (!backend->started) {
-        // Allow initial commit with ENABLED, MODE, RENDER_FORMAT, or empty state
-        if (state->committed == 0 ||
-            (state->committed & (WLR_OUTPUT_STATE_ENABLED | WLR_OUTPUT_STATE_MODE | WLR_OUTPUT_STATE_RENDER_FORMAT))) {
+        if (state->committed & (WLR_OUTPUT_STATE_ENABLED | WLR_OUTPUT_STATE_MODE | WLR_OUTPUT_STATE_RENDER_FORMAT)) {
             wlr_log(WLR_DEBUG, "Allowing initial commit for output %s with state flags 0x%x",
                     wlr_output->name ? wlr_output->name : "(null)", state->committed);
             return true;
@@ -1267,43 +1269,47 @@ static bool rdp_output_commit(struct wlr_output *wlr_output, const struct wlr_ou
         return false;
     }
 
-    if (state->committed & WLR_OUTPUT_STATE_BUFFER) {
-        freerdp_peer *peer = get_global_rdp_peer();
-        if (!peer || !rdp_connection_established) {
-            wlr_log(WLR_DEBUG, "No active RDP peer for buffer commit on output %s, proceeding anyway",
-                    wlr_output->name ? wlr_output->name : "(null)");
-        } else {
-            struct rdp_peer_context *peerCtx = (struct rdp_peer_context *)peer->context;
-            wlr_log(WLR_DEBUG, "RDP peer active, flags=0x%x", peerCtx->item.flags);
-            // Temporarily bypass suppression check
-            if (state->buffer) {
-                wlr_log(WLR_DEBUG, "Transmitting buffer for output %s", wlr_output->name ? wlr_output->name : "(null)");
-                rdp_transmit_surface(state->buffer);
-                wlr_log(WLR_DEBUG, "Buffer transmitted successfully for output %s",
-                        wlr_output->name ? wlr_output->name : "(null)");
-            } else {
-                wlr_log(WLR_ERROR, "No buffer provided for commit on output %s",
-                        wlr_output->name ? wlr_output->name : "(null)");
-                return false;
-            }
-        }
+    // Handle bufferless commits (often used for testing)
+    if (!(state->committed & WLR_OUTPUT_STATE_BUFFER)) {
+        wlr_log(WLR_DEBUG, "Bufferless commit on RDP output %s, assuming test mode",
+                wlr_output->name ? wlr_output->name : "(null)");
+        return true; // Skip frame event for test commits
+    }
 
-        // Emit frame event to trigger output_frame
-        struct rdp_peer_context *peerCtx = peer ? (struct rdp_peer_context *)peer->context : NULL;
-        if (peerCtx) {
-            peerCtx->current_output = wlr_output;
-            peerCtx->frame_ack_pending = true;
-        }
-        wlr_output_send_frame(wlr_output);
-        wlr_log(WLR_DEBUG, "Frame event sent for output %s", wlr_output->name ? wlr_output->name : "(null)");
+    // Get the current RDP peer
+    freerdp_peer *peer = get_global_rdp_peer();
+    wlr_log(WLR_DEBUG, "Peer retrieved: %p, connection_established=%d",
+            peer, rdp_connection_established);
+    if (!peer || !peer->context || !rdp_connection_established) {
+        wlr_log(WLR_DEBUG, "No active RDP peer for buffer commit on output %s, skipping",
+                wlr_output->name ? wlr_output->name : "(null)");
         return true;
     }
 
-    wlr_log(WLR_DEBUG, "Bufferless commit on RDP output %s",
-            wlr_output->name ? wlr_output->name : "(null)");
+    struct rdp_peer_context *peerCtx = (struct rdp_peer_context *)peer->context;
+    peerCtx->current_output = wlr_output;
+
+    // Transmit buffer if available
+    if (state->committed & WLR_OUTPUT_STATE_BUFFER && state->buffer) {
+        wlr_log(WLR_DEBUG, "Transmitting buffer %p for output %s",
+                state->buffer, wlr_output->name ? wlr_output->name : "(null)");
+        rdp_transmit_surface(state->buffer);
+    }
+
+    // Send frame event only if output is enabled and buffer is committed
+    if (peerCtx->item.flags & RDP_PEER_OUTPUT_ENABLED) {
+        wlr_output_send_frame(wlr_output);
+        peerCtx->frame_ack_pending = false;
+        wlr_log(WLR_DEBUG, "Frame event sent for output %s",
+                wlr_output->name ? wlr_output->name : "(null)");
+    } else {
+        peerCtx->frame_ack_pending = true;
+        wlr_log(WLR_DEBUG, "Frame event pending for output %s, output not enabled",
+                wlr_output->name ? wlr_output->name : "(null)");
+    }
+
     return true;
 }
-
 
 
 
@@ -1343,75 +1349,18 @@ static const struct wlr_output_impl rdp_output_impl = {
     .get_gamma_size = rdp_output_get_gamma_size,
     .get_cursor_formats = rdp_output_get_cursor_formats,
 };
+
+
+
 /* Creates one “virtual” RDP output. */
-/*
-static struct wlr_RDP_output *rdp_output_create(
-        struct wlr_RDP_backend *backend, const char *name,
-        int width, int height, int refresh_hz) {
-    struct wlr_RDP_output *output = calloc(1, sizeof(*output));
-    if (!output) {
-        return NULL;
-    }
-    output->backend = backend;
+#include <wlr/render/swapchain.h> // Added for wlr_swapchain
 
-    struct wlr_output *wlr_output = &output->wlr_output;
-    wlr_output_init(wlr_output, &backend->backend,
-        &rdp_output_impl, backend->display);
-
-    wlr_output->width = width;
-    wlr_output->height = height;
-    wlr_output->refresh = refresh_hz * 1000;
-    snprintf(wlr_output->name, sizeof(wlr_output->name) - 1, "%s", name);
-    wlr_output->name[sizeof(wlr_output->name) - 1] = '\0';
-
-    wl_list_insert(&backend->outputs, &output->link);
-    wlr_output_update_enabled(wlr_output, true);
-    return output;
-}*/
-/*
 static struct wlr_RDP_output *rdp_output_create(
         struct wlr_RDP_backend *backend, const char *name,
         int width, int height, int refresh_hz) {
     
-    // First, allocate and zero the entire structure
-    struct wlr_RDP_output *output = calloc(1, sizeof(struct wlr_RDP_output));
-    if (!output) {
-        wlr_log(WLR_ERROR, "Failed to allocate RDP output");
-        return NULL;
-    }
-
-    // Set backend pointer
-    output->backend = backend;
-
-    // Initialize the embedded wlr_output structure
-    wlr_log(WLR_DEBUG, "Initializing wlr_output");
-    wlr_output_init(&output->wlr_output, &backend->backend,
-                   &rdp_output_impl, backend->display);
-
-    // Now that wlr_output is initialized, we can set its fields
-    struct wlr_output *wlr_output = &output->wlr_output;
-    wlr_output->width = width;
-    wlr_output->height = height;
-    wlr_output->refresh = refresh_hz * 1000;
-
-    // Initialize the name now that the structure is properly set up
-    const char default_name[] = "rdp-0";
-    const char *output_name = name ? name : default_name;
-    const size_t max_name_len = sizeof(wlr_output->name) - 1;
-    strncpy(wlr_output->name, output_name, max_name_len);
-    wlr_output->name[max_name_len] = '\0';
-
-    // Add to outputs list
-    wl_list_insert(&backend->outputs, &output->link);
-    wlr_output_update_enabled(wlr_output, true);
-
-    wlr_log(WLR_DEBUG, "RDP output created successfully");
-    return output;
-}*/
-/*
-static struct wlr_RDP_output *rdp_output_create(
-        struct wlr_RDP_backend *backend, const char *name,
-        int width, int height, int refresh_hz) {
+    wlr_log(WLR_DEBUG, "Creating RDP output: %s %dx%d@%d", 
+            name, width, height, refresh_hz);
     
     struct wlr_RDP_output *output = calloc(1, sizeof(struct wlr_RDP_output));
     if (!output) {
@@ -1420,174 +1369,73 @@ static struct wlr_RDP_output *rdp_output_create(
     }
 
     output->backend = backend;
-    
-    // Initialize the base output
-    wlr_log(WLR_DEBUG, "Initializing wlr_output");
-    wlr_output_init(&output->wlr_output, &backend->backend,
-                    &rdp_output_impl, backend->display);
-
-    // Get pointer after initialization
-    struct wlr_output *wlr_output = &output->wlr_output;
-
-    // Set basic properties
-    wlr_output->width = width;
-    wlr_output->height = height;
-    wlr_output->refresh = refresh_hz * 1000;
-
-    // Just use static name for now for debugging
-    memset(wlr_output->name, 0, 8);
-    memcpy(wlr_output->name, "rdp-0", 5);
-
-    wl_list_insert(&backend->outputs, &output->link);
-    wlr_output_update_enabled(wlr_output, true);
-
-    return output;
-}*/
-/*/
-static struct wlr_RDP_output *rdp_output_create(
-        struct wlr_RDP_backend *backend, const char *name,
-        int width, int height, int refresh_hz) {
-    
-    struct wlr_RDP_output *output = calloc(1, sizeof(struct wlr_RDP_output));
-    if (!output) {
-        wlr_log(WLR_ERROR, "Failed to allocate RDP output");
-        return NULL;
-    }
-
-    output->backend = backend;
-    
-    // Get the output pointer
     struct wlr_output *wlr_output = &output->wlr_output;
     
-    // Initialize core output fields
-    wlr_output_init(wlr_output, &backend->backend,
-                    &rdp_output_impl, backend->display);
-    wlr_output_set_name(wlr_output, name); // Assign name
-    
-    wlr_output_set_custom_mode(wlr_output, width, height, refresh_hz * 1000);
-    wlr_output_enable(wlr_output, true);
-
-    // Add to list and enable
-    wl_list_insert(&backend->outputs, &output->link);
-    
-    return output;
-}*/
-/*
-static struct wlr_RDP_output *rdp_output_create(
-        struct wlr_RDP_backend *backend, const char *name,
-        int width, int height, int refresh_hz) {
-    wlr_log(WLR_DEBUG, "Creating RDP output: %s %dx%d@%d", name, width, height, refresh_hz);
-    struct wlr_RDP_output *output = calloc(1, sizeof(struct wlr_RDP_output));
-    if (!output) {
-        wlr_log(WLR_ERROR, "Failed to allocate RDP output");
-        return NULL;
-    }
-    output->backend = backend;
-    struct wlr_output *wlr_output = &output->wlr_output;
-    struct wl_event_loop *event_loop = wl_display_get_event_loop(backend->display);
-    if (!event_loop) {
-        wlr_log(WLR_ERROR, "Failed to get event loop");
-        free(output);
-        return NULL;
-    }
-    struct wlr_output_state initial_state = {0};
-    initial_state.committed = WLR_OUTPUT_STATE_MODE | WLR_OUTPUT_STATE_ENABLED;
-    initial_state.mode_type = WLR_OUTPUT_STATE_MODE_CUSTOM;
-    initial_state.custom_mode.width = width;
-    initial_state.custom_mode.height = height;
-    initial_state.custom_mode.refresh = refresh_hz * 1000;
-    initial_state.enabled = true;
-    wlr_output_init(wlr_output, &backend->backend, &rdp_output_impl, event_loop, &initial_state);
-    wlr_output_set_name(wlr_output, name ? name : "rdp-0");
-    if (!wlr_output_commit_state(wlr_output, &initial_state)) {
-        wlr_log(WLR_ERROR, "Failed to commit initial output state");
-        wlr_output_destroy(wlr_output);
-        free(output);
-        return NULL;
-    }
-    wl_list_insert(&backend->outputs, &output->link);
-    wlr_log(WLR_INFO, "RDP output created successfully");
-    return output;
-}*/
-
-
-/* Output creation */
-
-
-static struct wlr_RDP_output *rdp_output_create(
-        struct wlr_RDP_backend *backend, const char *name,
-        int width, int height, int refresh_hz) {
-    struct wlr_RDP_output *output = calloc(1, sizeof(*output));
-    if (!output) {
-        wlr_log(WLR_ERROR, "Failed to allocate RDP output");
-        return NULL;
-    }
-    output->backend = backend;
-    struct wlr_output *wlr_output = &output->wlr_output;
-    wlr_log(WLR_DEBUG, "Creating RDP output: %s %dx%d@%d",
-            name ? name : "(null)", width, height, refresh_hz);
     wlr_log(WLR_DEBUG, "Initializing output implementation");
     struct wl_event_loop *event_loop = wl_display_get_event_loop(backend->display);
-    if (!event_loop) {
-        wlr_log(WLR_ERROR, "Failed to get event loop");
-        free(output);
-        return NULL;
-    }
-    wlr_output_init(wlr_output, &backend->backend, &rdp_output_impl, event_loop, NULL);
-    wlr_log(WLR_DEBUG, "Output name after wlr_output_init: %s",
-            wlr_output->name ? wlr_output->name : "(null)");
-    // Set name after wlr_output_init to avoid reset
-    wlr_output_set_name(wlr_output, name ? name : "rdp-0");
-    wlr_log(WLR_DEBUG, "Output name set to %s", wlr_output->name ? wlr_output->name : "(null)");
+    
+    wl_list_init(&wlr_output->modes);
+    
     struct wlr_output_mode *mode = calloc(1, sizeof(*mode));
     if (!mode) {
         wlr_log(WLR_ERROR, "Failed to allocate output mode");
         free(output);
         return NULL;
     }
+
     mode->width = width;
     mode->height = height;
     mode->refresh = refresh_hz * 1000;
     wlr_log(WLR_DEBUG, "Adding mode: %dx%d@%d", width, height, refresh_hz);
     wl_list_insert(&wlr_output->modes, &mode->link);
+
+    if (!backend->renderer) {
+        wlr_log(WLR_ERROR, "Renderer not initialized for RDP backend");
+        free(mode);
+        free(output);
+        return NULL;
+    }
+
+    if (!backend->allocator) {
+        wlr_log(WLR_DEBUG, "Creating RDP allocator");
+        backend->allocator = wlr_rdp_allocator_create(backend->renderer); // Fixed: Pass renderer
+        if (!backend->allocator) {
+            wlr_log(WLR_ERROR, "Failed to create RDP allocator");
+            free(mode);
+            free(output);
+            return NULL;
+        }
+    }
+
     struct wlr_output_state state;
     wlr_output_state_init(&state);
     wlr_output_state_set_enabled(&state, true);
     wlr_output_state_set_mode(&state, mode);
-    wlr_log(WLR_DEBUG, "Initializing render with allocator=%p, renderer=%p",
-            backend->allocator, backend->renderer);
-    if (!wlr_output_init_render(wlr_output, backend->allocator, backend->renderer)) {
-        wlr_log(WLR_ERROR, "Failed to initialize output render for %s",
-                wlr_output->name ? wlr_output->name : "(null)");
-        wlr_output_state_finish(&state);
-        free(output);
-        return NULL;
-    }
-    wlr_log(WLR_DEBUG, "Output name before test: %s",
-            wlr_output->name ? wlr_output->name : "(null)");
-    wlr_log(WLR_DEBUG, "Testing output state for %s", wlr_output->name ? wlr_output->name : "(null)");
-    if (!wlr_output_test_state(wlr_output, &state)) {
-        wlr_log(WLR_ERROR, "Output state test failed for %s",
-                wlr_output->name ? wlr_output->name : "(null)");
-        wlr_output_state_finish(&state);
-        free(output);
-        return NULL;
-    }
-    wlr_log(WLR_DEBUG, "Output name before commit: %s",
-            wlr_output->name ? wlr_output->name : "(null)");
+
+    wlr_output_init(wlr_output, &backend->backend, &rdp_output_impl, event_loop, &state);
+    
     if (!wlr_output_commit_state(wlr_output, &state)) {
-        wlr_log(WLR_ERROR, "Failed to commit initial output state for %s",
-                wlr_output->name ? wlr_output->name : "(null)");
+        wlr_log(WLR_ERROR, "Failed to commit initial output state for %s", name);
         wlr_output_state_finish(&state);
+        wlr_output_destroy(wlr_output);
+        free(mode);
         free(output);
         return NULL;
     }
     wlr_output_state_finish(&state);
-    wlr_output->width = width;
-    wlr_output->height = height;
-    wlr_output->refresh = refresh_hz * 1000;
+
+    wlr_output_set_name(wlr_output, name);
+
+    if (wlr_output->swapchain) {
+      //  wlr_log(WLR_INFO, "Swapchain created for %s: format=0x%x, buffer count=%d",
+        //        name, wlr_output->swapchain->format, wlr_output->swapchain->num_slots);
+    } else {
+        wlr_log(WLR_INFO, "Swapchain not yet created for %s", name);
+    }
+
     wl_list_insert(&backend->outputs, &output->link);
-    wlr_log(WLR_INFO, "RDP output %s created successfully", wlr_output->name);
+    
+    wlr_log(WLR_INFO, "RDP output created successfully");
     return output;
 }
 
@@ -1598,9 +1446,11 @@ static struct wlr_RDP_output *rdp_output_create(
 static bool rdp_backend_start(struct wlr_backend *wlr_backend) {
     struct wlr_RDP_backend *backend = RDP_backend_from_backend(wlr_backend);
     wlr_log(WLR_INFO, "Starting RDP backend");
+    backend->started = true; // Set early to allow commits
     struct wlr_RDP_output *out = rdp_output_create(backend, "rdp-0", 1024, 768, 60);
     if (!out) {
         wlr_log(WLR_ERROR, "Failed to create RDP output");
+        backend->started = false; // Reset on failure
         return false;
     }
     struct wlr_output_state state = {0};
@@ -1609,10 +1459,10 @@ static bool rdp_backend_start(struct wlr_backend *wlr_backend) {
     if (!wlr_output_commit_state(&out->wlr_output, &state)) {
         wlr_log(WLR_ERROR, "Failed to enable RDP output");
         wlr_output_destroy(&out->wlr_output);
+        backend->started = false; // Reset on failure
         return false;
     }
     wl_signal_emit_mutable(&backend->backend.events.new_output, &out->wlr_output);
-    backend->started = true;
     return true;
 }
 

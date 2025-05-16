@@ -15,5 +15,6 @@ executable(
 	include_directories: [
 		include_directories('../include'),
 		include_directories('../backend/RDP'),  # Adjusted for backend/RDP/backend.h
+		include_directories('../include/tinywl'),
 	]
 )

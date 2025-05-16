@@ -21,7 +21,6 @@
 #include <wlr/util/log.h>
 
 #include "backend/RDP.h"
-#include "util/signal.h"
 #include "util/time.h"
 
 static const uint32_t SUPPORTED_OUTPUT_STATE =

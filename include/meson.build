@@ -23,6 +23,9 @@ endif
 if not features.get('session')
 	exclude_files += 'backend/session.h'
 endif
+if not features.get('tinywl', false)  # Add conditional for tinywl feature
+	exclude_files += 'tinywl/tinywl.h'
+endif
 
 install_subdir('wlr',
 	install_dir: get_option('includedir') / versioned_name,

@@ -271,25 +271,35 @@ static const struct wlr_texture_impl texture_impl = {
 	.destroy = handle_gles2_texture_destroy,
 };
 
-static struct wlr_gles2_texture *gles2_texture_create(
-		struct wlr_gles2_renderer *renderer, uint32_t width, uint32_t height) {
-	struct wlr_gles2_texture *texture = calloc(1, sizeof(*texture));
-	if (texture == NULL) {
-		wlr_log_errno(WLR_ERROR, "Allocation failed");
-		return NULL;
-	}
-	wlr_texture_init(&texture->wlr_texture, &renderer->wlr_renderer,
+static struct wlr_gles2_texture *gles2_texture_create(struct wlr_gles2_renderer *renderer,
+        uint32_t width, uint32_t height) {
+    if (!renderer) {
+        return NULL;
+    }
+
+    // Ensure renderer's texture list is initialized
+    if (renderer->textures.prev == NULL || renderer->textures.next == NULL) {
+        wl_list_init(&renderer->textures);
+    }
+
+    struct wlr_gles2_texture *texture = calloc(1, sizeof(*texture));
+    if (texture == NULL) {
+        return NULL;
+    }
+
+    wlr_texture_init(&texture->wlr_texture, &renderer->wlr_renderer,
 		&texture_impl, width, height);
-	texture->renderer = renderer;
+    texture->renderer = renderer;
 
-	/* Ensure renderer->textures is initialized */
-	if (!renderer->textures.next || !renderer->textures.prev) {
-		wlr_log(WLR_INFO, "Initializing renderer texture list");
-		wl_list_init(&renderer->textures);
-	}
+    // Initialize texture's link before insertion
+    wl_list_init(&texture->link);
 
-	wl_list_insert(&renderer->textures, &texture->link);
-	return texture;
+    // Insert into renderer's texture list
+    if (renderer->textures.prev && renderer->textures.next) {
+        wl_list_insert(&renderer->textures, &texture->link);
+    }
+
+    return texture;
 }
 
 static struct wlr_texture *gles2_texture_from_pixels(

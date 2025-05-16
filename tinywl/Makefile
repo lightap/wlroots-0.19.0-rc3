@@ -28,7 +28,7 @@ LIBS=\
 
 # Define CFLAGS with all required includes
 CFLAGS_PKG_CONFIG=$(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) $(PKG_CONFIG) --cflags wlroots wayland-server xkbcommon pixman-1 libdrm glesv2 libpng freerdp2 winpr2)
-CFLAGS+=$(CFLAGS_PKG_CONFIG) -I. -Iinclude -DWLR_USE_UNSTABLE -I/home/light/wlroots0.19/rc3/wlroots/include -g -Werror
+CFLAGS+=$(CFLAGS_PKG_CONFIG) -I. -Iinclude -DWLR_USE_UNSTABLE -I/home/light/testwlroots/wlroots0.19\ tinywl\ RDP\ 10am\ 10th\ may/rc3/wlroots/include -g -Werror
 
 # Define LDFLAGS to include library paths
 LDFLAGS+=$(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) $(PKG_CONFIG) --libs-only-L wlroots wayland-server xkbcommon pixman-1 libdrm glesv2 libpng freerdp2 winpr2)
