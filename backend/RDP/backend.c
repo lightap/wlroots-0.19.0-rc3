@@ -56,6 +56,10 @@
 #endif
 
 
+#include <wlr/types/wlr_output.h>
+#include <wlr/util/log.h>
+
+
 
 #define MAX_FREERDP_FDS 32  // Add this definition near the top of the file
 
@@ -660,6 +664,21 @@ struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display) {
     wlr_log(WLR_INFO, "Attempting to create GLES2 renderer with surfaceless EGL");
     backend->renderer = wlr_renderer_autocreate(&backend->backend);
  
+// Query OpenGL state
+    const char *vendor = (const char *)glGetString(GL_VENDOR);
+    const char *renderer = (const char *)glGetString(GL_RENDERER);
+    const char *version = (const char *)glGetString(GL_VERSION);
+    const char *shading_lang = (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
+
+    if (!vendor || !renderer || !version || !shading_lang) {
+        wlr_log(WLR_ERROR, "Failed to query OpenGL state: context may not be active");
+    } else {
+        wlr_log(WLR_INFO, "wlr_renderer GL_VENDOR: %s", vendor);
+        wlr_log(WLR_INFO, "wlr_renderer GL_RENDERER: %s", renderer);
+        wlr_log(WLR_INFO, "wlr_renderer GL_VERSION: %s", version);
+        wlr_log(WLR_INFO, "wlr_renderer GL_SHADING_LANGUAGE_VERSION: %s", shading_lang);
+    }
+
 /*
     if (!backend->renderer) {
         wlr_log(WLR_ERROR, "Failed to create GLES2 renderer, falling back to Pixman");
@@ -682,6 +701,22 @@ struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display) {
 */
     // Initialize renderer for Wayland display
     wlr_renderer_init_wl_display(backend->renderer, display);
+
+
+// Query OpenGL state
+    vendor = (const char *)glGetString(GL_VENDOR);
+    renderer = (const char *)glGetString(GL_RENDERER);
+    version = (const char *)glGetString(GL_VERSION);
+    shading_lang = (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
+
+    if (!vendor || !renderer || !version || !shading_lang) {
+        wlr_log(WLR_ERROR, "Failed to query OpenGL state: context may not be active");
+    } else {
+        wlr_log(WLR_INFO, "2wlr_renderer GL_VENDOR: %s", vendor);
+        wlr_log(WLR_INFO, "2wlr_renderer GL_RENDERER: %s", renderer);
+        wlr_log(WLR_INFO, "2wlr_renderer GL_VERSION: %s", version);
+        wlr_log(WLR_INFO, "2wlr_renderer GL_SHADING_LANGUAGE_VERSION: %s", shading_lang);
+    }
 
 wlr_log(WLR_INFO, "Successfully created GLES2 renderer");
 
@@ -1224,7 +1259,7 @@ static BOOL rdp_suppress_output(rdpContext *context, BYTE allow,
     struct rdp_peer_context *peerCtx = (struct rdp_peer_context *)context;
     
     wlr_log(WLR_DEBUG, "RDP: Output suppression changed: allow=%d", allow);
-    
+    wlr_output_send_frame(peerCtx->current_output);
     if (allow) {
         peerCtx->item.flags |= RDP_PEER_OUTPUT_ENABLED;
         
@@ -1241,73 +1276,41 @@ static BOOL rdp_suppress_output(rdpContext *context, BYTE allow,
 }
 
 
-/* backend.c: rdp_output_commit */
 
-
-// In rdp_output_commit
-
-#include <wlr/types/wlr_output.h>
-#include <wlr/util/log.h>
 
 static bool rdp_output_commit(struct wlr_output *wlr_output,
         const struct wlr_output_state *state) {
     struct wlr_RDP_output *output = RDP_output_from_output(wlr_output);
     struct wlr_RDP_backend *backend = output->backend;
-
-    wlr_log(WLR_DEBUG, "Committing output %s: backend->started=%d, state->committed=0x%x",
-            wlr_output->name ? wlr_output->name : "(null)", backend->started, state->committed);
-
-    // Allow commits during initialization if backend not started
+    
     if (!backend->started) {
-        if (state->committed & (WLR_OUTPUT_STATE_ENABLED | WLR_OUTPUT_STATE_MODE | WLR_OUTPUT_STATE_RENDER_FORMAT)) {
-            wlr_log(WLR_DEBUG, "Allowing initial commit for output %s with state flags 0x%x",
-                    wlr_output->name ? wlr_output->name : "(null)", state->committed);
-            return true;
-        }
-        wlr_log(WLR_ERROR, "Backend not started for output %s commit, unsupported state flags 0x%x",
-                wlr_output->name ? wlr_output->name : "(null)", state->committed);
         return false;
     }
 
-    // Handle bufferless commits (often used for testing)
+    // Handle bufferless commits for surfaceless mode
     if (!(state->committed & WLR_OUTPUT_STATE_BUFFER)) {
-        wlr_log(WLR_DEBUG, "Bufferless commit on RDP output %s, assuming test mode",
-                wlr_output->name ? wlr_output->name : "(null)");
-        return true; // Skip frame event for test commits
-    }
-
-    // Get the current RDP peer
-    freerdp_peer *peer = get_global_rdp_peer();
-    wlr_log(WLR_DEBUG, "Peer retrieved: %p, connection_established=%d",
-            peer, rdp_connection_established);
-    if (!peer || !peer->context || !rdp_connection_established) {
-        wlr_log(WLR_DEBUG, "No active RDP peer for buffer commit on output %s, skipping",
-                wlr_output->name ? wlr_output->name : "(null)");
+        wlr_log(WLR_DEBUG, "Bufferless commit on RDP output");
         return true;
     }
-
+    
+    // Get the current RDP peer
+    freerdp_peer *peer = get_global_rdp_peer();
+    if (!peer || !peer->context) {
+        wlr_log(WLR_ERROR, "No active RDP peer for frame commit");
+        return false;
+    }
+    
     struct rdp_peer_context *peerCtx = (struct rdp_peer_context *)peer->context;
     peerCtx->current_output = wlr_output;
-
-    // Transmit buffer if available
-    if (state->committed & WLR_OUTPUT_STATE_BUFFER && state->buffer) {
-        wlr_log(WLR_DEBUG, "Transmitting buffer %p for output %s",
-                state->buffer, wlr_output->name ? wlr_output->name : "(null)");
-        rdp_transmit_surface(state->buffer);
-    }
-
-    // Send frame event only if output is enabled and buffer is committed
-    if (peerCtx->item.flags & RDP_PEER_OUTPUT_ENABLED) {
+    
+    // Only send frame event if output is enabled
+   // if (peerCtx->item.flags & RDP_PEER_OUTPUT_ENABLED) {
         wlr_output_send_frame(wlr_output);
         peerCtx->frame_ack_pending = false;
-        wlr_log(WLR_DEBUG, "Frame event sent for output %s",
-                wlr_output->name ? wlr_output->name : "(null)");
-    } else {
-        peerCtx->frame_ack_pending = true;
-        wlr_log(WLR_DEBUG, "Frame event pending for output %s, output not enabled",
-                wlr_output->name ? wlr_output->name : "(null)");
-    }
-
+    //} else {
+      //  peerCtx->frame_ack_pending = true;
+   // }
+    
     return true;
 }
 
@@ -1395,6 +1398,8 @@ static struct wlr_RDP_output *rdp_output_create(
         free(output);
         return NULL;
     }
+
+
 
     if (!backend->allocator) {
         wlr_log(WLR_DEBUG, "Creating RDP allocator");

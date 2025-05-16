@@ -75,7 +75,7 @@ const struct wlr_drm_format_set *wlr_renderer_get_texture_formats(
 const struct wlr_drm_format_set *wlr_renderer_get_render_formats(
 		struct wlr_renderer *r) {
 	if (!r->impl->get_render_formats) {
-//		return NULL;
+		return NULL;
 	}
 	return r->impl->get_render_formats(r);
 }
@@ -124,7 +124,15 @@ bool wlr_renderer_init_wl_display(struct wlr_renderer *r,
 
 struct wlr_renderer *renderer_autocreate_with_drm_fd(int drm_fd) {
 	const char *renderer_env = getenv("WLR_RENDERER");
+const char *vendor = (const char *)glGetString(GL_VENDOR);
+    const char *renderer = (const char *)glGetString(GL_RENDERER);
+    const char *version = (const char *)glGetString(GL_VERSION);
+    const char *shading_lang = (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
 
+    wlr_log(WLR_INFO, "renderer_autocreate GL_VENDOR: %s", vendor);
+    wlr_log(WLR_INFO, "renderer_autocreate GL_RENDERER: %s", renderer);
+    wlr_log(WLR_INFO, "renderer_autocreate GL_VERSION: %s", version);
+    wlr_log(WLR_INFO, "renderer_autocreate GL_SHADING_LANGUAGE_VERSION: %s", shading_lang);
 
 // Direct surfaceless path - no fallbacks when surfaceless is requested
     //if (egl_platform && strcmp(egl_platform, "surfaceless") == 0)
@@ -182,9 +190,9 @@ struct wlr_renderer *wlr_renderer_autocreate(struct wlr_backend *backend) {
 }
 
 int wlr_renderer_get_drm_fd(struct wlr_renderer *r) {
-	if (!r->impl->get_drm_fd) {
-		return -1;
-	}
+//	if (!r->impl->get_drm_fd) {
+//		return -1;
+//	}
 	return r->impl->get_drm_fd(r);
 }
 

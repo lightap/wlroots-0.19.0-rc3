@@ -730,8 +730,8 @@ struct wlr_renderer *wlr_gles2_renderer_create(struct wlr_egl *egl) {
 
     if (!renderer->egl->exts.EXT_image_dma_buf_import) {
         wlr_log(WLR_ERROR, "EGL_EXT_image_dma_buf_import not supported");
-        free(renderer);
-    //    return NULL;
+     //   free(renderer);
+      //  return NULL;
     }
     if (!check_gl_ext(exts_str, "GL_EXT_texture_format_BGRA8888")) {
         wlr_log(WLR_ERROR, "BGRA8888 format not supported by GLES2");
@@ -917,6 +917,7 @@ struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void) {
     EGLDisplay display = egl->display;
     EGLContext context = egl->context;
 
+
     // Allocate renderer
     struct wlr_gles2_renderer *renderer = calloc(1, sizeof(struct wlr_gles2_renderer));
     if (!renderer) {
@@ -931,6 +932,19 @@ struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void) {
     renderer->wlr_renderer.impl = &renderer_impl;
     renderer->egl = egl;
     renderer->drm_fd = -1;
+
+
+
+    const char *vendor = (const char *)glGetString(GL_VENDOR);
+    const char *renderer_str  = (const char *)glGetString(GL_RENDERER);
+    const char *version = (const char *)glGetString(GL_VERSION);
+    const char *shading_lang = (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
+
+    wlr_log(WLR_INFO, "wlr_gles2_renderer GL_VENDOR: %s", vendor);
+    wlr_log(WLR_INFO, "wlr_gles2_renderer GL_RENDERER: %s",renderer_str );
+    wlr_log(WLR_INFO, "wlr_gles2_renderer GL_VERSION: %s", version);
+    wlr_log(WLR_INFO, "wlr_gles2_renderer GL_SHADING_LANGUAGE_VERSION: %s", shading_lang);
+
 
     // Initialize buffers list
     wl_list_init(&renderer->buffers);
