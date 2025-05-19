@@ -15,11 +15,9 @@
 #include "types/wlr_subcompositor.h"
 #include "util/array.h"
 #include "util/time.h"
-#include <freerdp/freerdp.h> // For RDP backend
 #include <freerdp/freerdp.h>
 #include <freerdp/version.h>
 
-#include <freerdp/freerdp.h>
 #include <freerdp/listener.h>
 #include <freerdp/update.h>
 #include <freerdp/input.h>
@@ -27,10 +25,11 @@
 #include <freerdp/codec/rfx.h>
 #include <freerdp/codec/nsc.h>
 #include <freerdp/locale/keyboard.h>
-#include <wlr/backend/RDP.h>
 #include <wlr/backend.h>
 #include <wlr/render/egl.h>
 #include <wlr/backend/RDP.h>
+#include <pthread.h>
+
 
 #define COMPOSITOR_VERSION 6
 #define CALLBACK_VERSION 1
@@ -68,7 +67,7 @@ struct rdp_peer_context {
     struct wl_event_source *frame_timer;
     struct wlr_output *current_output;
 };
-freerdp_peer *get_global_rdp_peer(void);
+//freerdp_peer *get_global_rdp_peer(void);
 // Function declarations (assumed implemented in backend/rdp/backend.c)
 static void surface_update_opaque_region(struct wlr_surface *surface);
 static void surface_update_input_region(struct wlr_surface *surface);
@@ -461,7 +460,6 @@ static void surface_state_move(struct wlr_surface_state *state,
 }
 
 static void surface_apply_damage(struct wlr_surface *surface) {
-    // Handle NULL buffer commit scenario
     if (surface->current.buffer == NULL) {
         if (surface->buffer != NULL) {
             wlr_buffer_unlock(&surface->buffer->base);
@@ -471,41 +469,7 @@ static void surface_apply_damage(struct wlr_surface *surface) {
         return;
     }
 
-    // Additional logging for RDP transmission
-    wlr_log(WLR_DEBUG, "Applying surface damage: buffer=%p", 
-            (void*)surface->current.buffer);
 
-
-
-    // Attempt RDP transmission for every surface with a buffer
-    if (surface->current.buffer != NULL) {
-        void *current_peer = get_global_rdp_peer();
-        
-        wlr_log(WLR_DEBUG, "Current RDP peer for transmission: %p", 
-                (void*)current_peer);
-        
-        if (current_peer) {
-            rdp_transmit_surface(surface->current.buffer);
-            
-            // Handle frame sync
-            struct rdp_peer_context *peerCtx = 
-                (struct rdp_peer_context *)((freerdp_peer*)current_peer)->context;
-            
-            if (peerCtx && peerCtx->current_output) {
-                // Only send frame event if output is enabled
-                if (peerCtx->item.flags & RDP_PEER_OUTPUT_ENABLED) {
-                    wlr_output_send_frame(peerCtx->current_output);
-                    peerCtx->frame_ack_pending = false;
-                } else {
-                    peerCtx->frame_ack_pending = true;
-                }
-            }
-        } else {
-            wlr_log(WLR_ERROR, "No RDP peer available for surface transmission");
-        }
-    }
-
-    // Continue with existing damage handling...
     // Determine surface opacity
     surface->opaque = wlr_buffer_is_opaque(surface->current.buffer);
 
@@ -555,17 +519,7 @@ static void surface_commit_state(struct wlr_surface *surface,
     }
 
     surface_update_damage(&surface->buffer_damage, &surface->current, next);
-
-    // RDP backend integration (from 0.16.2)
-    if (next->buffer != NULL) {
-        freerdp_peer *current_peer = get_global_rdp_peer();
-        if (current_peer) {
-     //       struct rdp_peer_context *peer_ctx = (struct rdp_peer_context *)current_peer->context;
-       //     if (peer_ctx->compositor == surface->compositor) {
-                rdp_transmit_surface(next->buffer);
-         //   }
-        }
-    }
+    
 
     surface->previous.scale = surface->current.scale;
     surface->previous.transform = surface->current.transform;
@@ -610,6 +564,9 @@ static void surface_commit_state(struct wlr_surface *surface,
 
     wlr_buffer_unlock(surface->current.buffer);
     surface->current.buffer = NULL;
+
+     
+                 
 }
 
 

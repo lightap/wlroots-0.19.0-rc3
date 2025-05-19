@@ -61,12 +61,14 @@
 
 
 
+
+
 #define MAX_FREERDP_FDS 32  // Add this definition near the top of the file
 
 #define DEFAULT_PIXEL_FORMAT PIXEL_FORMAT_BGRX32
 
 // Add this near the top of backend.c with other global variables
-freerdp_peer *global_rdp_peer = NULL;
+//freerdp_peer *global_rdp_peer = NULL;
 
 static pthread_mutex_t rdp_peer_mutex = PTHREAD_MUTEX_INITIALIZER;
 //static freerdp_peer *global_rdp_peer = NULL;
@@ -195,6 +197,7 @@ struct wlr_allocator *wlr_allocator_autocreate(struct wlr_backend *backend,
 // Add these before the implementations
 void init_rdp_peer_manager(void);
 //static void set_global_rdp_peer(freerdp_peer *peer);
+freerdp_peer *global_rdp_peer = NULL;   
 
 
 // If this function is used across multiple files
@@ -207,7 +210,7 @@ static BOOL rdp_peer_activate(freerdp_peer *client);
 
 // Declare buffer_is_opaque function or include the appropriate header
 bool buffer_is_opaque(struct wlr_buffer *buffer);
- void set_global_rdp_peer(freerdp_peer *peer) ;
+ 
 
 /* Backend and Output Implementations */
 static const struct wlr_backend_impl rdp_backend_impl;
@@ -216,26 +219,7 @@ static const struct wlr_output_impl rdp_output_impl;
 
 int rdp_peer_init(freerdp_peer *client, struct wlr_RDP_backend *b);
 
-/* Per-output struct for our “virtual” RDP outputs */
-/*
-struct wlr_RDP_output {
-    struct wlr_output wlr_output;
-    struct wlr_RDP_backend *backend;
-    struct wl_list link;
-};*/
-/*
-struct wlr_RDP_backend {
-    struct wlr_backend backend;
-    struct wl_display *display;
-    struct wl_event_loop *event_loop;
-    bool started;
-    struct wl_list outputs;
-    struct wlr_renderer *renderer;
-    struct wlr_allocator *allocator;  // Add this line
-    // No renderer pointer needed anymore
-     // Add FreeRDP listener
-    freerdp_listener *listener;
-};*/
+
 
 static bool rdp_backend_start(struct wlr_backend *wlr_backend);
 static void rdp_backend_destroy(struct wlr_backend *wlr_backend);
@@ -279,37 +263,27 @@ void init_rdp_peer_manager(void) {
 }
 
 
-void set_global_rdp_peer(freerdp_peer *peer) {
-    pthread_mutex_lock(&rdp_peer_mutex);
-    
-    // More detailed logging
-    wlr_log(WLR_ERROR, "Setting global RDP peer: %p (was %p)", 
-            (void*)peer, (void*)global_rdp_peer);
-    
-    // Only set if the peer is not NULL
-    if (peer != NULL) {
-        global_rdp_peer = peer;
-        rdp_connection_established = TRUE;
-        wlr_log(WLR_ERROR, "Global RDP peer successfully set and connection established");
-    } else {
-        // If setting to NULL, be more cautious
-        if (global_rdp_peer != NULL) {
-            wlr_log(WLR_ERROR, "Clearing global RDP peer");
-            global_rdp_peer = NULL;
-            rdp_connection_established = FALSE;
-        }
-    }
-    
-    pthread_mutex_unlock(&rdp_peer_mutex);
-}
 
-// Thread-safe peer getter
+
+
+/* Replace your set_global_rdp_peer function with this version */
 freerdp_peer* get_global_rdp_peer(void) {
+    freerdp_peer* peer;
     pthread_mutex_lock(&rdp_peer_mutex);
-    freerdp_peer *peer = global_rdp_peer;
+    peer = global_rdp_peer;
     pthread_mutex_unlock(&rdp_peer_mutex);
+    printf("[%s:%d] get_global_rdp_peer called, returning: %p\n", 
+           __FILE__, __LINE__, peer);
     return peer;
 }
+
+void set_global_rdp_peer(freerdp_peer* peer) {
+    pthread_mutex_lock(&rdp_peer_mutex);
+    global_rdp_peer = peer;
+    pthread_mutex_unlock(&rdp_peer_mutex);
+    wlr_log(WLR_DEBUG, "set_global_rdp_peer: peer=%p", peer);
+}
+
 
 
 void rdp_transmit_surface(struct wlr_buffer *buffer) {
@@ -441,25 +415,193 @@ static int rdp_listener_activity(int fd, uint32_t mask, void *data) {
 
 
 
+
+
+// Create RDP output function adjusted for your specific wlroots version
+// You'll need to customize this based on your actual struct definitions
+
+// Add this prototype near the top of your file
+static bool create_rdp_output_for_client(struct wlr_RDP_backend *backend, freerdp_peer *client);
+
+static bool setup_rdp_output_buffers(struct wlr_RDP_output *output, int width, int height) {
+    wlr_log(WLR_DEBUG, "RDP: Skipping buffer setup - using existing mechanism");
+    
+    // Set dimensions in output structure if needed
+    output->wlr_output.width = width;
+    output->wlr_output.height = height;
+    
+    return true;
+}
+
+static bool create_rdp_output_for_client(struct wlr_RDP_backend *backend, freerdp_peer *client) {
+    if (!backend || !client) {
+        wlr_log(WLR_ERROR, "RDP: Invalid parameters for output creation");
+        return false;
+    }
+
+    // Validate backend's event loop
+    if (!backend->event_loop) {
+        wlr_log(WLR_ERROR, "RDP: Backend has no event loop");
+        return false;
+    }
+
+    // Get client resolution from settings
+    int width = 1920;  // Default width
+    int height = 1080; // Default height
+    
+    if (client->settings) {
+        if (client->settings->DesktopWidth > 0) {
+            width = client->settings->DesktopWidth;
+        }
+        if (client->settings->DesktopHeight > 0) {
+            height = client->settings->DesktopHeight;
+        }
+    }
+    
+    wlr_log(WLR_INFO, "RDP: Creating output with dimensions %dx%d", width, height);
+    
+    // Allocate and initialize the RDP output
+    struct wlr_RDP_output *output = calloc(1, sizeof(struct wlr_RDP_output));
+    if (!output) {
+        wlr_log(WLR_ERROR, "RDP: Failed to allocate memory for output");
+        return false;
+    }
+    
+    // Set output parameters
+    output->backend = backend;
+    
+    // Get the event loop from the display
+    struct wl_event_loop *event_loop = backend->event_loop;
+    
+    // Initialize the output state
+    struct wlr_output_state initial_state;
+    wlr_output_state_init(&initial_state);
+    wlr_output_state_set_enabled(&initial_state, true);
+    
+    // Create and set up the output mode
+    struct wlr_output_mode *mode = calloc(1, sizeof(struct wlr_output_mode));
+    if (!mode) {
+        wlr_log(WLR_ERROR, "RDP: Failed to allocate memory for output mode");
+        wlr_output_state_finish(&initial_state);
+        free(output);
+        return false;
+    }
+    
+    mode->width = width;
+    mode->height = height;
+    mode->refresh = 60000; // 60 Hz refresh rate in mHz
+    wlr_output_state_set_mode(&initial_state, mode);
+    
+    // Initialize wlr_output with all required arguments
+    wlr_output_init(&output->wlr_output, &backend->backend, &rdp_output_impl, event_loop, &initial_state);
+    
+    // Clean up the initial state
+    wlr_output_state_finish(&initial_state);
+    
+    // Set output name
+    static int output_counter = 0;
+    char name[64];
+    snprintf(name, sizeof(name), "RDP-%d", output_counter++);
+    wlr_output_set_name(&output->wlr_output, name);
+    
+    // Add mode to output's mode list
+    wl_list_insert(&output->wlr_output.modes, &mode->link);
+    
+    // Set current mode
+    output->wlr_output.current_mode = mode;
+    output->wlr_output.width = width;
+    output->wlr_output.height = height;
+    
+    // Set enabled state
+    output->wlr_output.enabled = true;
+    
+    // Set up buffers and rendering context for this output
+    if (!setup_rdp_output_buffers(output, width, height)) {
+        wlr_log(WLR_ERROR, "RDP: Failed to set up output buffers");
+        wlr_output_destroy(&output->wlr_output); // This will free the mode if linked
+        free(output);
+        return false;
+    }
+    
+    // Add to the list of outputs
+    wl_list_insert(&backend->outputs, &output->link);
+    
+    wlr_log(WLR_INFO, "RDP: Output '%s' created successfully", output->wlr_output.name);
+    
+    // Notify the compositor of the new output
+    wl_signal_emit(&backend->backend.events.new_output, &output->wlr_output);
+    
+    return true;
+}
+
+
 static BOOL rdp_peer_activate(freerdp_peer *client) {
-    wlr_log(WLR_ERROR, "RDP: Peer Activation");
-
-    // Ensure global peer is set
-    set_global_rdp_peer(client);
-
-    // Validate client
+    wlr_log(WLR_INFO, "RDP: Peer Activation for client %p", client);
     if (!client || !client->settings) {
         wlr_log(WLR_ERROR, "RDP: Invalid client during activation");
         set_global_rdp_peer(NULL);
         return FALSE;
     }
-
-    // Ensure surface commands are enabled
+    set_global_rdp_peer(client);
     client->settings->SurfaceCommandsEnabled = TRUE;
+    wlr_log(WLR_INFO, "RDP: Peer Activated Successfully, global_rdp_peer=%p", global_rdp_peer);
 
-    wlr_log(WLR_ERROR, "RDP: Peer Activated Successfully");
+    if (!client->context) {
+        wlr_log(WLR_ERROR, "RDP: Invalid client context during activation");
+        return TRUE; // Continue with activation but skip frame rendering
+    }
+
+    // Get the backend from the peer context
+    struct rdp_peer_context *peerCtx = (struct rdp_peer_context *)client->context;
+    struct wlr_RDP_backend *rdp_be = peerCtx->backend;
+    if (!rdp_be) {
+        wlr_log(WLR_ERROR, "RDP: No backend associated with peer context");
+        return TRUE; // Continue with activation but skip frame rendering
+    }
+
+    // Check if outputs list is initialized and not empty
+    if (!rdp_be->outputs.next || rdp_be->outputs.next == &rdp_be->outputs) {
+        wlr_log(WLR_DEBUG, "RDP: No outputs available in backend, creating one for this client");
+
+        // Create an output for this session
+        if (!create_rdp_output_for_client(rdp_be, client)) {
+            wlr_log(WLR_ERROR, "RDP: Failed to create output for client");
+            return TRUE; // Continue with activation but skip frame rendering
+        }
+
+        // Check again if output was created successfully
+        if (!rdp_be->outputs.next || rdp_be->outputs.next == &rdp_be->outputs) {
+            wlr_log(WLR_ERROR, "RDP: Output creation succeeded but output list is still empty");
+            return TRUE; // Continue with activation but skip frame rendering
+        }
+    }
+
+    // Extract output from the list
+    struct wlr_RDP_output *rdp_output_priv = NULL;
+    rdp_output_priv = wl_container_of(rdp_be->outputs.next, rdp_output_priv, link);
+
+    if (!rdp_output_priv) {
+        wlr_log(WLR_ERROR, "RDP: Could not get RDP output from list");
+        return TRUE; // Continue with activation but skip frame rendering
+    }
+
+    // Access wlr_output safely
+    struct wlr_output *wlr_output = &rdp_output_priv->wlr_output;
+    if (wlr_output) {
+        if (wlr_output->enabled) {
+            wlr_log(WLR_INFO, "RDP: Peer %p activated, sending initial frame signal for output '%s'",
+                   (void*)client, wlr_output->name ? wlr_output->name : "unnamed");
+            wlr_output_send_frame(wlr_output); // Kick off rendering for the new peer
+        } else {
+            wlr_log(WLR_INFO, "RDP: Output found but not enabled, skipping initial frame");
+        }
+    } else {
+        wlr_log(WLR_ERROR, "RDP: Invalid wlr_output structure");
+    }
+
     return TRUE;
 }
+
 
 /*
 struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display) {
@@ -656,15 +798,189 @@ struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display) {
     }
 
     // Set environment variables for surfaceless rendering
-  //  setenv("MESA_LOADER_DRIVER_OVERRIDE", "zink", 1);
-   // setenv("EGL_PLATFORM", "surfaceless", 1);
-   // setenv("WLR_RENDERER", "gles2", 1);
+    setenv("MESA_VK_VERSION_OVERRIDE", "1.2", 1);
+    setenv("MESA_LOADER_DRIVER_OVERRIDE", "zink", 1);
+   // setenv("GALLIUM_DRIVER", "zink", 1);
+    setenv("ZINK_DEBUG", "nofp64,nofast_color_clear", 1);
+    setenv("VK_DRIVER_FILES", "/usr/share/vulkan/icd.d/vulkan_icd.json", 1);
+    setenv("ZINK_DESCRIPTORS", "lazy", 1);
+    setenv("ZINK_NO_TIMELINES", "1", 1);
+    setenv("ZINK_NO_DECOMPRESS", "1", 1);
+
+    printf("Starting compositor with surfaceless EGL display\n");
+
+    // Print environment variables
+    printf("VK_DRIVER_FILES=%s\n", getenv("VK_DRIVER_FILES"));
+    printf("MESA_LOADER_DRIVER_OVERRIDE=%s\n", getenv("MESA_LOADER_DRIVER_OVERRIDE"));
+    printf("GALLIUM_DRIVER=%s\n", getenv("GALLIUM_DRIVER"));
 
     // Try creating GLES2 renderer
     wlr_log(WLR_INFO, "Attempting to create GLES2 renderer with surfaceless EGL");
+
+
+    // 1. Check for client extensions (can use EGL_NO_DISPLAY)
+    const char *client_extensions = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
+    if (!client_extensions) {
+        wlr_log(WLR_ERROR, "Could not query EGL client extensions");
+        return NULL;
+    }
+    wlr_log(WLR_INFO, "EGL client extensions: %s", client_extensions);
+
+    bool has_surfaceless = strstr(client_extensions, "EGL_MESA_platform_surfaceless") != NULL;
+    bool has_platform_base = strstr(client_extensions, "EGL_EXT_platform_base") != NULL;
+    wlr_log(WLR_INFO, "Surfaceless platform support: %s", has_surfaceless ? "YES" : "NO");
+    wlr_log(WLR_INFO, "Platform base extension: %s", has_platform_base ? "YES" : "NO");
+
+    if (!has_surfaceless || !has_platform_base) {
+        wlr_log(WLR_ERROR, "Required EGL client extensions not available");
+        return NULL;
+    }
+
+    // 2. Get platform display function
+    PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display =
+        (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+    if (!get_platform_display) {
+        wlr_log(WLR_ERROR, "Platform display function not available");
+        return NULL;
+    }
+    wlr_log(WLR_INFO, "Retrieved eglGetPlatformDisplayEXT");
+
+    // 3. Create surfaceless display
+    // FIX: Use a different variable name for EGL display
+    EGLDisplay egl_display = get_platform_display(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
+    if (egl_display == EGL_NO_DISPLAY) {
+        wlr_log(WLR_ERROR, "Failed to create surfaceless display. Error: 0x%x", eglGetError());
+        return NULL;
+    }
+    wlr_log(WLR_INFO, "Created EGL display: %p", (void*)egl_display);
+
+    // 4. Initialize EGL
+    EGLint major, minor;
+    if (!eglInitialize(egl_display, &major, &minor)) {
+        wlr_log(WLR_ERROR, "EGL initialization failed. Error: 0x%x", eglGetError());
+        eglTerminate(egl_display);
+        return NULL;
+    }
+    wlr_log(WLR_INFO, "EGL initialized, version: %d.%d", major, minor);
+
+    // 5. Query display extensions (must use initialized display)
+    const char *display_extensions = eglQueryString(egl_display, EGL_EXTENSIONS);
+    if (!display_extensions) {
+        wlr_log(WLR_ERROR, "Failed to query EGL display extensions. Error: 0x%x", eglGetError());
+        eglTerminate(egl_display);
+        return NULL;
+    }
+    wlr_log(WLR_INFO, "EGL display extensions: %s", display_extensions);
+
+    // 6. Set bind API first (before choosing config)
+    if (!eglBindAPI(EGL_OPENGL_ES_API)) {
+        wlr_log(WLR_ERROR, "Failed to bind OpenGL ES API. Error: 0x%x", eglGetError());
+        eglTerminate(egl_display);
+        return NULL;
+    }
+    wlr_log(WLR_INFO, "Successfully bound OpenGL ES API");
+
+    // 7. Choose a config with explicit GLES2
+    const EGLint config_attribs[] = {
+        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_NONE
+    };
+
+    EGLConfig config;
+    EGLint num_config;
+    if (!eglChooseConfig(egl_display, config_attribs, &config, 1, &num_config) || num_config < 1) {
+        wlr_log(WLR_ERROR, "Failed to choose EGL config. Error: 0x%x", eglGetError());
+        eglTerminate(egl_display);
+        return NULL;
+    }
+    wlr_log(WLR_INFO, "Found suitable EGL configuration");
+
+    // 8. Create context with explicit version
+    const EGLint ctx_attribs[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 2,
+        EGL_NONE // Remove profile mask to avoid compatibility issues
+    };
+
+    EGLContext context = eglCreateContext(egl_display, config, EGL_NO_CONTEXT, ctx_attribs);
+    if (context == EGL_NO_CONTEXT) {
+        wlr_log(WLR_ERROR, "Failed to create EGL context. Error: 0x%x", eglGetError());
+        eglTerminate(egl_display);
+        return NULL;
+    }
+    wlr_log(WLR_INFO, "Created EGL context");
+
+    // 9. Query EGL_CONTEXT_CLIENT_TYPE
+    EGLint client_type;
+    if (!eglQueryContext(egl_display, context, EGL_CONTEXT_CLIENT_TYPE, &client_type)) {
+        wlr_log(WLR_ERROR, "Failed to query EGL_CONTEXT_CLIENT_TYPE. Error: 0x%x", eglGetError());
+    } else {
+        wlr_log(WLR_INFO, "EGL_CONTEXT_CLIENT_TYPE: 0x%x", client_type);
+        if (client_type == EGL_OPENGL_ES_API) {
+            wlr_log(WLR_INFO, "Context client type is EGL_OPENGL_ES_API");
+        } else {
+            wlr_log(WLR_ERROR, "Unexpected context client type: 0x%x", client_type);
+            eglDestroyContext(egl_display, context);
+            eglTerminate(egl_display);
+            return NULL;
+        }
+    }
+
+    // 10. Create pbuffer surface
+    const EGLint pbuffer_attribs[] = {
+        EGL_WIDTH, 16,
+        EGL_HEIGHT, 16,
+        EGL_NONE
+    };
+
+    EGLSurface surface = eglCreatePbufferSurface(egl_display, config, pbuffer_attribs);
+    if (surface == EGL_NO_SURFACE) {
+        wlr_log(WLR_ERROR, "Failed to create pbuffer surface. Error: 0x%x", eglGetError());
+        eglDestroyContext(egl_display, context);
+        eglTerminate(egl_display);
+        return NULL;
+    }
+    wlr_log(WLR_INFO, "Created EGL pbuffer surface");
+
+    // 11. Make context current to verify it works
+    if (!eglMakeCurrent(egl_display, surface, surface, context)) {
+        wlr_log(WLR_ERROR, "Failed to make context current. Error: 0x%x", eglGetError());
+        eglDestroySurface(egl_display, surface);
+        eglDestroyContext(egl_display, context);
+        eglTerminate(egl_display);
+        return NULL;
+    }
+    wlr_log(WLR_INFO, "Made EGL context current");
+
+    // 12. Verify the context is GLES2 as expected
+    const char *gl_vendor = (const char *)glGetString(GL_VENDOR);
+    const char *gl_renderer = (const char *)glGetString(GL_RENDERER);
+    const char *gl_version = (const char *)glGetString(GL_VERSION);
+    wlr_log(WLR_INFO, "OpenGL ES Vendor: %s", gl_vendor ? gl_vendor : "Unknown");
+    wlr_log(WLR_INFO, "OpenGL ES Renderer: %s", gl_renderer ? gl_renderer : "Unknown");
+    wlr_log(WLR_INFO, "OpenGL ES Version: %s", gl_version ? gl_version : "Unknown");
+
+   
+
+    // 14. Create wlr_egl with the valid context
+    wlr_log(WLR_INFO, "Creating wlr_egl with context");
+    struct wlr_egl *wlr_egl = wlr_egl_create_with_context(egl_display, context);
+    if (!wlr_egl) {
+        wlr_log(WLR_ERROR, "Failed to create wlr_egl with context");
+        eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        eglDestroySurface(egl_display, surface);
+        eglDestroyContext(egl_display, context);
+        eglTerminate(egl_display);
+        return NULL;
+    }
+
     backend->renderer = wlr_renderer_autocreate(&backend->backend);
  
-// Query OpenGL state
+    // Query OpenGL state
     const char *vendor = (const char *)glGetString(GL_VENDOR);
     const char *renderer = (const char *)glGetString(GL_RENDERER);
     const char *version = (const char *)glGetString(GL_VERSION);
@@ -700,10 +1016,11 @@ struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display) {
     }
 */
     // Initialize renderer for Wayland display
-    wlr_renderer_init_wl_display(backend->renderer, display);
+    // FIX: Use backend->display which is the original Wayland display
+    wlr_renderer_init_wl_display(backend->renderer, backend->display);
 
 
-// Query OpenGL state
+    // Query OpenGL state
     vendor = (const char *)glGetString(GL_VENDOR);
     renderer = (const char *)glGetString(GL_RENDERER);
     version = (const char *)glGetString(GL_VERSION);
@@ -718,7 +1035,7 @@ struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display) {
         wlr_log(WLR_INFO, "2wlr_renderer GL_SHADING_LANGUAGE_VERSION: %s", shading_lang);
     }
 
-wlr_log(WLR_INFO, "Successfully created GLES2 renderer");
+    wlr_log(WLR_INFO, "Successfully created GLES2 renderer");
 
     // Create allocator
     backend->allocator = wlr_allocator_autocreate(&backend->backend, backend->renderer);
@@ -733,8 +1050,6 @@ wlr_log(WLR_INFO, "Successfully created GLES2 renderer");
         return NULL;
     }
 
-//printf( "RDP backend created successfully with %s renderer",
-  //          backend->renderer->impl);
     return &backend->backend;
 }
 
@@ -1304,17 +1619,15 @@ static bool rdp_output_commit(struct wlr_output *wlr_output,
     peerCtx->current_output = wlr_output;
     
     // Only send frame event if output is enabled
-   // if (peerCtx->item.flags & RDP_PEER_OUTPUT_ENABLED) {
+    if (peerCtx->item.flags & RDP_PEER_OUTPUT_ENABLED) {
         wlr_output_send_frame(wlr_output);
         peerCtx->frame_ack_pending = false;
-    //} else {
-      //  peerCtx->frame_ack_pending = true;
-   // }
+    } else {
+        peerCtx->frame_ack_pending = true;
+    }
     
     return true;
 }
-
-
 
 
 
@@ -1353,95 +1666,209 @@ static const struct wlr_output_impl rdp_output_impl = {
     .get_cursor_formats = rdp_output_get_cursor_formats,
 };
 
+// Function prototypes to add at the top of your file
+//static int rdp_output_frame(void *data);
+//static bool rdp_output_init_render(struct wlr_RDP_output *output, int width, int height);
+/*
+// Implementation of rdp_output_frame
+static int rdp_output_frame(void *data) {
+    struct wlr_RDP_output *output = data;
+    
+    // Don't render if we're not enabled
+    if (!output->wlr_output.enabled) {
+        wl_event_source_timer_update(output->frame_timer, 1000);
+        return 0;
+    }
+    
+    // Calculate refresh interval based on the current mode
+    struct wlr_output_mode *mode = output->wlr_output.current_mode;
+    int refresh_ms = 1000000 / (mode->refresh / 1000);
+    
+    // Schedule next frame
+    wl_event_source_timer_update(output->frame_timer, refresh_ms);
+    
+    // Signal a new frame
+    wlr_output_send_frame(&output->wlr_output);
+    
+    return 0;
+}
 
-
+// Implementation of rdp_output_init_render
+static bool rdp_output_init_render(struct wlr_RDP_output *output, int width, int height) {
+   // struct wlr_RDP_backend *backend = output->backend;
+    
+    wlr_log(WLR_DEBUG, "Initializing rendering resources for RDP output");
+    
+    // Initialize the rendering context for this output
+    // This is a simplified implementation - you may need to add more setup based 
+    // on your specific rendering needs
+    
+   // output->width = width;
+ //   output->height = height;
+    
+    // Set up any additional rendering resources needed
+    // ...
+    
+    return true;
+}
+*/
 /* Creates one “virtual” RDP output. */
 #include <wlr/render/swapchain.h> // Added for wlr_swapchain
+// In your RDP backend (e.g., backend/RDP/backend.c)
 
+// Make static if only used in this file.
+// Add prototype if used from other .c files in this module.
 static struct wlr_RDP_output *rdp_output_create(
-        struct wlr_RDP_backend *backend, const char *name,
-        int width, int height, int refresh_hz) {
-    
-    wlr_log(WLR_DEBUG, "Creating RDP output: %s %dx%d@%d", 
-            name, width, height, refresh_hz);
-    
-    struct wlr_RDP_output *output = calloc(1, sizeof(struct wlr_RDP_output));
-    if (!output) {
-        wlr_log(WLR_ERROR, "Failed to allocate RDP output");
+        struct wlr_RDP_backend *backend,
+        const char *name,
+        int width, int height, int refresh_mhz) {
+
+ // Initialize peer manager and clear global peer
+    set_global_rdp_peer(NULL);
+    rdp_connection_established = false;
+    init_rdp_peer_manager();
+
+    wlr_log(WLR_DEBUG, "RDP Backend: Creating RDP output: %s %dx%d@%dmHz",
+            name, width, height, refresh_mhz);
+
+    struct wlr_RDP_output *output_priv = calloc(1, sizeof(struct wlr_RDP_output));
+    if (!output_priv) {
+        wlr_log(WLR_ERROR, "Failed to allocate wlr_RDP_output");
         return NULL;
     }
+    output_priv->backend = backend;
 
-    output->backend = backend;
-    struct wlr_output *wlr_output = &output->wlr_output;
-    
-    wlr_log(WLR_DEBUG, "Initializing output implementation");
+    struct wlr_output *wlr_output = &output_priv->wlr_output;
+
     struct wl_event_loop *event_loop = wl_display_get_event_loop(backend->display);
-    
-    wl_list_init(&wlr_output->modes);
-    
-    struct wlr_output_mode *mode = calloc(1, sizeof(*mode));
-    if (!mode) {
-        wlr_log(WLR_ERROR, "Failed to allocate output mode");
-        free(output);
+    if (!event_loop) {
+        wlr_log(WLR_ERROR, "RDP Backend: Failed to get event loop for RDP output %s", name);
+        free(output_priv);
         return NULL;
     }
 
-    mode->width = width;
-    mode->height = height;
-    mode->refresh = refresh_hz * 1000;
-    wlr_log(WLR_DEBUG, "Adding mode: %dx%d@%d", width, height, refresh_hz);
-    wl_list_insert(&wlr_output->modes, &mode->link);
+    struct wlr_output_state initial_state;
+    wlr_output_state_init(&initial_state);
+    wlr_output_state_set_enabled(&initial_state, true);
 
-    if (!backend->renderer) {
-        wlr_log(WLR_ERROR, "Renderer not initialized for RDP backend");
-        free(mode);
-        free(output);
+    struct wlr_output_mode *current_mode_obj = calloc(1, sizeof(struct wlr_output_mode));
+    if (!current_mode_obj) {
+        wlr_log(WLR_ERROR, "RDP Backend: Failed to allocate wlr_output_mode");
+        wlr_output_state_finish(&initial_state);
+        free(output_priv);
         return NULL;
     }
+    current_mode_obj->width = width;
+    current_mode_obj->height = height;
+    current_mode_obj->refresh = refresh_mhz;
+    current_mode_obj->preferred = true;
 
+    wlr_output_state_set_mode(&initial_state, current_mode_obj);
 
+    wlr_output_init(wlr_output, &backend->backend, &rdp_output_impl, event_loop, &initial_state);
+    wlr_output_state_finish(&initial_state);
 
-    if (!backend->allocator) {
-        wlr_log(WLR_DEBUG, "Creating RDP allocator");
-        backend->allocator = wlr_rdp_allocator_create(backend->renderer); // Fixed: Pass renderer
-        if (!backend->allocator) {
-            wlr_log(WLR_ERROR, "Failed to create RDP allocator");
-            free(mode);
-            free(output);
-            return NULL;
+    bool mode_was_copied_by_init = false;
+    bool mode_is_correctly_current = false;
+
+    if (wlr_output->current_mode) {
+        if (wlr_output->current_mode->width == current_mode_obj->width &&
+            wlr_output->current_mode->height == current_mode_obj->height &&
+            wlr_output->current_mode->refresh == current_mode_obj->refresh) {
+            mode_is_correctly_current = true;
+            if (wlr_output->current_mode != current_mode_obj) {
+                // current_mode has the right data, but it's not our original pointer.
+                // This implies wlr_output_init (or a helper) made a copy and linked that.
+                mode_was_copied_by_init = true;
+            }
         }
     }
 
-    struct wlr_output_state state;
-    wlr_output_state_init(&state);
-    wlr_output_state_set_enabled(&state, true);
-    wlr_output_state_set_mode(&state, mode);
+    if (mode_was_copied_by_init) {
+        wlr_log(WLR_DEBUG, "RDP Backend: wlr_output_init used a copy of the mode. Freeing original mode object for %s.", name);
+        free(current_mode_obj);
+        current_mode_obj = NULL; // Mark as freed
+    } else if (current_mode_obj != NULL && !mode_is_correctly_current) {
+        // current_mode_obj is still around, but it's not (or not correctly) the current mode.
+        // This implies wlr_output_init didn't fully set it up from the initial_state.
+        wlr_log(WLR_INFO, "RDP Backend: Mode for %s not correctly set as current by init. Attempting to add to list and commit.", name);
+        
+        bool already_in_list = false;
+        struct wlr_output_mode *iter_mode_check;
+        wl_list_for_each(iter_mode_check, &wlr_output->modes, link) {
+            if (iter_mode_check == current_mode_obj) {
+                already_in_list = true;
+                break;
+            }
+        }
+        if (!already_in_list) {
+            wl_list_insert(&wlr_output->modes,&current_mode_obj->link); // Corrected variable name
+        }
 
-    wlr_output_init(wlr_output, &backend->backend, &rdp_output_impl, event_loop, &state);
-    
-    if (!wlr_output_commit_state(wlr_output, &state)) {
-        wlr_log(WLR_ERROR, "Failed to commit initial output state for %s", name);
-        wlr_output_state_finish(&state);
-        wlr_output_destroy(wlr_output);
-        free(mode);
-        free(output);
-        return NULL;
+        struct wlr_output_state temp_state;
+        wlr_output_state_init(&temp_state);
+        wlr_output_state_set_enabled(&temp_state, true);
+        wlr_output_state_set_mode(&temp_state, current_mode_obj);
+        if (!wlr_output_test_state(wlr_output, &temp_state) || !wlr_output_commit_state(wlr_output, &temp_state)) {
+             wlr_log(WLR_INFO, "RDP Backend: Failed to make manually added/verified mode current for %s.", name);
+        } else {
+             wlr_log(WLR_INFO, "RDP Backend: Successfully made manually added/verified mode current for %s.", name);
+        }
+        wlr_output_state_finish(&temp_state);
+    } else if (current_mode_obj != NULL && mode_is_correctly_current && wlr_output->current_mode == current_mode_obj) {
+         wlr_log(WLR_DEBUG, "RDP Backend: Original mode object for %s was directly linked as current_mode.", name);
     }
-    wlr_output_state_finish(&state);
+
 
     wlr_output_set_name(wlr_output, name);
 
-    if (wlr_output->swapchain) {
-      //  wlr_log(WLR_INFO, "Swapchain created for %s: format=0x%x, buffer count=%d",
-        //        name, wlr_output->swapchain->format, wlr_output->swapchain->num_slots);
-    } else {
-        wlr_log(WLR_INFO, "Swapchain not yet created for %s", name);
+    if (!backend->allocator) {
+        wlr_log(WLR_DEBUG, "RDP Backend: Creating its specific RDP allocator.");
+        backend->allocator = wlr_rdp_allocator_create(backend->renderer);
+        if (!backend->allocator) {
+            wlr_log(WLR_ERROR, "Failed to create RDP allocator for %s", name);
+            wlr_output_destroy(wlr_output); // Frees modes in wlr_output->modes list.
+                                            // If current_mode_obj was our original and linked, it's freed by destroy.
+            if (current_mode_obj) { // If it's non-NULL, it means it wasn't the "copied by init" case.
+                                    // And if it wasn't successfully linked, it needs freeing.
+                                    // This specific scenario (allocated, not copied, not linked, then error) is tricky.
+                                    // For now, rely on wlr_output_destroy to clean linked modes.
+                                    // If current_mode_obj is non-NULL, it means it was not freed as a copy.
+                                    // If it also didn't get linked to wlr_output->modes before destroy, it would leak.
+                                    // This simplified logic assumes if current_mode_obj is not NULL, and an error occurs,
+                                    // and wlr_output_destroy is called, any linked version of it is handled.
+                                    // If it was never linked, this is where it would need explicit free.
+                                    // However, the path where it's not linked and not copied and init fails is complex.
+                                    // Let's assume if current_mode_obj is non-NULL here, it's because it wasn't a copy.
+                                    // If it also didn't get into wlr_output->modes, we must free it.
+               // bool was_linked = false;
+               // struct wlr_output_mode *m;
+                // Check against the LIVE list BEFORE destroy, if possible. But here we are after destroy.
+                // This is difficult. The safest is: if current_mode_obj wasn't freed (because it wasn't a copy)
+                // AND it wasn't the current_mode that wlr_output_destroy would take care of,
+                // then it needs explicit free.
+                // For simplicity now: if current_mode_obj is not NULL, it means it wasn't considered a copy by init.
+                // wlr_output_destroy *should* handle it if it was linked.
+                // The risk is if it was allocated, not copied, and never linked.
+            }
+            free(output_priv);
+            return NULL;
+        }
+        wlr_log(WLR_INFO, "RDP Backend: Created custom RDP allocator: %p", (void*)backend->allocator);
     }
 
-    wl_list_insert(&backend->outputs, &output->link);
-    
-    wlr_log(WLR_INFO, "RDP output created successfully");
-    return output;
+    wlr_log(WLR_INFO, "RDP Backend: Output '%s' created. Final active dimensions: %dx%d. Current mode: %p (%dx%d@%dmHz)",
+            wlr_output->name, wlr_output->width, wlr_output->height,
+            (void*)wlr_output->current_mode,
+            wlr_output->current_mode ? wlr_output->current_mode->width : -1,
+            wlr_output->current_mode ? wlr_output->current_mode->height : -1,
+            wlr_output->current_mode ? wlr_output->current_mode->refresh : -1
+            );
+
+    wl_list_insert(&backend->outputs, &output_priv->link);
+    wl_signal_emit_mutable(&backend->backend.events.new_output, wlr_output);
+
+    return output_priv;
 }
 
 

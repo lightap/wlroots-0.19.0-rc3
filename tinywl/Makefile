@@ -1,18 +1,14 @@
 PKG_CONFIG?=pkg-config
 WAYLAND_PROTOCOLS!=$(PKG_CONFIG) --variable=pkgdatadir wayland-protocols
 WAYLAND_SCANNER!=$(PKG_CONFIG) --variable=wayland_scanner wayland-scanner
-
 # Define PKG_CONFIG_PATH to include custom paths and system paths
 PKG_CONFIG_PATH?=/usr/local/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:$$PKG_CONFIG_PATH
-
 # Check if required pkg-config packages are available
 CHECK_PKG_CONFIG=$(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) $(PKG_CONFIG) --exists $(1) && echo yes || echo no)
-
 # Ensure all required packages are found
 REQUIRED_PKGS=wlroots wayland-server xkbcommon pixman-1 libdrm glesv2 libpng freerdp2 winpr2
 $(foreach pkg,$(REQUIRED_PKGS),$(if $(call CHECK_PKG_CONFIG,$(pkg)),,\
 	$(error Package $(pkg) not found in PKG_CONFIG_PATH=$(PKG_CONFIG_PATH))))
-
 # Define LIBS with all required libraries, manually adding -lEGL
 LIBS=\
 	$(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) $(PKG_CONFIG) --libs wlroots) \
@@ -25,12 +21,9 @@ LIBS=\
 	$(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) $(PKG_CONFIG) --libs freerdp2) \
 	$(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) $(PKG_CONFIG) --libs winpr2) \
 	-lEGL
-
 # Define CFLAGS with all required includes
 CFLAGS_PKG_CONFIG=$(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) $(PKG_CONFIG) --cflags wlroots wayland-server xkbcommon pixman-1 libdrm glesv2 libpng freerdp2 winpr2)
-CFLAGS+=$(CFLAGS_PKG_CONFIG) -I. -Iinclude -DWLR_USE_UNSTABLE -I/home/light/testwlroots/wlroots0.19\ tinywl\ RDP\ 10am\ 10th\ may/rc3/wlroots/include -g -Werror
-
-# Define LDFLAGS to include library paths
+CFLAGS+=$(CFLAGS_PKG_CONFIG) -I. -Iinclude -DWLR_USE_UNSTABLE -g -Werror
 LDFLAGS+=$(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) $(PKG_CONFIG) --libs-only-L wlroots wayland-server xkbcommon pixman-1 libdrm glesv2 libpng freerdp2 winpr2)
 
 all: tinywl
@@ -46,6 +39,7 @@ tinywl.o: tinywl.c xdg-shell-protocol.h
 backend_RDP_backend.o: ../backend/RDP/backend.c
 	$(CC) -c $< $(CFLAGS) -o $@
 
+# Just compile tinywl and the backend without the renderer
 tinywl: tinywl.o backend_RDP_backend.o
 	$(CC) $^ $(CFLAGS) $(LDFLAGS) $(LIBS) -o $@
 

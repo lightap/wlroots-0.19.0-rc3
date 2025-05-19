@@ -1,9 +1,8 @@
-
 #include <assert.h>
 #include <drm_fourcc.h>
 #include <stdlib.h>
 #include <wlr/interfaces/wlr_output.h>
-#include <wlr/render/allocator.h>
+//#include <wlr/render/allocator.h>
 #include <wlr/render/interface.h>
 #include <wlr/render/swapchain.h>
 #include <wlr/util/log.h>
@@ -55,7 +54,7 @@ bool wlr_output_init_render(struct wlr_output *output,
 
 	return true;
 }
-
+/*
 static struct wlr_buffer *output_acquire_empty_buffer(struct wlr_output *output,
 		const struct wlr_output_state *state) {
 	assert(!(state->committed & WLR_OUTPUT_STATE_BUFFER));
@@ -92,12 +91,68 @@ static struct wlr_buffer *output_acquire_empty_buffer(struct wlr_output *output,
 	}
 
 	return buffer;
+}*/
+
+
+
+static struct wlr_buffer *output_acquire_empty_buffer(struct wlr_output *output,
+        const struct wlr_output_state *state) {
+    wlr_log(WLR_DEBUG, "Acquiring empty buffer for output: %s", output->name);
+
+    if (!output->allocator) {
+        wlr_log(WLR_ERROR, "No allocator for output %s", output->name);
+        return NULL;
+    }
+
+    wlr_log(WLR_DEBUG, "Allocator: %p", output->allocator);
+
+    if (output->width <= 0 || output->height <= 0) {
+        wlr_log(WLR_ERROR, "Invalid output dimensions: %dx%d",
+                output->width, output->height);
+        return NULL;
+    }
+
+    if (!output->swapchain) {
+        wlr_log(WLR_DEBUG, "Creating swapchain for %s: %dx%d, format=0x%x",
+                output->name, output->width, output->height, output->render_format);
+        struct wlr_drm_format format = {
+            .format = DRM_FORMAT_XRGB8888,
+            .len = 0,
+            .modifiers = NULL,
+        };
+        output->swapchain = wlr_swapchain_create(output->allocator,
+            output->width, output->height, &format);
+        if (!output->swapchain) {
+            wlr_log(WLR_ERROR, "Failed to create swapchain with XRGB8888 for %s, trying ARGB8888",
+                    output->name);
+            format.format = DRM_FORMAT_ARGB8888;
+            output->swapchain = wlr_swapchain_create(output->allocator,
+                output->width, output->height, &format);
+            if (!output->swapchain) {
+                wlr_log(WLR_ERROR, "Failed to create swapchain for %s: allocator=%p, format=0x%x",
+                        output->name, output->allocator, format.format);
+                return NULL;
+            }
+        }
+        wlr_log(WLR_DEBUG, "Swapchain created for %s: %dx%d",
+                output->name, output->swapchain->width, output->swapchain->height);
+    }
+
+    struct wlr_buffer *buffer = wlr_swapchain_acquire(output->swapchain);
+    if (!buffer) {
+        wlr_log(WLR_ERROR, "Failed to acquire buffer from swapchain for %s", output->name);
+        return NULL;
+    }
+
+    wlr_log(WLR_DEBUG, "Acquired empty buffer for %s", output->name);
+    return buffer;
 }
 
 // This function may attach a new, empty buffer if necessary.
 // If so, the new_back_buffer out parameter will be set to true.
 bool output_ensure_buffer(struct wlr_output *output,
 		struct wlr_output_state *state, bool *new_buffer) {
+
 	assert(*new_buffer == false);
 
 	// If we already have a buffer, we don't need to allocate a new one
@@ -110,6 +165,7 @@ bool output_ensure_buffer(struct wlr_output *output,
 	if (output->renderer == NULL) {
 		return true;
 	}
+
 
 	bool enabled = output->enabled;
 	if (state->committed & WLR_OUTPUT_STATE_ENABLED) {

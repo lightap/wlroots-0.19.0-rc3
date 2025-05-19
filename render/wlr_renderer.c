@@ -33,7 +33,7 @@
 #include <drm_fourcc.h>
 #include <stdio.h>
 
-#include "tinywl/tinywl.h"
+
 
 void wlr_renderer_init(struct wlr_renderer *renderer,
 		const struct wlr_renderer_impl *impl, uint32_t render_buffer_caps) {

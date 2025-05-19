@@ -205,7 +205,7 @@ struct wlr_buffer *wlr_allocator_create_buffer(struct wlr_allocator *alloc,
 #include <stdlib.h>
 #include <unistd.h>
 #include <wlr/interfaces/wlr_buffer.h>
-#include <wlr/render/allocator.h>
+//#include <wlr/render/allocator.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/util/log.h>
 #include <drm_fourcc.h>
@@ -437,19 +437,33 @@ static struct wlr_buffer *rdp_allocator_create_buffer(
     int width, int height,
     const struct wlr_drm_format *format) {
     struct rdp_allocator *alloc = wl_container_of(wlr_alloc, alloc, base);
-    wlr_log(WLR_INFO, "RDP allocator: requesting buffer %dx%d, format: 0x%x",
-            width, height, format ? format->format : 0);
-
-    if (!format || format->format != DRM_FORMAT_XRGB8888) {
-        wlr_log(WLR_ERROR, "Unsupported format 0x%x, only XRGB8888 supported", 
-                format ? format->format : 0);
+    
+    // Check if format is NULL and handle it properly
+    if (!format) {
+        wlr_log(WLR_ERROR, "Format is NULL, cannot allocate RDP buffer");
         return NULL;
     }
-
+    
+    wlr_log(WLR_INFO, "RDP allocator: requesting buffer %dx%d, format: 0x%x",
+            width, height, format->format);
+            
+    // If format is 0, default to XRGB8888 since that's what we support
+    uint32_t desired_format = format->format;
+    if (desired_format == 0) {
+        wlr_log(WLR_ERROR, "Format value is 0, defaulting to DRM_FORMAT_XRGB8888");
+        desired_format = DRM_FORMAT_XRGB8888;
+    } else if (desired_format != DRM_FORMAT_XRGB8888) {
+        wlr_log(WLR_ERROR, "Unsupported format 0x%x, only XRGB8888 supported", desired_format);
+        return NULL;
+    }
+    
     struct rdp_buffer_pool *pool = rdp_get_pool(alloc, width, height);
     if (!pool) {
+        wlr_log(WLR_ERROR, "Failed to get RDP buffer pool");
         return NULL;
     }
+    
+    // Rest of your existing code...
 
     // Check for reusable buffers
     struct rdp_buffer *buffer;
@@ -612,10 +626,23 @@ void wlr_allocator_init(struct wlr_allocator *alloc,
 
 struct wlr_buffer *wlr_allocator_create_buffer(struct wlr_allocator *alloc,
         int width, int height, const struct wlr_drm_format *format) {
+    
+    // Create a default format if NULL is passed
+    struct wlr_drm_format default_format;
+    if (format == NULL) {
+        wlr_log(WLR_DEBUG, "Format is NULL, using default XRGB8888 format");
+        default_format.format = DRM_FORMAT_XRGB8888;
+        default_format.len = 0;
+        default_format.modifiers = NULL;
+        format = &default_format;
+    }
+    
+    // Now call the implementation with our guaranteed non-NULL format
     struct wlr_buffer *buffer = alloc->impl->create_buffer(alloc, width, height, format);
     if (buffer == NULL) {
         return NULL;
     }
+    
     if (alloc->buffer_caps & WLR_BUFFER_CAP_DATA_PTR) {
         assert(buffer->impl->begin_data_ptr_access && buffer->impl->end_data_ptr_access);
     }
@@ -625,6 +652,7 @@ struct wlr_buffer *wlr_allocator_create_buffer(struct wlr_allocator *alloc,
     if (alloc->buffer_caps & WLR_BUFFER_CAP_SHM) {
         assert(buffer->impl->get_shm);
     }
+    
     return buffer;
 }
 

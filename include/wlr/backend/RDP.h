@@ -12,9 +12,6 @@
 #include <freerdp/listener.h>
 #include <time.h>
 #include <wlr/render/egl.h>
-#include <wlr/backend.h>
-#include <wlr/render/egl.h>
-
 
 /* Forward declarations */
 struct wlr_RDP_output;
@@ -26,34 +23,39 @@ struct wlr_RDP_backend;
  * references to all RDP outputs and peers.
  */
 struct wlr_RDP_backend {
-    struct wlr_backend backend;          // The base wlroots backend
-    struct wl_display *display;          // Pointer to the main Wayland display
-    struct wl_event_loop *event_loop;    // Wayland event loop
-    bool started;                        // Whether the backend has started
-    struct wl_list outputs;              // List of wlr_RDP_output.link
-    struct wl_list peers;                // List of RDP peers
-    struct wlr_renderer *renderer;       // Renderer for this backend
-    struct wlr_allocator *allocator;     // Allocator for output initialization
-    freerdp_listener *listener;          // FreeRDP listener for RDP connections
-    struct wl_event_source *fd_event_sources[32]; // Event sources for listener FDs
-    int fd_count;                        // Number of active event sources
+    struct wlr_backend backend;
+    struct wl_display *display;
+    struct wl_event_loop *event_loop;
+    bool started;
+    struct wl_list outputs;
+    struct wl_list peers;
+    struct wlr_renderer *renderer;
+    struct wlr_allocator *allocator;
+    freerdp_listener *listener;
+    struct wl_event_source *fd_event_sources[32];
+    int fd_count;
+      struct wlr_egl *egl; 
+    struct wlr_egl *egl_instance;       
 };
 
 /**
  * Our per-output structure: one RDP "virtual monitor."
  */
 struct wlr_RDP_output {
-    struct wlr_output wlr_output;       // The wlroots output
-    struct wlr_RDP_backend *backend;    // Backreference to our backend
-    struct wl_list link;                // Link in backend->outputs
+    struct wlr_output wlr_output;
+    struct wlr_RDP_backend *backend;
+    struct wl_list link;
+
+    struct wlr_buffer *pending_buffer;  // Currently acquired buffer
+    struct wl_listener buffer_release;  // Listener for buffer release events
+    struct wl_event_source *frame_timer; // Timer for frame scheduling
+
 };
 
 /**
  * Entry point: create an RDP backend
  */
-//struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display, struct wlr_egl *egl);
 struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display);
-
 
 /**
  * Create an RDP output
@@ -78,6 +80,9 @@ struct wlr_RDP_backend *RDP_backend_from_backend(struct wlr_backend *backend);
 void set_global_rdp_peer(freerdp_peer *peer);
 freerdp_peer* get_global_rdp_peer(void);
 
+
+
+//freerdp_peer *global_rdp_peer ;
 /**
  * Surface transmission
  */

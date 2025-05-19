@@ -74,16 +74,18 @@ static bool swapchain_is_compatible(struct wlr_swapchain *swapchain,
 	assert(format->len > 0);
 	return memcmp(swapchain->format.modifiers, format->modifiers, format->len * sizeof(format->modifiers[0])) == 0;
 }
-
+#include <stdio.h>
 static struct wlr_swapchain *manager_output_get_swapchain(
 		struct wlr_output_swapchain_manager_output *manager_output,
 		int width, int height, const struct wlr_drm_format *format) {
 	struct wlr_output *output = manager_output->output;
 
 	if (swapchain_is_compatible(output->swapchain, width, height, format)) {
+		printf("swapchain_is_compatible(output->swapchain, width, height, format");
 		return output->swapchain;
 	}
 	if (swapchain_is_compatible(manager_output->new_swapchain, width, height, format)) {
+		printf("swapchain_is_compatible(manager_output->new_swapchain, width, height, format)");
 		return manager_output->new_swapchain;
 	}
 
@@ -145,6 +147,7 @@ static bool manager_output_prepare(struct wlr_output_swapchain_manager_output *m
 	}
 
 	struct wlr_buffer *buffer = wlr_swapchain_acquire(swapchain);
+	printf("wlr_swapchain_acquire");
 	if (buffer == NULL) {
 		return false;
 	}

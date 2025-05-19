@@ -1,4 +1,4 @@
-
+#include <wlr/types/wlr_xdg_shell.h>
 #include <assert.h>
 #include <getopt.h>
 #include <stdbool.h>
@@ -9,6 +9,7 @@
 #include <wayland-server-core.h>
 #include <wlr/backend.h>
 #include <wlr/backend/RDP.h>
+#include <wlr/types/wlr_xdg_shell.h>
 
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_cursor.h>
@@ -36,10 +37,140 @@
 #include <wlr/render/gles2.h>
 #include <wlr/render/egl.h>
 
-#include <render/allocator/RDP_allocator.h>
 #include <wlr/backend/RDP.h>
+#include <wlr/render/gles2.h>     // For wlr_gles2_renderer_create_surfaceless, wlr_gles2_renderer_create_with_egl
+#include <wlr/render/wlr_renderer.h> // For wlr_renderer_begin, wlr_renderer_end etc.
+#include <wlr/render/egl.h>    
+#include <GLES3/gl31.h> // For OpenGL ES 3.1 constants
+#include <wlr/render/gles2.h>
 
+#include <wlr/types/wlr_xdg_shell.h>
+#include <wlr/util/box.h> // For wlr_matrix_project_box, also includes matrix.h
+#include <wlr/util/log.h> // For WLR_LOG_WARNING
 
+#ifndef RENDER_EGL_H
+#define RENDER_EGL_H
+
+#include <wlr/render/egl.h>
+
+struct wlr_egl {
+    EGLDisplay display;
+    EGLContext context;
+    EGLDeviceEXT device; // may be EGL_NO_DEVICE_EXT
+    struct gbm_device *gbm_device;
+
+    struct {
+        // Display extensions
+        bool KHR_image_base;
+        bool EXT_image_dma_buf_import;
+        bool EXT_image_dma_buf_import_modifiers;
+        bool IMG_context_priority;
+        bool EXT_create_context_robustness;
+
+        // Device extensions
+        bool EXT_device_drm;
+        bool EXT_device_drm_render_node;
+
+        // Client extensions
+        bool EXT_device_query;
+        bool KHR_platform_gbm;
+        bool EXT_platform_device;
+        bool KHR_display_reference;
+    } exts;
+
+    struct {
+        PFNEGLGETPLATFORMDISPLAYEXTPROC eglGetPlatformDisplayEXT;
+        PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR;
+        PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR;
+        PFNEGLQUERYDMABUFFORMATSEXTPROC eglQueryDmaBufFormatsEXT;
+        PFNEGLQUERYDMABUFMODIFIERSEXTPROC eglQueryDmaBufModifiersEXT;
+        PFNEGLDEBUGMESSAGECONTROLKHRPROC eglDebugMessageControlKHR;
+        PFNEGLQUERYDISPLAYATTRIBEXTPROC eglQueryDisplayAttribEXT;
+        PFNEGLQUERYDEVICESTRINGEXTPROC eglQueryDeviceStringEXT;
+        PFNEGLQUERYDEVICESEXTPROC eglQueryDevicesEXT;
+        PFNEGLCREATESYNCKHRPROC eglCreateSyncKHR;
+        PFNEGLDESTROYSYNCKHRPROC eglDestroySyncKHR;
+        PFNEGLDUPNATIVEFENCEFDANDROIDPROC eglDupNativeFenceFDANDROID;
+        PFNEGLWAITSYNCKHRPROC eglWaitSyncKHR;
+    } procs;
+
+    bool has_modifiers;
+    struct wlr_drm_format_set dmabuf_texture_formats;
+    struct wlr_drm_format_set dmabuf_render_formats;
+};
+
+struct wlr_egl_context {
+    EGLDisplay display;
+    EGLContext context;
+    EGLSurface draw_surface;
+    EGLSurface read_surface;
+};
+
+/**
+ * Initializes an EGL context for the given DRM FD.
+ *
+ * Will attempt to load all possibly required API functions.
+ */
+struct wlr_egl *wlr_egl_create_with_drm_fd(int drm_fd);
+
+/**
+ * Frees all related EGL resources, makes the context not-current and
+ * unbinds a bound wayland display.
+ */
+void wlr_egl_destroy(struct wlr_egl *egl);
+
+/**
+ * Creates an EGL image from the given dmabuf attributes. Check usability
+ * of the dmabuf with wlr_egl_check_import_dmabuf once first.
+ */
+EGLImageKHR wlr_egl_create_image_from_dmabuf(struct wlr_egl *egl,
+    struct wlr_dmabuf_attributes *attributes, bool *external_only);
+
+/**
+ * Get DMA-BUF formats suitable for sampling usage.
+ */
+const struct wlr_drm_format_set *wlr_egl_get_dmabuf_texture_formats(
+    struct wlr_egl *egl);
+/**
+ * Get DMA-BUF formats suitable for rendering usage.
+ */
+const struct wlr_drm_format_set *wlr_egl_get_dmabuf_render_formats(
+    struct wlr_egl *egl);
+
+/**
+ * Destroys an EGL image created with the given wlr_egl.
+ */
+bool wlr_egl_destroy_image(struct wlr_egl *egl, EGLImageKHR image);
+
+int wlr_egl_dup_drm_fd(struct wlr_egl *egl);
+
+/**
+ * Restore EGL context that was previously saved using wlr_egl_save_current().
+ */
+bool wlr_egl_restore_context(struct wlr_egl_context *context);
+
+/**
+ * Make the EGL context current.
+ *
+ * The old EGL context is saved. Callers are expected to clear the current
+ * context when they are done by calling wlr_egl_restore_context().
+ */
+bool wlr_egl_make_current(struct wlr_egl *egl, struct wlr_egl_context *save_context);
+
+bool wlr_egl_unset_current(struct wlr_egl *egl);
+
+EGLSyncKHR wlr_egl_create_sync(struct wlr_egl *egl, int fence_fd);
+
+void wlr_egl_destroy_sync(struct wlr_egl *egl, EGLSyncKHR sync);
+
+int wlr_egl_dup_fence_fd(struct wlr_egl *egl, EGLSyncKHR sync);
+
+bool wlr_egl_wait_sync(struct wlr_egl *egl, EGLSyncKHR sync);
+
+#endif
+
+// Add at the top of your tinywl.c file
+struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void);
 
 /* RDP backend access */
 struct wlr_rdp_backend {
@@ -146,7 +277,20 @@ void rdp_transmit_surface(struct wlr_buffer *buffer) {
     wlr_log(WLR_DEBUG, "Transmitted bitmap update: %dx%d, stride=%zu, format=0x%x",
             buffer->width, buffer->height, stride, format);
 }*/
+#include <wlr/types/wlr_compositor.h>
+#include <wlr/types/wlr_output.h>
+#include <wlr/types/wlr_xdg_shell.h> // THIS IS KEY for wlr_xdg_surface_get_geometry
+// Add other wlr/types/ as needed: scene, output_layout, cursor, seat, etc.
+#include <wlr/types/wlr_scene.h>
 
+
+#include <wlr/backend.h>
+#include <wlr/render/wlr_renderer.h> // THIS IS KEY for struct wlr_render_texture_options
+#include <wlr/render/allocator.h>
+#include <wlr/render/egl.h>
+#include <wlr/render/gles2.h>
+
+#include <drm_fourcc.h>
 
 /* Structures */
 enum tinywl_cursor_mode {
@@ -196,6 +340,11 @@ struct tinywl_server {
     EGLConfig egl_config;
     EGLContext egl_context;
    EGLSurface egl_surface;
+ // For XDG clients
+ // list of tinywl_output.link
+    struct wl_list views;   // <<< THIS IS CRUCIAL: list of tinywl_view.link
+
+  
 };
 
 /* Updated tinywl_output struct to store timer */
@@ -241,7 +390,22 @@ struct tinywl_keyboard {
     struct wl_listener destroy;
 };
 
+struct tinywl_view {
+    struct tinywl_server *server;
+    struct wlr_xdg_surface *xdg_surface; // Or wlr_layer_surface_v1, etc.
+    struct wl_listener map;
+    struct wl_listener unmap;
+    struct wl_listener destroy;
+    struct wl_listener request_move;
+    struct wl_listener request_resize;
+    // You also need a commit listener on xdg_surface->surface->events.commit
+    // to know when to ask for a frame render.
+    struct wl_listener surface_commit;
 
+    bool mapped;
+    int x, y; // Position on the output
+    struct wl_list link; // For server.views
+};
 
 /* Function declarations */
 //struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display, struct wlr_egl *egl);
@@ -626,130 +790,860 @@ static void server_cursor_frame(struct wl_listener *listener, void *data) {
 
 
 
-/* Updated timer callback without damage 
-static int schedule_frame_timer(void *data) {
-    struct tinywl_output *output = data;
-    struct wlr_output *wlr_output = output->wlr_output;
-    struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(output->server->scene, wlr_output);
+// In tinywl.c (or your main server file)
 
-    wlr_output_schedule_frame(wlr_output);
-    wlr_log(WLR_DEBUG, "Scheduled frame for output %s via timer", wlr_output->name);
+// Ensure you have these includes (or equivalent for your project structure)
+#include <time.h>
+#include <wlr/types/wlr_compositor.h> // For wlr_surface_send_frame_done
+#include <wlr/types/wlr_output_damage.h> // For wlr_output_damage_add_whole (optional but good)
 
-    if (scene_output) {
-        wlr_scene_output_commit(scene_output, NULL);
-        wlr_log(WLR_DEBUG, "Committed scene output for %s to force rendering", wlr_output->name);
+// You'll need to define or include your tinywl_server and tinywl_view structs
+// For example:
+// struct tinywl_server {
+//     // ... other members ...
+//     struct wl_list views; // list of struct tinywl_view
+//     // ...
+// };
+//
+// struct tinywl_view {
+//     struct tinywl_server *server;
+//     struct wlr_xdg_surface *xdg_surface;
+//     struct wl_listener map;
+//     struct wl_listener unmap;
+//     struct wl_listener destroy;
+//     struct wl_listener request_move;
+//     struct wl_listener request_resize;
+//     struct wl_listener commit;
+//     bool mapped;
+//     int x, y;
+//     struct wl_list link;
+// };
+
+// Assume 'server' is a global or accessible pointer to your tinywl_server instance
+// extern struct tinywl_server server; // If global, or pass it in somehow
+
+// In tinywl.c
+
+// Ensure these are included at the top of your tinywl.c:
+// #include <time.h>
+// #include <wlr/types/wlr_compositor.h>
+// #include <wlr/types/wlr_xdg_shell.h>
+// #include <wlr/util/box.h>
+// #include <wlr/util/log.h>
+// #include <wlr/render/wlr_renderer.h> // For wlr_renderer_is_gles2
+// #include <wlr/render/egl.h>         // For wlr_gles2_renderer_get_egl, wlr_egl_make_current etc.
+// In tinywl.c
+
+#include <wlr/types/wlr_xdg_shell.h>
+#include <wlr/util/box.h>
+#include <wlr/util/transform.h>
+#include <wlr/util/log.h>
+#include <wlr/render/wlr_renderer.h>
+
+static void output_frame(struct wl_listener *listener, void *data) {
+    struct tinywl_output *output_wrapper = wl_container_of(listener, output_wrapper, frame);
+  struct tinywl_output *output = wl_container_of(listener, output, frame);
+    struct wlr_output *wlr_output = output_wrapper->wlr_output;
+    struct tinywl_server *server = output_wrapper->server;
+    struct wlr_scene *scene = output->server->scene;
+
+    struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(
+        scene, output->wlr_output);
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    if (!wlr_output || !wlr_output->enabled) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Output '%s' not valid or not enabled.", wlr_output ? wlr_output->name : "null");
+        return;
+    }
+    if (!wlr_output->renderer || !wlr_output->allocator) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Output '%s' has no renderer or allocator.", wlr_output->name);
+        return;
+    }
+    if (!wlr_renderer_is_gles2(wlr_output->renderer)) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Renderer is not GLES2");
+        return;
+    }
+
+    // Clear any existing OpenGL errors
+    GLenum err_clear_loop;
+    int clear_loop_count = 0;
+    while ((err_clear_loop = glGetError()) != GL_NO_ERROR && clear_loop_count < 10) {
+        clear_loop_count++;
+    }
+
+    // Begin rendering
+    struct wlr_egl_context prev_ctx = {0};
+    struct wlr_egl *egl = wlr_gles2_renderer_get_egl(wlr_output->renderer);
+    if (!egl || !wlr_egl_make_current(egl, &prev_ctx)) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to make EGL context current. EGL error: 0x%x", eglGetError());
+        wlr_egl_restore_context(&prev_ctx);
+        return;
+    }
+
+    struct wlr_output_state state;
+    wlr_output_state_init(&state);
+
+    struct wlr_buffer_pass_options pass_options = {0};
+    struct wlr_render_pass *pass = wlr_output_begin_render_pass(wlr_output, &state, &pass_options);
+    if (!pass) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] wlr_output_begin_render_pass failed for '%s'", wlr_output->name);
+        wlr_egl_restore_context(&prev_ctx);
+        wlr_output_state_finish(&state);
+        return;
+    }
+
+    GLenum fbo_status_check = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (fbo_status_check != GL_FRAMEBUFFER_COMPLETE) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] FBO incomplete after begin_render_pass: status=0x%x", fbo_status_check);
+        wlr_render_pass_submit(pass);
+        wlr_egl_restore_context(&prev_ctx);
+        wlr_output_state_finish(&state);
+        return;
+    }
+
+    struct wlr_buffer *rendered_buffer = state.buffer;
+    if (!rendered_buffer) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] No buffer available for rendering in wlr_output_state");
+        wlr_render_pass_submit(pass);
+        wlr_egl_restore_context(&prev_ctx);
+        wlr_output_state_finish(&state);
+        return;
+    }
+
+    // Render background
+    float background_color[] = {0.1f, 0.1f, 0.15f, 1.0f};
+    struct wlr_render_rect_options background_opts = {
+        .box = {0, 0, wlr_output->width, wlr_output->height},
+        .color = {background_color[0], background_color[1], background_color[2], background_color[3]},
+        .blend_mode = WLR_RENDER_BLEND_MODE_NONE,
+    };
+    wlr_render_pass_add_rect(pass, &background_opts);
+    wlr_log(WLR_INFO, "[RENDER_FRAME] Rendered background for output %s (%dx%d)", 
+            wlr_output->name, wlr_output->width, wlr_output->height);
+
+    // Render all toplevel views
+    struct tinywl_toplevel *toplevel_view;
+    int window_count = 0;
+    bool content_rendered = false;
+    wl_list_for_each(toplevel_view, &server->toplevels, link) {
+        if (!toplevel_view->xdg_toplevel || !toplevel_view->xdg_toplevel->base ||
+            !toplevel_view->xdg_toplevel->base->surface->mapped) {
+            continue;
+        }
+
+        struct wlr_xdg_surface *xdg_surface = toplevel_view->xdg_toplevel->base;
+        struct wlr_surface *surface = xdg_surface->surface;
+
+        if (!wlr_surface_has_buffer(surface)) {
+            continue;
+        }
+
+        struct wlr_texture *texture = wlr_surface_get_texture(surface);
+        if (!texture) {
+            wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to get texture for surface");
+            continue;
+        }
+
+        window_count++;
+        content_rendered = true;
+
+        double view_x = toplevel_view->scene_tree->node.x;
+        double view_y = toplevel_view->scene_tree->node.y;
+        int width = surface->current.width;
+        int height = surface->current.height;
+
+        struct wlr_fbox src_box = { .x = 0, .y = 0, .width = width, .height = height };
+        struct wlr_box dst_box = { .x = (int)view_x, .y = (int)view_y, .width = width, .height = height };
+
+        wlr_log(WLR_INFO, "[RENDER_FRAME] Window %d: pos=(%d,%d) size=(%dx%d)", 
+                window_count, dst_box.x, dst_box.y, dst_box.width, dst_box.height);
+
+        struct wlr_render_texture_options tex_opts = {
+            .texture = texture,
+            .src_box = src_box,
+            .dst_box = dst_box,
+            .blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
+        };
+        wlr_render_pass_add_texture(pass, &tex_opts);
+    }
+
+    wlr_log(WLR_INFO, "[RENDER_FRAME] Rendered %d windows", window_count);
+
+    if (!wlr_render_pass_submit(pass)) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] wlr_render_pass_submit failed for '%s'", wlr_output->name);
+        wlr_egl_restore_context(&prev_ctx);
+        wlr_output_state_finish(&state);
+        return;
+    }
+
+    // Only transmit if content was rendered
+    if (content_rendered) {
+        void *bdata;
+        uint32_t bfmt;
+        size_t bstride;
+        if (wlr_buffer_begin_data_ptr_access(rendered_buffer, WLR_BUFFER_DATA_PTR_ACCESS_READ, &bdata, &bfmt, &bstride)) {
+            if (bdata && rendered_buffer->width > 5 && rendered_buffer->height > 5) {
+                unsigned char *pixels_final = (unsigned char *)bdata;
+                size_t offset = 5 * bstride + 5 * 4;
+                if (bfmt != DRM_FORMAT_XRGB8888 && bfmt != DRM_FORMAT_ARGB8888 && bfmt != 0x34325258) {
+                    wlr_log(WLR_INFO, "[RENDER_FRAME] Readback format 0x%X might not be 4bpp as assumed for offset calculation.", bfmt);
+                }
+                if (offset + 3 < bstride * rendered_buffer->height) {
+                    unsigned char r_val = pixels_final[offset + 0];
+                    unsigned char g_val = pixels_final[offset + 1];
+                    unsigned char b_val = pixels_final[offset + 2];
+                    unsigned char a_val = pixels_final[offset + 3];
+                    printf("[RENDER_FRAME] RDP Buffer Readback Pixel (5,5) RGBA-order: %02X %02X %02X %02X (Format: 0x%X, Stride: %zu)\n",
+                           r_val, g_val, b_val, a_val, bfmt, bstride);
+                    if (r_val == (unsigned char)(background_color[0]*255.0f) &&
+                        g_val == (unsigned char)(background_color[1]*255.0f) &&
+                        b_val == (unsigned char)(background_color[2]*255.0f) ) {
+                        printf("[RENDER_FRAME] Pixel (5,5) IS BACKGROUND COLOR!\n");
+                    } else {
+                        printf("[RENDER_FRAME] Pixel (5,5) IS NOT PLAIN BACKGROUND (might be client window or other content).\n");
+                    }
+                } else {
+                    wlr_log(WLR_ERROR, "[RENDER_FRAME] Pixel readback offset out of bounds.");
+                }
+            }
+            wlr_buffer_end_data_ptr_access(rendered_buffer);
+        } else {
+            wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed RDP buffer pixel readback: wlr_buffer_begin_data_ptr_access failed.");
+        }
+
+        rdp_transmit_surface(rendered_buffer);
     } else {
-        wlr_log(WLR_DEBUG, "No scene output found for %s during timer", wlr_output->name);
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Skipping RDP transmission: no windows rendered");
     }
 
    
-    if (output->timer) {
-        wl_event_source_timer_update(output->timer, 100); 
-    }
+       
+                
+        
+    
 
-    return 1; 
-}*/
-
-/* Unchanged output_frame with debug logging */
-#include <GLES2/gl2.h> // Add this at the top of tinywl.c if not already present
-// In tinywl.c, around the output_frame function
-
-// Frame handler for output
- // For wlr_rdp_backend
-
-static void output_frame(struct wl_listener *listener, void *data) {
-    struct tinywl_output *output = wl_container_of(listener, output, frame);
-    struct tinywl_server *server = output->server;
-    struct wlr_output *wlr_output = output->wlr_output;
-    struct wlr_scene *scene = server->scene;
-    struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(scene, wlr_output);
-    struct wlr_renderer *renderer = server->renderer;
-    struct wlr_allocator *allocator = server->allocator;
-
-    // Skip if no scene output
-    if (!scene_output) {
-        wlr_log(WLR_ERROR, "No scene output for %s", wlr_output->name);
-        return;
-    }
-
-    // Skip if no active RDP peer
-    struct wlr_rdp_backend *rdp_backend = (struct wlr_rdp_backend *)wlr_output->backend;
-    if (!rdp_backend ) {
-        wlr_log(WLR_DEBUG, "No active RDP peer for %s, scheduling next frame", wlr_output->name);
-        wlr_output_schedule_frame(wlr_output);
-        return;
-    }
-
-    // Lock rendering to prevent direct scan-out
-    wlr_output_lock_attach_render(wlr_output, true);
-    wlr_log(WLR_DEBUG, "Render lock state for %s: locks=%d", wlr_output->name, wlr_output->attach_render_locks);
-
-    // Allocate a buffer
-    struct wlr_buffer *buffer = wlr_allocator_create_buffer(allocator, wlr_output->width, wlr_output->height, NULL);
-    if (!buffer) {
-        wlr_log(WLR_ERROR, "Failed to allocate buffer for %s", wlr_output->name);
-        wlr_output_lock_attach_render(wlr_output, false);
-        return;
-    }
-    wlr_log(WLR_DEBUG, "Allocated buffer %p for %s", (void*)buffer, wlr_output->name);
-
-    // Begin buffer render pass
-    struct wlr_buffer_pass_options render_options = {0};
-    struct wlr_render_pass *render_pass = wlr_renderer_begin_buffer_pass(renderer, buffer, &render_options);
-    if (!render_pass) {
-        wlr_log(WLR_ERROR, "Failed to begin buffer render pass for %s", wlr_output->name);
-        wlr_buffer_drop(buffer);
-        wlr_output_lock_attach_render(wlr_output, false);
-        return;
-    }
-    wlr_log(WLR_DEBUG, "Began buffer render pass for %s", wlr_output->name);
-
-    // Clear the screen
-    struct wlr_render_rect_options clear_options = {
-        .box = {0, 0, wlr_output->width, wlr_output->height},
-        .color = {1.0f, 0.0f, 0.0f, 1.0f}, // Red background (as specified)
-        .blend_mode = WLR_RENDER_BLEND_MODE_NONE,
-    };
-    wlr_render_pass_add_rect(render_pass, &clear_options);
-
-    // Render the scene
-    if (!wlr_scene_output_commit(scene_output, NULL)) {
-        wlr_log(WLR_ERROR, "wlr_scene_output_commit failed for %s", wlr_output->name);
-        wlr_render_pass_submit(render_pass);
-        wlr_buffer_drop(buffer);
-        wlr_output_lock_attach_render(wlr_output, false);
-        return;
-    }
-    wlr_log(WLR_DEBUG, "Successfully committed scene output for %s", wlr_output->name);
-
-    // Submit render pass
-    wlr_render_pass_submit(render_pass);
-
-    // Attach buffer to output
-    struct wlr_output_state state;
-    wlr_output_state_init(&state);
-    wlr_output_state_set_enabled(&state, true);
-    wlr_output_state_set_buffer(&state, buffer);
-    if (!wlr_output_commit_state(wlr_output, &state)) {
-        wlr_log(WLR_ERROR, "Failed to commit output state for %s", wlr_output->name);
-        wlr_buffer_drop(buffer);
-        wlr_output_state_finish(&state);
-        wlr_output_lock_attach_render(wlr_output, false);
-        return;
-    }
-
-    // Clean up
-    wlr_buffer_drop(buffer);
+    wlr_egl_restore_context(&prev_ctx);
     wlr_output_state_finish(&state);
-    wlr_output_lock_attach_render(wlr_output, false);
 
-    // Send frame done event
+    wlr_scene_output_send_frame_done(scene_output, &now);
+}
+/*
+static void output_frame(struct wl_listener *listener, void *data) {
+    struct tinywl_output *output_wrapper = wl_container_of(listener, output_wrapper, frame);
+    struct wlr_output *wlr_output = output_wrapper->wlr_output;
+    struct tinywl_server *server = output_wrapper->server;
+
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
-    wlr_scene_output_send_frame_done(scene_output, &now);
 
-    wlr_log(WLR_DEBUG, "Frame committed successfully for %s", wlr_output->name);
-}
+    if (!wlr_output || !wlr_output->enabled) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Output '%s' not valid or not enabled.", wlr_output ? wlr_output->name : "null");
+        return;
+    }
+    if (!wlr_output->renderer || !wlr_output->allocator) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Output '%s' has no renderer or allocator.", wlr_output->name);
+        return;
+    }
+    if (!wlr_renderer_is_gles2(wlr_output->renderer)) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Renderer is not GLES2");
+        return;
+    }
+
+    // Clear any existing OpenGL errors
+    GLenum err_clear_loop;
+    int clear_loop_count = 0;
+    while ((err_clear_loop = glGetError()) != GL_NO_ERROR && clear_loop_count < 10) {
+        clear_loop_count++;
+    }
+
+    // Begin rendering
+    struct wlr_egl_context prev_ctx = {0};
+    struct wlr_egl *egl = wlr_gles2_renderer_get_egl(wlr_output->renderer);
+    if (!egl || !wlr_egl_make_current(egl, &prev_ctx)) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to make EGL context current. EGL error: 0x%x", eglGetError());
+        wlr_egl_restore_context(&prev_ctx);
+        return;
+    }
+
+    struct wlr_output_state state;
+    wlr_output_state_init(&state);
+
+    struct wlr_buffer_pass_options pass_options = {0};
+    struct wlr_render_pass *pass = wlr_output_begin_render_pass(wlr_output, &state, &pass_options);
+    if (!pass) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] wlr_output_begin_render_pass failed for '%s'", wlr_output->name);
+        wlr_egl_restore_context(&prev_ctx);
+        wlr_output_state_finish(&state);
+        return;
+    }
+
+    GLenum fbo_status_check = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (fbo_status_check != GL_FRAMEBUFFER_COMPLETE) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] FBO incomplete after begin_render_pass: status=0x%x", fbo_status_check);
+        wlr_render_pass_submit(pass);
+        wlr_egl_restore_context(&prev_ctx);
+        wlr_output_state_finish(&state);
+        return;
+    }
+
+    struct wlr_buffer *rendered_buffer = state.buffer;
+    if (!rendered_buffer) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] No buffer available for rendering in wlr_output_state");
+        wlr_render_pass_submit(pass);
+        wlr_egl_restore_context(&prev_ctx);
+        wlr_output_state_finish(&state);
+        return;
+    }
+
+    // Render background
+    float background_color[] = {0.1f, 0.1f, 0.15f, 1.0f};
+    struct wlr_render_rect_options background_opts = {
+        .box = {0, 0, wlr_output->width, wlr_output->height},
+        .color = {background_color[0], background_color[1], background_color[2], background_color[3]},
+        .blend_mode = WLR_RENDER_BLEND_MODE_NONE,
+    };
+    wlr_render_pass_add_rect(pass, &background_opts);
+    wlr_log(WLR_INFO, "[RENDER_FRAME] Rendered background for output %s (%dx%d)", 
+            wlr_output->name, wlr_output->width, wlr_output->height);
+
+    // Render all toplevel views
+    struct tinywl_toplevel *toplevel_view;
+    int window_count = 0;
+    bool content_rendered = false;
+    wl_list_for_each(toplevel_view, &server->toplevels, link) {
+        if (!toplevel_view->xdg_toplevel || !toplevel_view->xdg_toplevel->base ||
+            !toplevel_view->xdg_toplevel->base->surface->mapped) {
+            continue;
+        }
+
+        struct wlr_xdg_surface *xdg_surface = toplevel_view->xdg_toplevel->base;
+        struct wlr_surface *surface = xdg_surface->surface;
+
+        if (!wlr_surface_has_buffer(surface)) {
+            continue;
+        }
+
+        struct wlr_texture *texture = wlr_surface_get_texture(surface);
+        if (!texture) {
+            wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to get texture for surface");
+            continue;
+        }
+
+        window_count++;
+        content_rendered = true;
+
+        double view_x = toplevel_view->scene_tree->node.x;
+        double view_y = toplevel_view->scene_tree->node.y;
+        int width = surface->current.width;
+        int height = surface->current.height;
+
+        struct wlr_fbox src_box = { .x = 0, .y = 0, .width = width, .height = height };
+        struct wlr_box dst_box = { .x = (int)view_x, .y = (int)view_y, .width = width, .height = height };
+
+        wlr_log(WLR_INFO, "[RENDER_FRAME] Window %d: pos=(%d,%d) size=(%dx%d)", 
+                window_count, dst_box.x, dst_box.y, dst_box.width, dst_box.height);
+
+        struct wlr_render_texture_options tex_opts = {
+            .texture = texture,
+            .src_box = src_box,
+            .dst_box = dst_box,
+            .blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
+        };
+        wlr_render_pass_add_texture(pass, &tex_opts);
+    }
+
+    wlr_log(WLR_INFO, "[RENDER_FRAME] Rendered %d windows", window_count);
+
+    if (!wlr_render_pass_submit(pass)) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] wlr_render_pass_submit failed for '%s'", wlr_output->name);
+        wlr_egl_restore_context(&prev_ctx);
+        wlr_output_state_finish(&state);
+        return;
+    }
+
+    // Only transmit if content was rendered
+    if (content_rendered) {
+        void *bdata;
+        uint32_t bfmt;
+        size_t bstride;
+        if (wlr_buffer_begin_data_ptr_access(rendered_buffer, WLR_BUFFER_DATA_PTR_ACCESS_READ, &bdata, &bfmt, &bstride)) {
+            if (bdata && rendered_buffer->width > 5 && rendered_buffer->height > 5) {
+                unsigned char *pixels_final = (unsigned char *)bdata;
+                size_t offset = 5 * bstride + 5 * 4;
+                if (bfmt != DRM_FORMAT_XRGB8888 && bfmt != DRM_FORMAT_ARGB8888 && bfmt != 0x34325258) {
+                    wlr_log(WLR_INFO, "[RENDER_FRAME] Readback format 0x%X might not be 4bpp as assumed for offset calculation.", bfmt);
+                }
+                if (offset + 3 < bstride * rendered_buffer->height) {
+                    unsigned char r_val = pixels_final[offset + 0];
+                    unsigned char g_val = pixels_final[offset + 1];
+                    unsigned char b_val = pixels_final[offset + 2];
+                    unsigned char a_val = pixels_final[offset + 3];
+                    printf("[RENDER_FRAME] RDP Buffer Readback Pixel (5,5) RGBA-order: %02X %02X %02X %02X (Format: 0x%X, Stride: %zu)\n",
+                           r_val, g_val, b_val, a_val, bfmt, bstride);
+                    if (r_val == (unsigned char)(background_color[0]*255.0f) &&
+                        g_val == (unsigned char)(background_color[1]*255.0f) &&
+                        b_val == (unsigned char)(background_color[2]*255.0f) ) {
+                        printf("[RENDER_FRAME] Pixel (5,5) IS BACKGROUND COLOR!\n");
+                    } else {
+                        printf("[RENDER_FRAME] Pixel (5,5) IS NOT PLAIN BACKGROUND (might be client window or other content).\n");
+                    }
+                } else {
+                    wlr_log(WLR_ERROR, "[RENDER_FRAME] Pixel readback offset out of bounds.");
+                }
+            }
+            wlr_buffer_end_data_ptr_access(rendered_buffer);
+        } else {
+            wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed RDP buffer pixel readback: wlr_buffer_begin_data_ptr_access failed.");
+        }
+
+        rdp_transmit_surface(rendered_buffer);
+    } else {
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Skipping RDP transmission: no windows rendered");
+    }
+
+    if (!wlr_output_commit_state(wlr_output, &state)) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] wlr_output_commit_state failed for '%s'", wlr_output->name);
+    } else {
+        wl_list_for_each(toplevel_view, &server->toplevels, link) {
+            if (!toplevel_view->xdg_toplevel || !toplevel_view->xdg_toplevel->base ||
+                !toplevel_view->xdg_toplevel->base->surface->mapped) {
+                continue;
+            }
+            struct wlr_surface *surface = toplevel_view->xdg_toplevel->base->surface;
+            if (wlr_surface_has_buffer(surface)) {
+                wlr_surface_send_frame_done(surface, &now);
+            }
+        }
+    }
+
+    wlr_egl_restore_context(&prev_ctx);
+    wlr_output_state_finish(&state);
+}*/
+/*
+static void output_frame(struct wl_listener *listener, void *data) {
+    struct tinywl_output *output_wrapper = wl_container_of(listener, output_wrapper, frame);
+    struct wlr_output *wlr_output = output_wrapper->wlr_output;
+    struct tinywl_server *server = output_wrapper->server;
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    if (!wlr_output || !wlr_output->enabled) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Output '%s' not valid or not enabled.", wlr_output ? wlr_output->name : "null");
+        return;
+    }
+    if (!wlr_output->renderer || !wlr_output->allocator) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Output '%s' has no renderer or allocator.", wlr_output->name);
+        return;
+    }
+    if (!wlr_renderer_is_gles2(wlr_output->renderer)) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Renderer is not GLES2");
+        return;
+    }
+
+    // Clear any existing OpenGL errors
+    GLenum err_clear_loop;
+    int clear_loop_count = 0;
+    while ((err_clear_loop = glGetError()) != GL_NO_ERROR && clear_loop_count < 10) {
+        clear_loop_count++;
+    }
+
+    // Begin rendering
+    struct wlr_egl_context prev_ctx = {0};
+    struct wlr_egl *egl = wlr_gles2_renderer_get_egl(wlr_output->renderer);
+    if (!egl || !wlr_egl_make_current(egl, &prev_ctx)) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to make EGL context current. EGL error: 0x%x", eglGetError());
+        wlr_egl_restore_context(&prev_ctx);
+        return;
+    }
+
+    // Initialize output state
+    struct wlr_output_state state;
+    wlr_output_state_init(&state);
+
+    // Begin the render pass
+    struct wlr_buffer_pass_options pass_options = {0};
+    struct wlr_render_pass *pass = wlr_output_begin_render_pass(wlr_output, &state, &pass_options);
+    if (!pass) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] wlr_output_begin_render_pass failed for '%s'", wlr_output->name);
+        GLenum err = glGetError();
+        if (err != GL_NO_ERROR) {
+            wlr_log(WLR_ERROR, "[RENDER_FRAME] OpenGL error: 0x%x", err);
+        }
+        wlr_egl_restore_context(&prev_ctx);
+        wlr_output_state_finish(&state);
+        return;
+    }
+
+    // Check framebuffer status
+    GLenum fbo_status_check = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (fbo_status_check != GL_FRAMEBUFFER_COMPLETE) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] FBO incomplete after begin_render_pass: status=0x%x", fbo_status_check);
+        wlr_render_pass_submit(pass);
+        wlr_egl_restore_context(&prev_ctx);
+        wlr_output_state_finish(&state);
+        return;
+    }
+
+    // Get the buffer we're rendering to
+    struct wlr_buffer *rendered_buffer = state.buffer;
+    if (!rendered_buffer) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] No buffer available for rendering in wlr_output_state");
+        wlr_render_pass_submit(pass);
+        wlr_egl_restore_context(&prev_ctx);
+        wlr_output_state_finish(&state);
+        return;
+    }
+
+    // --- BEGIN RENDERING LOGIC ---
+    
+    // Render background
+    float background_color[] = {0.1f, 0.1f, 0.15f, 1.0f};
+    struct wlr_render_rect_options background_opts = {
+        .box = {0, 0, wlr_output->width, wlr_output->height},
+        .color = {background_color[0], background_color[1], background_color[2], background_color[3]},
+        .blend_mode = WLR_RENDER_BLEND_MODE_NONE,
+    };
+    wlr_render_pass_add_rect(pass, &background_opts);
+    
+    // Debug
+    wlr_log(WLR_INFO, "[RENDER_FRAME] Rendered background for output %s (%dx%d)", 
+            wlr_output->name, wlr_output->width, wlr_output->height);
+    
+    // Render all toplevel views
+    struct tinywl_toplevel *toplevel_view;
+    int window_count = 0;
+    wl_list_for_each(toplevel_view, &server->toplevels, link) {
+        // Skip if no toplevel or not mapped
+        if (!toplevel_view->xdg_toplevel || !toplevel_view->xdg_toplevel->base ||
+            !toplevel_view->xdg_toplevel->base->surface->mapped) {
+            continue;
+        }
+
+        struct wlr_xdg_surface *xdg_surface = toplevel_view->xdg_toplevel->base;
+        struct wlr_surface *surface = xdg_surface->surface;
+
+        // Skip if no buffer
+        if (!wlr_surface_has_buffer(surface)) {
+            continue;
+        }
+
+
+
+        // Get the texture
+        struct wlr_texture *texture = wlr_surface_get_texture(surface);
+        if (!texture) {
+            wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to get texture for surface");
+            continue;
+        }
+
+        window_count++;
+
+        // Get the view's position
+        double view_x = toplevel_view->scene_tree->node.x;
+        double view_y = toplevel_view->scene_tree->node.y;
+        
+        // Get the surface dimensions
+        int width = surface->current.width;
+        int height = surface->current.height;
+        
+        // Set up source box (entire texture)
+        struct wlr_fbox src_box = {
+            .x = 0, .y = 0,
+            .width = width, .height = height
+        };
+        
+        // Set up destination box (where to render on screen)
+        struct wlr_box dst_box = {
+            .x = (int)view_x,
+            .y = (int)view_y,
+            .width = width,
+            .height = height
+        };
+        
+        // Log window position and size
+        wlr_log(WLR_INFO, "[RENDER_FRAME] Window %d: pos=(%d,%d) size=(%dx%d)", 
+                window_count, dst_box.x, dst_box.y, dst_box.width, dst_box.height);
+        
+        // Create texture rendering options
+        struct wlr_render_texture_options tex_opts = {
+            .texture = texture,
+            .src_box = src_box,
+            .dst_box = dst_box,
+            .blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
+        };
+        
+        // Add the texture to the render pass
+        wlr_render_pass_add_texture(pass, &tex_opts);
+    }
+    
+    wlr_log(WLR_INFO, "[RENDER_FRAME] Rendered %d windows", window_count);
+    
+    // --- END RENDERING LOGIC ---
+
+    // Submit the render pass
+    if (!wlr_render_pass_submit(pass)) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] wlr_render_pass_submit failed for '%s'", wlr_output->name);
+        wlr_egl_restore_context(&prev_ctx);
+        wlr_output_state_finish(&state);
+        return;
+    }
+
+    // CPU Readback Test (from the RDP buffer)
+    void *bdata;
+    uint32_t bfmt;
+    size_t bstride;
+    if (wlr_buffer_begin_data_ptr_access(rendered_buffer, WLR_BUFFER_DATA_PTR_ACCESS_READ, &bdata, &bfmt, &bstride)) {
+        if (bdata && rendered_buffer->width > 5 && rendered_buffer->height > 5) {
+            unsigned char *pixels_final = (unsigned char *)bdata;
+            size_t offset = 5 * bstride + 5 * 4;
+            if (bfmt != DRM_FORMAT_XRGB8888 && bfmt != DRM_FORMAT_ARGB8888 && bfmt != 0x34325258) {
+                wlr_log(WLR_INFO, "[RENDER_FRAME] Readback format 0x%X might not be 4bpp as assumed for offset calculation.", bfmt);
+            }
+            if (offset + 3 < bstride * rendered_buffer->height) {
+                unsigned char r_val = pixels_final[offset + 0];
+                unsigned char g_val = pixels_final[offset + 1];
+                unsigned char b_val = pixels_final[offset + 2];
+                unsigned char a_val = pixels_final[offset + 3];
+                printf("[RENDER_FRAME] RDP Buffer Readback Pixel (5,5) RGBA-order: %02X %02X %02X %02X (Format: 0x%X, Stride: %zu)\n",
+                       r_val, g_val, b_val, a_val, bfmt, bstride);
+                if (r_val == (unsigned char)(background_color[0]*255.0f) &&
+                    g_val == (unsigned char)(background_color[1]*255.0f) &&
+                    b_val == (unsigned char)(background_color[2]*255.0f) ) {
+                    printf("[RENDER_FRAME] Pixel (5,5) IS BACKGROUND COLOR!\n");
+                } else {
+                    printf("[RENDER_FRAME] Pixel (5,5) IS NOT PLAIN BACKGROUND (might be client window or other content).\n");
+                }
+            } else {
+                wlr_log(WLR_ERROR, "[RENDER_FRAME] Pixel readback offset out of bounds.");
+            }
+        }
+        wlr_buffer_end_data_ptr_access(rendered_buffer);
+    } else {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed RDP buffer pixel readback: wlr_buffer_begin_data_ptr_access failed.");
+    }
+
+    // Transmit the rendered buffer
+    rdp_transmit_surface(rendered_buffer);
+
+    // Commit the output state
+    if (!wlr_output_commit_state(wlr_output, &state)) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] wlr_output_commit_state failed for '%s'", wlr_output->name);
+    } else {
+        // Send frame done events to client surfaces
+        wl_list_for_each(toplevel_view, &server->toplevels, link) {
+            if (!toplevel_view->xdg_toplevel || !toplevel_view->xdg_toplevel->base ||
+                !toplevel_view->xdg_toplevel->base->surface->mapped) {
+                continue;
+            }
+            struct wlr_surface *surface = toplevel_view->xdg_toplevel->base->surface;
+            if (wlr_surface_has_buffer(surface)) {
+                wlr_surface_send_frame_done(surface, &now);
+            }
+        }
+    }
+
+    // Restore the EGL context and clean up
+    wlr_egl_restore_context(&prev_ctx);
+    wlr_output_state_finish(&state);
+}*/
+
+/*
+
+static void output_frame(struct wl_listener *listener, void *data) {
+    struct tinywl_output *output_wrapper = wl_container_of(listener, output_wrapper, frame);
+    struct wlr_output *wlr_output = output_wrapper->wlr_output;
+
+    printf("[DIRECT_CLEAR_TEST] Frame for '%s'\n", wlr_output->name);
+    fflush(stdout);
+
+    if (!wlr_output || !wlr_output->enabled) {
+        wlr_log(WLR_ERROR, "[DIRECT_CLEAR_TEST] Output '%s' not valid or not enabled.", wlr_output ? wlr_output->name : "null");
+        return;
+    }
+    if (!wlr_output->renderer || !wlr_output->allocator) {
+        wlr_log(WLR_ERROR, "[DIRECT_CLEAR_TEST] Output '%s' has no renderer or allocator.", wlr_output->name);
+        return;
+    }
+
+    if (!wlr_renderer_is_gles2(wlr_output->renderer)) {
+        wlr_log(WLR_ERROR, "[DIRECT_CLEAR_TEST] Renderer is not GLES2");
+        return;
+    }
+
+    GLenum err_clear_loop;
+    int clear_loop_count = 0;
+    while ((err_clear_loop = glGetError()) != GL_NO_ERROR && clear_loop_count < 10) {
+        wlr_log(WLR_DEBUG, "[DIRECT_CLEAR_TEST] Cleared GL error: 0x%x", err_clear_loop);
+        clear_loop_count++;
+    }
+
+    struct wlr_egl_context prev_ctx = {0};
+    struct wlr_egl *egl = wlr_gles2_renderer_get_egl(wlr_output->renderer);
+    if (!egl || !wlr_egl_make_current(egl, &prev_ctx)) {
+        wlr_log(WLR_ERROR, "[DIRECT_CLEAR_TEST] Failed to make EGL context current");
+        wlr_egl_restore_context(&prev_ctx);
+        return;
+    }
+
+    struct wlr_output_state state;
+    wlr_output_state_init(&state);
+
+    struct wlr_buffer_pass_options pass_options = {0};
+    printf("[DIRECT_CLEAR_TEST] Calling wlr_output_begin_render_pass for '%s'\n", wlr_output->name);
+    fflush(stdout);
+    struct wlr_render_pass *pass = wlr_output_begin_render_pass(wlr_output, &state, &pass_options);
+
+    GLenum err;
+    if (!pass) {
+        wlr_log(WLR_ERROR, "[DIRECT_CLEAR_TEST] wlr_output_begin_render_pass failed for '%s'", wlr_output->name);
+        err = glGetError();
+        if (err != GL_NO_ERROR) {
+            printf("[DIRECT_CLEAR_TEST] GL Error after FAILED wlr_output_begin_render_pass: 0x%x\n", err);
+            fflush(stdout);
+        }
+        wlr_egl_restore_context(&prev_ctx);
+        wlr_output_state_finish(&state);
+        return;
+    }
+    printf("[DIRECT_CLEAR_TEST] wlr_output_begin_render_pass succeeded for '%s'\n", wlr_output->name);
+    fflush(stdout);
+
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        wlr_log(WLR_ERROR, "[DIRECT_CLEAR_TEST] FBO incomplete after begin_render_pass: status=0x%x", status);
+        wlr_render_pass_submit(pass);
+        wlr_egl_restore_context(&prev_ctx);
+        wlr_output_state_finish(&state);
+        return;
+    }
+    wlr_log(WLR_DEBUG, "[DIRECT_CLEAR_TEST] FBO complete: status=0x%x", status);
+
+    struct wlr_buffer *rendered_buffer = state.buffer;
+    if (!rendered_buffer) {
+        wlr_log(WLR_ERROR, "[DIRECT_CLEAR_TEST] No buffer available for rendering");
+        wlr_render_pass_submit(pass);
+        wlr_egl_restore_context(&prev_ctx);
+        wlr_output_state_finish(&state);
+        return;
+    }
+
+    bool rendered_surface = false;
+    struct wlr_xdg_surface *xdg_surface = NULL;
+    struct wlr_surface *surface = xdg_surface ? xdg_surface->surface : NULL;
+    if (surface && wlr_surface_has_buffer(surface)) {
+        struct wlr_texture *texture = wlr_surface_get_texture(surface);
+        if (texture) {
+            struct wlr_render_texture_options tex_opts = {
+                .texture = texture,
+                .dst_box = {0, 0, surface->current.width, surface->current.height},
+                .blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
+            };
+            wlr_render_pass_add_texture(pass, &tex_opts);
+            wlr_log(WLR_DEBUG, "[DIRECT_CLEAR_TEST] Rendered XDG surface 0x%p", surface);
+            rendered_surface = true;
+        }
+    }
+
+    if (!rendered_surface) {
+        wlr_log(WLR_DEBUG, "[DIRECT_CLEAR_TEST] Using GLES2 renderer for clear");
+        struct wlr_render_rect_options clear_opts = {
+            .box = {0, 0, wlr_output->width, wlr_output->height},
+            .color = {0.0f, 1.0f, 0.0f, 1.0f},
+            .blend_mode = WLR_RENDER_BLEND_MODE_NONE,
+        };
+        wlr_render_pass_add_rect(pass, &clear_opts);
+        printf("[DIRECT_CLEAR_TEST] Cleared buffer to green for '%s' (%dx%d)\n",
+               wlr_output->name, wlr_output->width, wlr_output->height);
+    }
+
+    status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    wlr_log(WLR_DEBUG, "[DIRECT_CLEAR_TEST] FBO status before submit: 0x%x", status);
+
+    uint8_t pixel[4];
+    glReadPixels(5, 5, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+    err = glGetError();
+    wlr_log(WLR_DEBUG, "[DIRECT_CLEAR_TEST] glReadPixels before submit, error: 0x%x", err);
+    wlr_log(WLR_DEBUG, "[DIRECT_CLEAR_TEST] glReadPixels Pixel (5,5) RGBA: %02x %02x %02x %02x",
+            pixel[0], pixel[1], pixel[2], pixel[3]);
+
+    printf("[DIRECT_CLEAR_TEST] Calling wlr_render_pass_submit for '%s'\n", wlr_output->name);
+    fflush(stdout);
+    if (!wlr_render_pass_submit(pass)) {
+        wlr_log(WLR_ERROR, "[DIRECT_CLEAR_TEST] wlr_render_pass_submit failed for '%s'", wlr_output->name);
+        wlr_egl_restore_context(&prev_ctx);
+        wlr_output_state_finish(&state);
+        return;
+    }
+    glFinish(); 
+
+    glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT);
+    printf("[DIRECT_CLEAR_TEST] Render pass submitted for '%s'\n", wlr_output->name);
+    fflush(stdout);
+
+    status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    wlr_log(WLR_DEBUG, "[DIRECT_CLEAR_TEST] FBO status after submit: 0x%x", status);
+
+    glFlush();
+    glFinish();
+
+    status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    wlr_log(WLR_DEBUG, "[DIRECT_CLEAR_TEST] FBO status after sync: 0x%x", status);
+
+    void *bdata;
+    uint32_t bfmt;
+    size_t bstride;
+    printf("[DIRECT_CLEAR_TEST] Attempting pixel readback for '%s'\n", wlr_output->name);
+    fflush(stdout);
+    if (wlr_buffer_begin_data_ptr_access(rendered_buffer, WLR_BUFFER_DATA_PTR_ACCESS_READ, &bdata, &bfmt, &bstride)) {
+        if (bdata && rendered_buffer->width > 5 && rendered_buffer->height > 5) {
+            unsigned char *pixels = (unsigned char *)bdata;
+            size_t offset = 5 * bstride + 5 * 4;
+            if (offset + 3 < bstride * rendered_buffer->height) {
+                unsigned char r_val = pixels[offset + 0];
+                unsigned char g_val = pixels[offset + 1];
+                unsigned char b_val = pixels[offset + 2];
+                unsigned char a_val = pixels[offset + 3];
+                printf("[DIRECT_CLEAR_TEST] Readback Pixel (5,5) RGBA: %02X %02X %02X %02X (Format: 0x%X, Stride: %zu)\n",
+                       r_val, g_val, b_val, a_val, bfmt, bstride);
+                if (g_val == 0xFF && r_val == 0x00 && b_val == 0x00) {
+                    printf("[DIRECT_CLEAR_TEST] Pixel (5,5) IS GREEN!\n");
+                } else {
+                    printf("[DIRECT_CLEAR_TEST] Pixel (5,5) IS NOT GREEN as expected.\n");
+                }
+                wlr_log(WLR_DEBUG, "[DIRECT_CLEAR_TEST] Buffer sample (0,0): %02x %02x %02x %02x",
+                        pixels[0], pixels[1], pixels[2], pixels[3]);
+            } else {
+                wlr_log(WLR_ERROR, "[DIRECT_CLEAR_TEST] Pixel readback offset out of bounds.");
+            }
+        } else {
+            wlr_log(WLR_INFO, "[DIRECT_CLEAR_TEST] Buffer too small or bdata NULL for pixel check.");
+        }
+        wlr_buffer_end_data_ptr_access(rendered_buffer);
+    } else {
+        wlr_log(WLR_ERROR, "[DIRECT_CLEAR_TEST] Failed pixel readback: begin_data_ptr_access failed.");
+    }
+
+    printf("[DIRECT_CLEAR_TEST] Transmitting buffer %p via RDP for '%s'\n", (void *)rendered_buffer, wlr_output->name);
+    fflush(stdout);
+    rdp_transmit_surface(rendered_buffer);
+    wlr_buffer_unlock(rendered_buffer);
+
+    printf("[DIRECT_CLEAR_TEST] Committing state to output '%s'\n", wlr_output->name);
+    fflush(stdout);
+    if (!wlr_output_commit_state(wlr_output, &state)) {
+        wlr_log(WLR_ERROR, "[DIRECT_CLEAR_TEST] wlr_output_commit_state failed for '%s'", wlr_output->name);
+    } else {
+        printf("[DIRECT_CLEAR_TEST] wlr_output_commit_state succeeded for '%s'\n", wlr_output->name);
+    }
+    wlr_egl_restore_context(&prev_ctx);
+    wlr_output_state_finish(&state);
+
+    printf("[DIRECT_CLEAR_TEST] Frame complete for '%s'\n", wlr_output->name);
+    fflush(stdout);
+}*/
 
 
 static void output_request_state(struct wl_listener *listener, void *data) {
@@ -770,124 +1664,109 @@ static void output_destroy(struct wl_listener *listener, void *data) {
 
 
 /* Updated server_new_output without damage */
+
 static void server_new_output(struct wl_listener *listener, void *data) {
-    struct tinywl_server *server = wl_container_of(listener, server, new_output);
+    /* This event is raised by the backend when a new output (aka a display or
+     * monitor) becomes available. */
+struct tinywl_server *server =
+        wl_container_of(listener, server, new_output);
     struct wlr_output *wlr_output = data;
-
-    wlr_log(WLR_INFO, "Initializing RDP output with surfaceless EGL/Zink");
-
-
-    if (!server->renderer || !server->allocator) {
-        wlr_log(WLR_ERROR, "No renderer or allocator available");
-        return;
-    }
-
-    struct wlr_allocator *new_allocator = wlr_rdp_allocator_create(server->renderer);
-    if (!new_allocator) {
-        wlr_log(WLR_ERROR, "Failed to create RDP allocator");
-        return;
-    }
-
-    if (!wlr_output_init_render(wlr_output, new_allocator, server->renderer)) {
-        wlr_log(WLR_ERROR, "Failed to initialize output rendering");
-        wlr_allocator_destroy(new_allocator);
-        return;
-    }
-
-    if (server->allocator) {
-        wlr_allocator_destroy(server->allocator);
-    }
-    server->allocator = new_allocator;
-
-    const uint32_t formats[] = {
-        DRM_FORMAT_XRGB8888,
-        DRM_FORMAT_ARGB8888,
-        DRM_FORMAT_XBGR8888,
-        WL_SHM_FORMAT_XRGB8888,
-        WL_SHM_FORMAT_ARGB8888
-    };
-
-    bool output_initialized = false;
-    for (size_t i = 0; i < sizeof(formats)/sizeof(formats[0]); i++) {
-        wlr_log(WLR_DEBUG, "Attempting format: 0x%x", formats[i]);
-        struct wlr_output_state state;
-        wlr_output_state_init(&state);
-        wlr_output_state_set_enabled(&state, true);
-        wlr_output_state_set_custom_mode(&state, 1024, 768, 60000);
-        wlr_output_state_set_render_format(&state, formats[i]);
-        if (wlr_output_test_state(wlr_output, &state)) {
-            if (wlr_output_commit_state(wlr_output, &state)) {
-                wlr_log(WLR_INFO, "Successfully committed output with format 0x%x", formats[i]);
-                output_initialized = true;
-            }
+     struct tinywl_output *output_wrapper_iter;
+    wl_list_for_each(output_wrapper_iter, &server->outputs, link) {
+        if (output_wrapper_iter->wlr_output == wlr_output) {
+            wlr_log(WLR_INFO, "server_new_output: Output %s (ptr %p) already processed, skipping.",
+                    wlr_output->name ? wlr_output->name : "(null)", (void*)wlr_output);
+            return; // Already handled this specific wlr_output instance
         }
-        wlr_output_state_finish(&state);
-        if (output_initialized) break;
     }
-
-    if (!output_initialized) {
-        wlr_log(WLR_ERROR, "Failed to initialize output with any format");
-        return;
-    }
-
     
 
-    
+    /* Configures the output created by the backend to use our allocator
+     * and our renderer. Must be done once, before commiting the output */
+    wlr_output_init_render(wlr_output, server->allocator, server->renderer);
+
+    /* The output may be disabled, switch it on. */
+    struct wlr_output_state state;
+    wlr_output_state_init(&state);
+    wlr_output_state_set_enabled(&state, true);
+
+    /* Some backends don't have modes. DRM+KMS does, and we need to set a mode
+     * before we can use the output. The mode is a tuple of (width, height,
+     * refresh rate), and each monitor supports only a specific set of modes. We
+     * just pick the monitor's preferred mode, a more sophisticated compositor
+     * would let the user configure it. */
+    struct wlr_output_mode *mode = wlr_output_preferred_mode(wlr_output);
+    if (mode != NULL) {
+        wlr_output_state_set_mode(&state, mode);
+    }
+
+    /* Atomically applies the new output state. */
+    wlr_output_commit_state(wlr_output, &state);
+    wlr_output_state_finish(&state);
+
+    /* Allocates and configures our state for this output */
     struct tinywl_output *output = calloc(1, sizeof(*output));
-    if (!output) {
-        wlr_log(WLR_ERROR, "Failed to allocate output structure");
-        return;
-    }
     output->wlr_output = wlr_output;
     output->server = server;
-    output->rendering = false; // Initialize rendering flag
 
+    /* Sets up a listener for the frame event. */
     output->frame.notify = output_frame;
     wl_signal_add(&wlr_output->events.frame, &output->frame);
+
+    /* Sets up a listener for the state request event. */
     output->request_state.notify = output_request_state;
     wl_signal_add(&wlr_output->events.request_state, &output->request_state);
+
+    /* Sets up a listener for the destroy event. */
     output->destroy.notify = output_destroy;
     wl_signal_add(&wlr_output->events.destroy, &output->destroy);
 
     wl_list_insert(&server->outputs, &output->link);
 
-    struct wlr_output_layout_output *l_output = wlr_output_layout_add_auto(server->output_layout, wlr_output);
+    /* Adds this to the output layout. The add_auto function arranges outputs
+     * from left-to-right in the order they appear. A more sophisticated
+     * compositor would let the user configure the arrangement of outputs in the
+     * layout.
+     *
+     * The output layout utility automatically adds a wl_output global to the
+     * display, which Wayland clients can see to find out information about the
+     * output (such as DPI, scale factor, manufacturer, etc).
+     */
+    struct wlr_output_layout_output *l_output = wlr_output_layout_add_auto(server->output_layout,
+        wlr_output);
     struct wlr_scene_output *scene_output = wlr_scene_output_create(server->scene, wlr_output);
-if (!scene_output) {
-    wlr_log(WLR_ERROR, "Failed to create scene output for %s", wlr_output->name);
-    free(output);
-    return;
-}
-output->scene_output = scene_output;
-wlr_log(WLR_INFO, "Created scene output %p for %s", scene_output, wlr_output->name);
     wlr_scene_output_layout_add_output(server->scene_layout, l_output, scene_output);
+    wlr_output_schedule_frame(output->wlr_output);
 
-    /* Attempt initial rendering by committing the scene output */
-    if (scene_output) {
-        wlr_scene_output_commit(scene_output, NULL);
-        wlr_log(WLR_INFO, "Committed scene output for %s to force initial rendering", wlr_output->name);
-    } else {
-        wlr_log(WLR_ERROR, "Failed to create scene output for initial rendering");
-    }
-
-    /* Schedule an initial frame */
-    wlr_output_schedule_frame(wlr_output);
-    wlr_log(WLR_INFO, "Scheduled initial frame for output %s", wlr_output->name);
-
-
-    wlr_log(WLR_INFO, "RDP output initialized successfully");
 }
 
 static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
     struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, map);
+    wlr_log(WLR_INFO, "Mapping XDG toplevel: %p, title='%s', mapped=%d",
+            toplevel->xdg_toplevel,
+            toplevel->xdg_toplevel->title ? toplevel->xdg_toplevel->title : "(null)",
+            toplevel->xdg_toplevel->base->surface->mapped);
+
     wl_list_insert(&toplevel->server->toplevels, &toplevel->link);
     focus_toplevel(toplevel);
 
     struct wlr_surface *surface = toplevel->xdg_toplevel->base->surface;
-    if (surface) {
+    if (surface && surface->mapped) {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         wlr_surface_send_frame_done(surface, &now);
+
+        // Force a frame schedule for all outputs
+        struct tinywl_output *output;
+        wl_list_for_each(output, &toplevel->server->outputs, link) {
+            if (output->wlr_output && output->wlr_output->enabled) {
+                wlr_output_schedule_frame(output->wlr_output);
+                wlr_log(WLR_INFO, "Scheduled frame for output %s on toplevel map",
+                        output->wlr_output->name);
+            }
+        }
+    } else {
+        wlr_log(WLR_ERROR, "Toplevel %p not mapped or no surface", toplevel);
     }
 }
 
@@ -899,30 +1778,33 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
     wl_list_remove(&toplevel->link);
 }
 
+// In tinywl.c
+
+// Ensure you have these includes at the top:
+// #include <wlr/types/wlr_scene.h> // For wlr_scene_get_scene_output
+
 static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
     struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, commit);
+    struct wlr_surface *surface = toplevel->xdg_toplevel->base->surface;
+    wlr_log(WLR_DEBUG, "xdg_toplevel_commit: toplevel=%p, title='%s', has_buffer=%d, mapped=%d",
+            toplevel,
+            toplevel->xdg_toplevel->title ? toplevel->xdg_toplevel->title : "(null)",
+            wlr_surface_has_buffer(surface),
+            surface->mapped);
+
     if (toplevel->xdg_toplevel->base->initial_commit) {
         wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel, 0, 0);
     }
 
-    struct wlr_surface *surface = toplevel->xdg_toplevel->base->surface;
-    wlr_log(WLR_DEBUG, "xdg_toplevel_commit: surface=%p, has_buffer=%d, mapped=%d, buffer=%p",
-            (void*)surface, wlr_surface_has_buffer(surface), surface->mapped,
-            surface->buffer ? (void*)surface->buffer : NULL);
-    if (surface && wlr_surface_has_buffer(surface)) {
-        rdp_transmit_surface(&surface->buffer->base);
-        wlr_log(WLR_DEBUG, "Transmitted surface buffer to RDP peer for surface %p", (void*)surface);
-    } else {
-        wlr_log(WLR_DEBUG, "Surface %p has no buffer to transmit", (void*)surface);
-    }
-
-    /* Schedule a frame to ensure rendering updates */
-    struct tinywl_output *output;
-    wl_list_for_each(output, &toplevel->server->outputs, link) {
-      //  if (wlr_scene_get_scene_output(toplevel->server->scene, output->wlr_output)) {
-            wlr_output_schedule_frame(output->wlr_output);
-            wlr_log(WLR_DEBUG, "Scheduled frame for output %s after surface commit", output->wlr_output->name);
-       // }
+    if (surface && surface->mapped && wlr_surface_has_buffer(surface)) {
+        struct tinywl_output *output;
+        wl_list_for_each(output, &toplevel->server->outputs, link) {
+            if (output->wlr_output && output->wlr_output->enabled) {
+                wlr_output_schedule_frame(output->wlr_output);
+                wlr_log(WLR_DEBUG, "Scheduled frame for output %s on surface commit",
+                        output->wlr_output->name);
+            }
+        }
     }
 }
 
@@ -986,17 +1868,31 @@ static void xdg_toplevel_request_fullscreen(struct wl_listener *listener, void *
         wlr_xdg_surface_schedule_configure(toplevel->xdg_toplevel->base);
     }
 }
-
 static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
     struct tinywl_server *server = wl_container_of(listener, server, new_xdg_toplevel);
     struct wlr_xdg_toplevel *xdg_toplevel = data;
+    wlr_log(WLR_INFO, "New XDG toplevel detected: %p, title='%s', app_id='%s'",
+            xdg_toplevel,
+            xdg_toplevel->title ? xdg_toplevel->title : "(null)",
+            xdg_toplevel->app_id ? xdg_toplevel->app_id : "(null)");
+
     struct tinywl_toplevel *toplevel = calloc(1, sizeof(*toplevel));
+    if (!toplevel) {
+        wlr_log(WLR_ERROR, "Failed to allocate tinywl_toplevel");
+        return;
+    }
     toplevel->server = server;
     toplevel->xdg_toplevel = xdg_toplevel;
-    toplevel->scene_tree = wlr_scene_xdg_surface_create(&toplevel->server->scene->tree, xdg_toplevel->base);
+    toplevel->scene_tree = wlr_scene_xdg_surface_create(&server->scene->tree, xdg_toplevel->base);
+    if (!toplevel->scene_tree) {
+        wlr_log(WLR_ERROR, "Failed to create scene tree for toplevel");
+        free(toplevel);
+        return;
+    }
     toplevel->scene_tree->node.data = toplevel;
     xdg_toplevel->base->data = toplevel->scene_tree;
 
+    // Register listeners
     toplevel->map.notify = xdg_toplevel_map;
     wl_signal_add(&xdg_toplevel->base->surface->events.map, &toplevel->map);
     toplevel->unmap.notify = xdg_toplevel_unmap;
@@ -1013,6 +1909,8 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
     wl_signal_add(&xdg_toplevel->events.request_maximize, &toplevel->request_maximize);
     toplevel->request_fullscreen.notify = xdg_toplevel_request_fullscreen;
     wl_signal_add(&xdg_toplevel->events.request_fullscreen, &toplevel->request_fullscreen);
+
+    wlr_log(WLR_INFO, "Toplevel %p initialized and added to scene tree", toplevel);
 }
 
 static void xdg_popup_commit(struct wl_listener *listener, void *data) {
@@ -1328,8 +2226,8 @@ int main(int argc, char *argv[]) {
     }
 
     struct tinywl_server server = {0};
- struct wlr_egl *wlr_egl = NULL;
-
+ //struct wlr_egl *wlr_egl = NULL;
+/*
     // Setup EGL surfaceless display
     wlr_egl = setup_surfaceless_egl(&server);
     if (!wlr_egl) {
@@ -1337,7 +2235,7 @@ int main(int argc, char *argv[]) {
         cleanup_egl(&server);
         return 1;
     }
-
+*/
 
     server.wl_display = wl_display_create();
     if (!server.wl_display) {
@@ -1375,7 +2273,7 @@ if (!server.backend) {
 
 
  
-    server.renderer = wlr_renderer_autocreate(server.backend);
+    server.renderer = wlr_gles2_renderer_create_surfaceless();
     if (server.renderer == NULL) {
         wlr_log(WLR_ERROR, "failed to create wlr_renderer");
         return 1;
@@ -1417,6 +2315,8 @@ const char *vendor = (const char *)glGetString(GL_VENDOR);
         server_destroy(&server);
         return 1;
     }
+
+
 
     wlr_compositor_create(server.wl_display, 5, server.renderer);
     wlr_subcompositor_create(server.wl_display);

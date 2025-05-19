@@ -248,6 +248,13 @@ struct wlr_backend *attempt_RDP_backend(struct wl_display *display) {
     }
 
     
+    size_t outputs = parse_outputs_env("WLR_RDP_OUTPUTS");
+    if (outputs > 0) {
+        wlr_log(WLR_INFO, "RDP backend will use default output configuration");
+    }
+
+
+    
     return backend;
 }
 

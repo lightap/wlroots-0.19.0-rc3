@@ -756,10 +756,10 @@ void output_apply_commit(struct wlr_output *output, const struct wlr_output_stat
 	wl_signal_emit_mutable(&output->events.commit, &event);
 }
 
-#include <stdio.h> // Add this line
-#include "util/global.h"
+//#include <stdio.h> 
+//#include "util/global.h"
 // Other existing includes...
-
+/*
 bool wlr_output_commit_state(struct wlr_output *output,
 		const struct wlr_output_state *state) {
 	// Debug entry point
@@ -856,6 +856,46 @@ bool wlr_output_commit_state(struct wlr_output *output,
 	// printf("[DEBUG] Exiting wlr_output_commit_state - success\n");
 	fflush(stdout);
 	// wlr_log(WLR_DEBUG, "Successfully committed output state for %s", output->name);
+	return true;
+}*/
+
+
+bool wlr_output_commit_state(struct wlr_output *output,
+		const struct wlr_output_state *state) {
+	uint32_t unchanged = output_compare_state(output, state);
+
+	// Create a shallow copy of the state with only the fields which have been
+	// changed and potentially a new buffer.
+	struct wlr_output_state pending = *state;
+	pending.committed &= ~unchanged;
+
+	if (!output_basic_test(output, &pending)) {
+		wlr_log(WLR_ERROR, "Basic output test failed for %s", output->name);
+		return false;
+	}
+
+	bool new_back_buffer = false;
+	if (!output_ensure_buffer(output, &pending, &new_back_buffer)) {
+		return false;
+	}
+
+	if (!output_prepare_commit(output, &pending)) {
+		return false;
+	}
+
+	if (!output->impl->commit(output, &pending)) {
+		if (new_back_buffer) {
+			wlr_buffer_unlock(pending.buffer);
+		}
+		return false;
+	}
+
+	output_apply_commit(output, &pending);
+
+	if (new_back_buffer) {
+		wlr_buffer_unlock(pending.buffer);
+	}
+
 	return true;
 }
 
@@ -1030,7 +1070,7 @@ const struct wlr_drm_format_set *wlr_output_get_primary_formats(
 
 bool wlr_output_is_direct_scanout_allowed(struct wlr_output *output) {
 	if (output->attach_render_locks > 0) {
-		// wlr_log(WLR_DEBUG, "Direct scan-out disabled by lock");
+		 wlr_log(WLR_DEBUG, "Direct scan-out disabled by lock");
 		return false;
 	}
 
@@ -1039,8 +1079,8 @@ bool wlr_output_is_direct_scanout_allowed(struct wlr_output *output) {
 	wl_list_for_each(cursor, &output->cursors, link) {
 		if (cursor->enabled && cursor->visible &&
 				cursor != output->hardware_cursor) {
-			// wlr_log(WLR_DEBUG,
-		//		"Direct scan-out disabled by software cursor");
+			 wlr_log(WLR_DEBUG,
+				"Direct scan-out disabled by software cursor");
 			return false;
 		}
 	}

@@ -134,9 +134,6 @@ static bool check_list_integrity(struct wl_list *list, const char *name) {
     }
     return true;
 }
-
-
-
 struct wlr_gles2_buffer *gles2_buffer_get_or_create(struct wlr_gles2_renderer *renderer,
         struct wlr_buffer *wlr_buffer) {
     struct wlr_addon *addon =
@@ -233,14 +230,8 @@ struct wlr_gles2_buffer *gles2_buffer_get_or_create(struct wlr_gles2_renderer *r
 
     // Step 6: Check for GL_EXT_texture_format_BGRA8888 extension
     const char *extensions = (const char *)glGetString(GL_EXTENSIONS);
-    bool has_bgra = strstr(extensions, "GL_EXT_texture_format_BGRA8888") != NULL;
-    if (!has_bgra) {
-        wlr_log(WLR_ERROR, "GL_EXT_texture_format_BGRA8888 not supported");
-        wlr_egl_restore_context(&prev_ctx);
-        wlr_buffer_end_data_ptr_access(wlr_buffer);
-        free(buffer);
-        return NULL;
-    }
+    bool has_bgra = extensions && strstr(extensions, "GL_EXT_texture_format_BGRA8888") != NULL;
+    wlr_log(WLR_DEBUG, "GL_EXT_texture_format_BGRA8888 supported: %d", has_bgra);
 
     // Step 7: Generate texture
     glGenTextures(1, &buffer->texture);
@@ -251,10 +242,20 @@ struct wlr_gles2_buffer *gles2_buffer_get_or_create(struct wlr_gles2_renderer *r
         free(buffer);
         return NULL;
     }
-    wlr_log(WLR_DEBUG, "Generated new texture ID: %u for buffer %p", buffer->texture, buffer);
+    wlr_log(WLR_DEBUG, "Generated new texture ID: %u for buffer %p", buffer->texture, wlr_buffer);
 
     // Step 8: Bind and configure texture
     glBindTexture(GL_TEXTURE_2D, buffer->texture);
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+        wlr_log(WLR_ERROR, "glBindTexture failed with error: 0x%x", err);
+        glDeleteTextures(1, &buffer->texture);
+        wlr_egl_restore_context(&prev_ctx);
+        wlr_buffer_end_data_ptr_access(wlr_buffer);
+        free(buffer);
+        return NULL;
+    }
+
     GLboolean is_texture = glIsTexture(buffer->texture);
     wlr_log(WLR_DEBUG, "Texture %u validity check: %d", buffer->texture, is_texture);
     if (!is_texture) {
@@ -282,10 +283,70 @@ struct wlr_gles2_buffer *gles2_buffer_get_or_create(struct wlr_gles2_renderer *r
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    err = glGetError();
+    if (err != GL_NO_ERROR) {
+        wlr_log(WLR_ERROR, "glTexParameteri failed with error: 0x%x", err);
+        glDeleteTextures(1, &buffer->texture);
+        wlr_egl_restore_context(&prev_ctx);
+        wlr_buffer_end_data_ptr_access(wlr_buffer);
+        free(buffer);
+        return NULL;
+    }
 
     // Step 9: Upload texture data
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, wlr_buffer->width, wlr_buffer->height,
-                 0, GL_BGRA_EXT, GL_UNSIGNED_BYTE, data_ptr);
+    glBindTexture(GL_TEXTURE_2D, buffer->texture);
+   // GLenum internal_format = has_bgra ? GL_BGRA_EXT : GL_RGBA;
+  //  GLenum data_format = has_bgra ? GL_BGRA_EXT : GL_RGBA;
+    uint8_t *temp_buffer = NULL;
+
+   if (!has_bgra) {
+    // Convert BGRA (XRGB8888) to RGBA
+    temp_buffer = malloc(wlr_buffer->width * wlr_buffer->height * 4);
+    if (!temp_buffer) {
+        wlr_log(WLR_ERROR, "Failed to allocate temp buffer for RGBA conversion");
+        glDeleteTextures(1, &buffer->texture);
+        wlr_egl_restore_context(&prev_ctx);
+        wlr_buffer_end_data_ptr_access(wlr_buffer);
+        free(buffer);
+        return NULL;
+    }
+    int total_pixels = wlr_buffer->width * wlr_buffer->height;
+    if (total_pixels <= 0) {
+        wlr_log(WLR_ERROR, "Invalid buffer size: %dx%d", wlr_buffer->width, wlr_buffer->height);
+        glDeleteTextures(1, &buffer->texture);
+        wlr_egl_restore_context(&prev_ctx);
+        wlr_buffer_end_data_ptr_access(wlr_buffer);
+        free(temp_buffer);
+        free(buffer);
+        return NULL;
+    }
+    uint8_t *src = (uint8_t *)data_ptr;
+    for (int i = 0; i < total_pixels * 4; i += 4) {
+        temp_buffer[i + 0] = src[i + 2]; // R
+        temp_buffer[i + 1] = src[i + 1]; // G
+        temp_buffer[i + 2] = src[i + 0]; // B
+        temp_buffer[i + 3] = src[i + 3]; // A
+    }
+    data_ptr = temp_buffer;
+}
+
+   wlr_log(WLR_DEBUG, "Calling glTexImage2D: internalFmt=GL_RGBA, w=%d, h=%d, format=GL_BGRA_EXT, type=GL_UNSIGNED_BYTE",
+        wlr_buffer->width, wlr_buffer->height);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, wlr_buffer->width, wlr_buffer->height,
+             0, GL_BGRA_EXT, GL_UNSIGNED_BYTE, data_ptr);
+GLenum tex_upload_err = glGetError();
+if (tex_upload_err != GL_NO_ERROR) {
+    wlr_log(WLR_ERROR, "!!!!!!!! GL Error after glTexImage2D (BGRA_EXT): 0x%x !!!!!!!!", tex_upload_err);
+    // ... existing cleanup and return NULL path ...
+    glDeleteTextures(1, &buffer->texture);
+    wlr_buffer_end_data_ptr_access(wlr_buffer); // Ensure this is called before restore
+    wlr_egl_restore_context(&prev_ctx);
+    free(buffer);
+    return NULL;
+}
+wlr_log(WLR_DEBUG, "glTexImage2D with GL_BGRA_EXT seems successful.");
+
+    if (temp_buffer) free(temp_buffer);
 
     // Step 10: End buffer data access
     wlr_buffer_end_data_ptr_access(wlr_buffer);
@@ -331,7 +392,6 @@ struct wlr_gles2_buffer *gles2_buffer_get_or_create(struct wlr_gles2_renderer *r
 
     // Insert buffer into list
     wl_list_insert(&renderer->buffers, &buffer->link);
-    // Verify insertion
     if (buffer->link.prev == NULL || buffer->link.next == NULL) {
         wlr_log(WLR_ERROR, "Failed to insert buffer into renderer->buffers");
         wlr_addon_finish(&buffer->addon);
@@ -343,11 +403,10 @@ struct wlr_gles2_buffer *gles2_buffer_get_or_create(struct wlr_gles2_renderer *r
         return NULL;
     }
 
-    wlr_log(WLR_DEBUG, "Created GL FBO for buffer %dx%d", wlr_buffer->width, wlr_buffer->height);
-
     // Step 16: Restore EGL context
     wlr_egl_restore_context(&prev_ctx);
 
+    wlr_log(WLR_DEBUG, "Created GL FBO %u for buffer %dx%d", buffer->fbo, wlr_buffer->width, wlr_buffer->height);
     return buffer;
 }
 
@@ -591,7 +650,7 @@ static void gles2_log(GLenum src, GLenum type, GLuint id, GLenum severity,
         GLsizei len, const GLchar *msg, const void *user) {
     _wlr_log(gles2_log_importance_to_wlr(type), "[GLES2] %s", msg);
 }
-
+/*
 static GLuint compile_shader(struct wlr_gles2_renderer *renderer,
         GLenum type, const GLchar *src) {
     push_gles2_debug(renderer);
@@ -610,47 +669,75 @@ static GLuint compile_shader(struct wlr_gles2_renderer *renderer,
 
     pop_gles2_debug(renderer);
     return shader;
-}
+}*/
 
 static GLuint link_program(struct wlr_gles2_renderer *renderer,
-        const GLchar *vert_src, const GLchar *frag_src) {
-    push_gles2_debug(renderer);
+        const char *vert_src, const char *frag_src) {
+    wlr_log(WLR_DEBUG, "Compiling shader program: vert_src=%p, frag_src=%p", vert_src, frag_src);
 
-    GLuint vert = compile_shader(renderer, GL_VERTEX_SHADER, vert_src);
-    if (!vert) {
-        goto error;
-    }
+    // Compile vertex shader
+    GLuint vert = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vert, 1, &vert_src, NULL);
+    glCompileShader(vert);
 
-    GLuint frag = compile_shader(renderer, GL_FRAGMENT_SHADER, frag_src);
-    if (!frag) {
+    GLint vert_status;
+    glGetShaderiv(vert, GL_COMPILE_STATUS, &vert_status);
+    if (vert_status != GL_TRUE) {
+        char info_log[512] = {0};
+        glGetShaderInfoLog(vert, sizeof(info_log) - 1, NULL, info_log);
+        info_log[sizeof(info_log) - 1] = '\0';
+        wlr_log(WLR_ERROR, "Failed to compile vertex shader: %s", info_log[0] ? info_log : "No info log available");
+        wlr_log(WLR_DEBUG, "Vertex shader source:\n%s", vert_src);
         glDeleteShader(vert);
-        goto error;
+        return 0;
     }
+    wlr_log(WLR_DEBUG, "Vertex shader compiled successfully");
 
+    // Compile fragment shader
+    GLuint frag = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(frag, 1, &frag_src, NULL);
+    glCompileShader(frag);
+
+    GLint frag_status;
+    glGetShaderiv(frag, GL_COMPILE_STATUS, &frag_status);
+    if (frag_status != GL_TRUE) {
+        char info_log[512] = {0};
+        glGetShaderInfoLog(frag, sizeof(info_log) - 1, NULL, info_log);
+        info_log[sizeof(info_log) - 1] = '\0';
+        wlr_log(WLR_ERROR, "Failed to compile fragment shader: %s", info_log[0] ? info_log : "No info log available");
+        wlr_log(WLR_DEBUG, "Fragment shader source:\n%s", frag_src);
+        glDeleteShader(frag);
+        glDeleteShader(vert);
+        return 0;
+    }
+    wlr_log(WLR_DEBUG, "Fragment shader compiled successfully");
+
+    // Link program
     GLuint prog = glCreateProgram();
     glAttachShader(prog, vert);
     glAttachShader(prog, frag);
     glLinkProgram(prog);
+
+    GLint link_status;
+    glGetProgramiv(prog, GL_LINK_STATUS, &link_status);
+    if (link_status != GL_TRUE) {
+        char info_log[512] = {0};
+        glGetProgramInfoLog(prog, sizeof(info_log) - 1, NULL, info_log);
+        info_log[sizeof(info_log) - 1] = '\0';
+        wlr_log(WLR_ERROR, "Shader link failed: %s", info_log[0] ? info_log : "No info log available");
+        glDeleteProgram(prog);
+        glDeleteShader(frag);
+        glDeleteShader(vert);
+        return 0;
+    }
+    wlr_log(WLR_DEBUG, "Shader program linked successfully: program=%u", prog);
 
     glDetachShader(prog, vert);
     glDetachShader(prog, frag);
     glDeleteShader(vert);
     glDeleteShader(frag);
 
-    GLint ok;
-    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
-    if (ok == GL_FALSE) {
-        wlr_log(WLR_ERROR, "Failed to link shader");
-        glDeleteProgram(prog);
-        goto error;
-    }
-
-    pop_gles2_debug(renderer);
     return prog;
-
-error:
-    pop_gles2_debug(renderer);
-    return 0;
 }
 
 static bool check_gl_ext(const char *exts, const char *ext) {
@@ -730,8 +817,8 @@ struct wlr_renderer *wlr_gles2_renderer_create(struct wlr_egl *egl) {
 
     if (!renderer->egl->exts.EXT_image_dma_buf_import) {
         wlr_log(WLR_ERROR, "EGL_EXT_image_dma_buf_import not supported");
-     //   free(renderer);
-      //  return NULL;
+        free(renderer);
+        return NULL;
     }
     if (!check_gl_ext(exts_str, "GL_EXT_texture_format_BGRA8888")) {
         wlr_log(WLR_ERROR, "BGRA8888 format not supported by GLES2");
@@ -903,6 +990,8 @@ bool wlr_gles2_renderer_check_ext(struct wlr_renderer *wlr_renderer,
     struct wlr_gles2_renderer *renderer = gles2_get_renderer(wlr_renderer);
     return check_gl_ext(renderer->exts_str, ext);
 }
+
+/*
 struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void) {
     wlr_log(WLR_DEBUG, "Entering wlr_gles2_renderer_create_surfaceless");
 
@@ -965,4 +1054,237 @@ struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void) {
 
     wlr_log(WLR_DEBUG, "Exiting wlr_gles2_renderer_create_surfaceless");
     return &renderer->wlr_renderer;
+}*/
+
+struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void) {
+    wlr_log(WLR_DEBUG, "Entering wlr_gles2_renderer_create_surfaceless");
+
+    // Initialize EGL
+    struct wlr_egl *egl = wlr_egl_create_surfaceless();
+    if (!egl) {
+        wlr_log(WLR_ERROR, "Failed to create EGL context");
+        return NULL;
+    }
+    wlr_log(WLR_DEBUG, "Created EGL context: %p", egl);
+
+    EGLDisplay display = egl->display;
+    EGLContext context = egl->context;
+
+    // Make EGL context current
+    if (!wlr_egl_make_current(egl, NULL)) {
+        wlr_log(WLR_ERROR, "Failed to make EGL context current");
+        eglDestroyContext(display, context);
+        eglTerminate(display);
+        free(egl);
+        return NULL;
+    }
+
+    // Allocate renderer
+    struct wlr_gles2_renderer *renderer = calloc(1, sizeof(struct wlr_gles2_renderer));
+    if (!renderer) {
+        wlr_log(WLR_ERROR, "Failed to allocate renderer");
+        wlr_egl_unset_current(egl);
+        eglDestroyContext(display, context);
+        eglTerminate(display);
+        free(egl);
+        return NULL;
+    }
+    wlr_log(WLR_DEBUG, "Allocated renderer: %p", renderer);
+
+    renderer->wlr_renderer.impl = &renderer_impl;
+    renderer->egl = egl;
+    renderer->drm_fd = -1;
+
+    // Log GL details
+    const char *vendor = (const char *)glGetString(GL_VENDOR);
+    const char *renderer_str = (const char *)glGetString(GL_RENDERER);
+    const char *version = (const char *)glGetString(GL_VERSION);
+    const char *shading_lang = (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
+    const char *exts_str = (const char *)glGetString(GL_EXTENSIONS);
+    wlr_log(WLR_INFO, "wlr_gles2_renderer GL_VENDOR: %s", vendor ? vendor : "unknown");
+    wlr_log(WLR_INFO, "wlr_gles2_renderer GL_RENDERER: %s", renderer_str ? renderer_str : "unknown");
+    wlr_log(WLR_INFO, "wlr_gles2_renderer GL_VERSION: %s", version ? version : "unknown");
+    wlr_log(WLR_INFO, "wlr_gles2_renderer GL_SHADING_LANGUAGE_VERSION: %s", shading_lang ? shading_lang : "unknown");
+    wlr_log(WLR_INFO, "Supported GLES2 extensions: %s", exts_str ? exts_str : "none");
+
+    // Log Zink usage
+    const char *driver = getenv("MESA_LOADER_DRIVER_OVERRIDE");
+    if (driver && strcmp(driver, "zink") == 0) {
+        wlr_log(WLR_INFO, "Using Zink (Vulkan) driver for hardware acceleration");
+    } else {
+        wlr_log(WLR_DEBUG, "MESA_LOADER_DRIVER_OVERRIDE: %s", driver ? driver : "unset");
+    }
+
+    // Initialize renderer
+    wlr_renderer_init(&renderer->wlr_renderer, &renderer_impl, WLR_BUFFER_CAP_DMABUF);
+    wlr_log(WLR_DEBUG, "Renderer initialized with DMABUF capability");
+
+    // Initialize buffers and textures lists
+    wl_list_init(&renderer->buffers);
+    wl_list_init(&renderer->textures);
+    wlr_log(WLR_DEBUG, "Initialized renderer->buffers: prev=%p, next=%p",
+            renderer->buffers.prev, renderer->buffers.next);
+
+    // Check required extensions
+    if (!exts_str) {
+        wlr_log(WLR_ERROR, "Failed to get GL_EXTENSIONS");
+        wlr_egl_unset_current(egl);
+        free(renderer);
+        eglDestroyContext(display, context);
+        eglTerminate(display);
+        free(egl);
+        return NULL;
+    }
+    renderer->exts_str = exts_str;
+
+    if (!check_gl_ext(exts_str, "GL_EXT_texture_format_BGRA8888")) {
+        wlr_log(WLR_ERROR, "BGRA8888 format not supported by GLES2");
+        wlr_egl_unset_current(egl);
+        free(renderer);
+        eglDestroyContext(display, context);
+        eglTerminate(display);
+        free(egl);
+        return NULL;
+    }
+    if (!check_gl_ext(exts_str, "GL_EXT_unpack_subimage")) {
+        wlr_log(WLR_ERROR, "GL_EXT_unpack_subimage not supported");
+        wlr_egl_unset_current(egl);
+        free(renderer);
+        eglDestroyContext(display, context);
+        eglTerminate(display);
+        free(egl);
+        return NULL;
+    }
+
+    // Load optional extensions
+    renderer->exts.EXT_read_format_bgra = check_gl_ext(exts_str, "GL_EXT_read_format_bgra");
+    renderer->exts.EXT_texture_type_2_10_10_10_REV = check_gl_ext(exts_str, "GL_EXT_texture_type_2_10_10_10_REV");
+    renderer->exts.OES_texture_half_float_linear = check_gl_ext(exts_str, "GL_OES_texture_half_float_linear");
+    renderer->exts.EXT_texture_norm16 = check_gl_ext(exts_str, "GL_EXT_texture_norm16");
+
+    if (check_gl_ext(exts_str, "GL_KHR_debug")) {
+        renderer->exts.KHR_debug = true;
+        load_gl_proc(&renderer->procs.glDebugMessageCallbackKHR, "glDebugMessageCallbackKHR");
+        load_gl_proc(&renderer->procs.glDebugMessageControlKHR, "glDebugMessageControlKHR");
+        glEnable(GL_DEBUG_OUTPUT_KHR);
+        glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS_KHR);
+        renderer->procs.glDebugMessageCallbackKHR(gles2_log, NULL);
+        renderer->procs.glDebugMessageControlKHR(GL_DONT_CARE, GL_DEBUG_TYPE_POP_GROUP_KHR, GL_DONT_CARE, 0, NULL, GL_FALSE);
+        renderer->procs.glDebugMessageControlKHR(GL_DONT_CARE, GL_DEBUG_TYPE_PUSH_GROUP_KHR, GL_DONT_CARE, 0, NULL, GL_FALSE);
+    }
+
+    if (check_gl_ext(exts_str, "GL_OES_EGL_image_external")) {
+        renderer->exts.OES_egl_image_external = true;
+        load_gl_proc(&renderer->procs.glEGLImageTargetTexture2DOES, "glEGLImageTargetTexture2DOES");
+    }
+
+    if (check_gl_ext(exts_str, "GL_OES_EGL_image")) {
+        renderer->exts.OES_egl_image = true;
+        load_gl_proc(&renderer->procs.glEGLImageTargetRenderbufferStorageOES, "glEGLImageTargetRenderbufferStorageOES");
+    }
+
+    if (check_gl_ext(exts_str, "GL_EXT_disjoint_timer_query")) {
+        renderer->exts.EXT_disjoint_timer_query = true;
+        load_gl_proc(&renderer->procs.glGenQueriesEXT, "glGenQueriesEXT");
+        load_gl_proc(&renderer->procs.glDeleteQueriesEXT, "glDeleteQueriesEXT");
+        load_gl_proc(&renderer->procs.glQueryCounterEXT, "glQueryCounterEXT");
+        load_gl_proc(&renderer->procs.glGetQueryObjectivEXT, "glGetQueryObjectivEXT");
+        load_gl_proc(&renderer->procs.glGetQueryObjectui64vEXT, "glGetQueryObjectui64vEXT");
+        if (eglGetProcAddress("glGetInteger64vEXT")) {
+            load_gl_proc(&renderer->procs.glGetInteger64vEXT, "glGetInteger64vEXT");
+        } else {
+            load_gl_proc(&renderer->procs.glGetInteger64vEXT, "glGetInteger64v");
+        }
+    }
+
+    // Initialize shaders
+    wlr_log(WLR_DEBUG, "Starting quad shader setup in surfaceless");
+    push_gles2_debug(renderer);
+
+    GLuint prog;
+    renderer->shaders.quad.program = prog = link_program(renderer, common_vert_src, quad_frag_src);
+    if (!renderer->shaders.quad.program) {
+        wlr_log(WLR_ERROR, "Failed to create quad shader program");
+        goto error;
+    }
+    renderer->shaders.quad.proj = glGetUniformLocation(prog, "proj");
+    renderer->shaders.quad.color = glGetUniformLocation(prog, "color");
+    renderer->shaders.quad.pos_attrib = glGetAttribLocation(prog, "pos");
+    wlr_log(WLR_DEBUG, "Quad shader created: program=%u, proj=%d, color=%d, pos_attrib=%d",
+            prog, renderer->shaders.quad.proj, renderer->shaders.quad.color, renderer->shaders.quad.pos_attrib);
+
+    renderer->shaders.tex_rgba.program = prog = link_program(renderer, common_vert_src, tex_rgba_frag_src);
+    if (!renderer->shaders.tex_rgba.program) {
+        wlr_log(WLR_ERROR, "Failed to create tex_rgba shader program");
+        glDeleteProgram(renderer->shaders.quad.program);
+        goto error;
+    }
+    renderer->shaders.tex_rgba.proj = glGetUniformLocation(prog, "proj");
+    renderer->shaders.tex_rgba.tex_proj = glGetUniformLocation(prog, "tex_proj");
+    renderer->shaders.tex_rgba.tex = glGetUniformLocation(prog, "tex");
+    renderer->shaders.tex_rgba.alpha = glGetUniformLocation(prog, "alpha");
+    renderer->shaders.tex_rgba.pos_attrib = glGetAttribLocation(prog, "pos");
+
+    renderer->shaders.tex_rgbx.program = prog = link_program(renderer, common_vert_src, tex_rgbx_frag_src);
+    if (!renderer->shaders.tex_rgbx.program) {
+        wlr_log(WLR_ERROR, "Failed to create tex_rgbx shader program");
+        glDeleteProgram(renderer->shaders.quad.program);
+        glDeleteProgram(renderer->shaders.tex_rgba.program);
+        goto error;
+    }
+    renderer->shaders.tex_rgbx.proj = glGetUniformLocation(prog, "proj");
+    renderer->shaders.tex_rgbx.tex_proj = glGetUniformLocation(prog, "tex_proj");
+    renderer->shaders.tex_rgbx.tex = glGetUniformLocation(prog, "tex");
+    renderer->shaders.tex_rgbx.alpha = glGetUniformLocation(prog, "alpha");
+    renderer->shaders.tex_rgbx.pos_attrib = glGetAttribLocation(prog, "pos");
+
+    if (renderer->exts.OES_egl_image_external) {
+        renderer->shaders.tex_ext.program = prog = link_program(renderer, common_vert_src, tex_external_frag_src);
+        if (!renderer->shaders.tex_ext.program) {
+            wlr_log(WLR_ERROR, "Failed to create tex_ext shader program");
+            glDeleteProgram(renderer->shaders.quad.program);
+            glDeleteProgram(renderer->shaders.tex_rgba.program);
+            glDeleteProgram(renderer->shaders.tex_rgbx.program);
+            goto error;
+        }
+        renderer->shaders.tex_ext.proj = glGetUniformLocation(prog, "proj");
+        renderer->shaders.tex_ext.tex_proj = glGetUniformLocation(prog, "tex_proj");
+        renderer->shaders.tex_ext.tex = glGetUniformLocation(prog, "tex");
+        renderer->shaders.tex_ext.alpha = glGetUniformLocation(prog, "alpha");
+        renderer->shaders.tex_ext.pos_attrib = glGetAttribLocation(prog, "pos");
+    }
+
+    pop_gles2_debug(renderer);
+    wlr_egl_unset_current(egl);
+
+    // Initialize SHM texture formats
+    get_gles2_shm_formats(renderer, &renderer->shm_texture_formats);
+
+    // Check for timeline support
+    int drm_fd = wlr_renderer_get_drm_fd(&renderer->wlr_renderer);
+    uint64_t cap_syncobj_timeline;
+    if (drm_fd >= 0 && drmGetCap(drm_fd, DRM_CAP_SYNCOBJ_TIMELINE, &cap_syncobj_timeline) == 0) {
+        renderer->wlr_renderer.features.timeline = egl->procs.eglDupNativeFenceFDANDROID &&
+            egl->procs.eglWaitSyncKHR && cap_syncobj_timeline != 0;
+    }
+
+    wlr_log(WLR_DEBUG, "Exiting wlr_gles2_renderer_create_surfaceless");
+    return &renderer->wlr_renderer;
+
+error:
+    glDeleteProgram(renderer->shaders.quad.program);
+    glDeleteProgram(renderer->shaders.tex_rgba.program);
+    glDeleteProgram(renderer->shaders.tex_rgbx.program);
+    glDeleteProgram(renderer->shaders.tex_ext.program);
+    pop_gles2_debug(renderer);
+    if (renderer->exts.KHR_debug) {
+        glDisable(GL_DEBUG_OUTPUT_KHR);
+        renderer->procs.glDebugMessageCallbackKHR(NULL, NULL);
+    }
+    wlr_egl_unset_current(egl);
+    free(renderer);
+    eglDestroyContext(display, context);
+    eglTerminate(display);
+    free(egl);
+    return NULL;
 }

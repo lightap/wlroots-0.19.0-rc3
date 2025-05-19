@@ -148,6 +148,7 @@ struct wlr_gles2_render_pass {
 	struct wlr_gles2_render_timer *timer;
 	struct wlr_drm_syncobj_timeline *signal_timeline;
 	uint64_t signal_point;
+	void *cpu_direct_data_ptr_hack;
 };
 
 bool is_gles2_pixel_format_supported(const struct wlr_gles2_renderer *renderer,
