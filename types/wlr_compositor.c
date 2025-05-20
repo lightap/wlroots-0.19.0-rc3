@@ -37,7 +37,7 @@
 
 // RDP backend structures (from 0.16.2)
 
-
+/*
 struct rdp_peers_item {
     void *peer;  // freerdp_peer* opaque type for compositor
     uint32_t flags;
@@ -66,7 +66,7 @@ struct rdp_peer_context {
     bool frame_ack_pending;
     struct wl_event_source *frame_timer;
     struct wlr_output *current_output;
-};
+};*/
 //freerdp_peer *get_global_rdp_peer(void);
 // Function declarations (assumed implemented in backend/rdp/backend.c)
 static void surface_update_opaque_region(struct wlr_surface *surface);

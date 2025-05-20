@@ -46,7 +46,11 @@
 
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/box.h> // For wlr_matrix_project_box, also includes matrix.h
-#include <wlr/util/log.h> // For WLR_LOG_WARNING
+#include <wlr/util/log.h> // For WLR_ERRORARNING
+#include <freerdp/freerdp.h> // For freerdp_peer and rdpContext
+ // For wlr_rdp_backend
+#include <wlr/types/wlr_seat.h> // For wlr_seat_pointer_notify_*
+#include <linux/input-event-codes.h> // For BTN_LEFT, BTN_RIGHT, BTN_MIDDLE
 
 #ifndef RENDER_EGL_H
 #define RENDER_EGL_H
@@ -322,6 +326,7 @@ struct tinywl_server {
     struct wl_listener cursor_axis;
     struct wl_listener cursor_frame;
 
+struct wl_listener pointer_motion;
     struct wlr_seat *seat;
     struct wl_listener new_input;
     struct wl_listener request_cursor;
@@ -415,6 +420,7 @@ void rdp_transmit_surface(struct wlr_buffer *buffer);
 //freerdp_peer *get_global_rdp_peer(void);
 struct wlr_egl *setup_surfaceless_egl(struct tinywl_server *server) ;
 void cleanup_egl(struct tinywl_server *server);
+static void process_cursor_motion(struct tinywl_server *server, uint32_t time);
 
 /* Function implementations */
 static void server_destroy(struct tinywl_server *server) {
@@ -497,33 +503,49 @@ static void server_destroy(struct tinywl_server *server) {
 
 
 
-
 static void focus_toplevel(struct tinywl_toplevel *toplevel) {
     if (toplevel == NULL) {
+        wlr_log(WLR_ERROR, "focus_toplevel: No toplevel to focus");
         return;
     }
     struct tinywl_server *server = toplevel->server;
     struct wlr_seat *seat = server->seat;
-    struct wlr_surface *prev_surface = seat->keyboard_state.focused_surface;
     struct wlr_surface *surface = toplevel->xdg_toplevel->base->surface;
+    struct wlr_surface *prev_surface = seat->keyboard_state.focused_surface;
+
     if (prev_surface == surface) {
+        wlr_log(WLR_ERROR, "Surface %p already focused, skipping", surface);
         return;
     }
+
+    // Deactivate previous toplevel
     if (prev_surface) {
         struct wlr_xdg_toplevel *prev_toplevel =
             wlr_xdg_toplevel_try_from_wlr_surface(prev_surface);
         if (prev_toplevel != NULL) {
             wlr_xdg_toplevel_set_activated(prev_toplevel, false);
+            wlr_log(WLR_ERROR, "Deactivated previous toplevel %p", prev_toplevel);
         }
     }
-    struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
+
+    // Raise and focus new toplevel
     wlr_scene_node_raise_to_top(&toplevel->scene_tree->node);
     wl_list_remove(&toplevel->link);
     wl_list_insert(&server->toplevels, &toplevel->link);
     wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
-    if (keyboard != NULL) {
+    wlr_log(WLR_ERROR, "Focused toplevel %p, title='%s'", toplevel,
+            toplevel->xdg_toplevel->title ? toplevel->xdg_toplevel->title : "(null)");
+
+    // Notify seat of new focus
+    struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
+    if (keyboard && surface) {
         wlr_seat_keyboard_notify_enter(seat, surface,
             keyboard->keycodes, keyboard->num_keycodes, &keyboard->modifiers);
+        wlr_log(WLR_ERROR, "Notified seat of keyboard focus on surface %p", surface);
+        wl_display_flush_clients(server->wl_display);
+    } else {
+        wlr_log(WLR_ERROR, "No keyboard or surface for focus: keyboard=%p, surface=%p",
+                keyboard, surface);
     }
 }
 
@@ -558,22 +580,89 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
     struct tinywl_server *server = keyboard->server;
     struct wlr_keyboard_key_event *event = data;
     struct wlr_seat *seat = server->seat;
+    
+    // Log key event details with timestamp to track potential duplicates
+    wlr_log(WLR_DEBUG, "Key event: keycode=%u, state=%s, time=%u",
+            event->keycode, event->state == WL_KEYBOARD_KEY_STATE_PRESSED ? "pressed" : "released",
+            event->time_msec);
+    
+    // Track duplicate events - if we see same keycode and state with similar timestamp, ignore it
+    static uint32_t last_keycode = 0;
+    static uint32_t last_state = 0;
+    static uint32_t last_time = 0;
+    
+    // Check for duplicate events (same key, same state, within 5ms)
+    if (last_keycode == event->keycode && 
+        last_state == event->state &&
+        event->time_msec > 0 && 
+        last_time > 0 &&
+        (event->time_msec - last_time < 5 || last_time - event->time_msec < 5)) {
+        wlr_log(WLR_ERROR, "Ignoring duplicate key event: keycode=%u, state=%u, time=%u (prev=%u)",
+                event->keycode, event->state, event->time_msec, last_time);
+        return;
+    }
+    
+    // Store current event details for duplicate detection
+    last_keycode = event->keycode;
+    last_state = event->state;
+    last_time = event->time_msec;
 
+    // Ignore release events at startup with no focused surface and no prior press
+    if (event->state == WL_KEYBOARD_KEY_STATE_RELEASED && !seat->keyboard_state.focused_surface) {
+        // Note: XKB keycodes are offset by 8 from evdev keycodes
+        xkb_keycode_t xkb_keycode = event->keycode + 8;
+        struct xkb_state *state = keyboard->wlr_keyboard->xkb_state;
+        if (xkb_state_key_get_level(state, xkb_keycode, 0) == 0) {
+            wlr_log(WLR_ERROR, "Ignoring phantom release for keycode=%u (no prior press, no focused surface)",
+                    event->keycode);
+            return;
+        }
+    }
+    
+    // Convert keycode to XKB keycode (Wayland keycodes are offset by 8)
     uint32_t keycode = event->keycode + 8;
     const xkb_keysym_t *syms;
     int nsyms = xkb_state_key_get_syms(keyboard->wlr_keyboard->xkb_state, keycode, &syms);
-
+    
+    if (nsyms <= 0) {
+        wlr_log(WLR_ERROR, "No keysyms found for keycode %u (raw=%u)", keycode, event->keycode);
+    } else {
+        // Only log detailed keysym info at debug level to reduce noise
+        if (wlr_log_get_verbosity() >= WLR_DEBUG) {
+            for (int i = 0; i < nsyms; i++) {
+                char buf[32];
+                xkb_keysym_get_name(syms[i], buf, sizeof(buf));
+                wlr_log(WLR_DEBUG, "Keysym %d: %s (0x%x)", i, buf, syms[i]);
+            }
+        }
+    }
+    
+    // Handle keybindings for Alt+key combinations
     bool handled = false;
     uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
     if ((modifiers & WLR_MODIFIER_ALT) && event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
         for (int i = 0; i < nsyms; i++) {
             handled = handle_keybinding(server, syms[i]);
+            if (handled) break;
         }
     }
-
+    
+    // Forward key event to the focused client if not handled
     if (!handled) {
-        wlr_seat_set_keyboard(seat, keyboard->wlr_keyboard);
-        wlr_seat_keyboard_notify_key(seat, event->time_msec, event->keycode, event->state);
+        // Set the keyboard once at initialization or focus change, not on every key event
+        static struct wlr_keyboard *last_keyboard = NULL;
+        if (last_keyboard != keyboard->wlr_keyboard) {
+            wlr_seat_set_keyboard(seat, keyboard->wlr_keyboard);
+            last_keyboard = keyboard->wlr_keyboard;
+        }
+        
+        // Only notify if there's a focused surface
+        if (seat->keyboard_state.focused_surface) {
+            wlr_seat_keyboard_notify_key(seat, event->time_msec, event->keycode, event->state);
+            wlr_log(WLR_DEBUG, "Key sent to focused surface %p", seat->keyboard_state.focused_surface);
+        } else {
+            wlr_log(WLR_DEBUG, "No focused surface for key event");
+        }
     }
 }
 
@@ -588,17 +677,57 @@ static void keyboard_handle_destroy(struct wl_listener *listener, void *data) {
 
 static void server_new_keyboard(struct tinywl_server *server, struct wlr_input_device *device) {
     struct wlr_keyboard *wlr_keyboard = wlr_keyboard_from_input_device(device);
+    if (!wlr_keyboard) {
+        wlr_log(WLR_ERROR, "Failed to get wlr_keyboard from input device %p", device);
+        return;
+    }
+
     struct tinywl_keyboard *keyboard = calloc(1, sizeof(*keyboard));
+    if (!keyboard) {
+        wlr_log(WLR_ERROR, "Failed to allocate tinywl_keyboard");
+        return;
+    }
     keyboard->server = server;
     keyboard->wlr_keyboard = wlr_keyboard;
 
+    // Initialize XKB context and keymap
     struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-    struct xkb_keymap *keymap = xkb_keymap_new_from_names(context, NULL, XKB_KEYMAP_COMPILE_NO_FLAGS);
-    wlr_keyboard_set_keymap(wlr_keyboard, keymap);
+    if (!context) {
+        wlr_log(WLR_ERROR, "Failed to create XKB context");
+        free(keyboard);
+        return;
+    }
+
+    // Use a more specific keymap to align with RDP client expectations
+    struct xkb_rule_names rules = {0};
+    rules.rules = "evdev";
+    rules.model = "pc105";
+    rules.layout = "us";
+    rules.variant = "";
+    rules.options = "";
+    struct xkb_keymap *keymap = xkb_keymap_new_from_names(context, &rules, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    if (!keymap) {
+        wlr_log(WLR_ERROR, "Failed to create XKB keymap");
+        xkb_context_unref(context);
+        free(keyboard);
+        return;
+    }
+
+    if (!wlr_keyboard_set_keymap(wlr_keyboard, keymap)) {
+        wlr_log(WLR_ERROR, "Failed to set keymap on wlr_keyboard");
+        xkb_keymap_unref(keymap);
+        xkb_context_unref(context);
+        free(keyboard);
+        return;
+    }
     xkb_keymap_unref(keymap);
     xkb_context_unref(context);
-    wlr_keyboard_set_repeat_info(wlr_keyboard, 25, 600);
 
+    // Set repeat info
+    wlr_keyboard_set_repeat_info(wlr_keyboard, 25, 600);
+    wlr_log(WLR_ERROR, "Keyboard %p initialized with keymap and repeat info", wlr_keyboard);
+
+    // Add event listeners
     keyboard->modifiers.notify = keyboard_handle_modifiers;
     wl_signal_add(&wlr_keyboard->events.modifiers, &keyboard->modifiers);
     keyboard->key.notify = keyboard_handle_key;
@@ -606,12 +735,50 @@ static void server_new_keyboard(struct tinywl_server *server, struct wlr_input_d
     keyboard->destroy.notify = keyboard_handle_destroy;
     wl_signal_add(&device->events.destroy, &keyboard->destroy);
 
-    wlr_seat_set_keyboard(server->seat, keyboard->wlr_keyboard);
+    // Set keyboard on seat
+    wlr_seat_set_keyboard(server->seat, wlr_keyboard);
+    wlr_log(WLR_ERROR, "Keyboard %p set on seat %s", wlr_keyboard, server->seat->name);
+
     wl_list_insert(&server->keyboards, &keyboard->link);
+    wlr_log(WLR_ERROR, "Keyboard %p added to server keyboards list", wlr_keyboard);
+
+    // Update seat capabilities
+    wlr_seat_set_capabilities(server->seat, WL_SEAT_CAPABILITY_KEYBOARD);
+    wlr_log(WLR_ERROR, "Set seat capabilities: WL_SEAT_CAPABILITY_KEYBOARD");
+}
+
+static void server_pointer_motion(struct wl_listener *listener, void *data) {
+    struct tinywl_server *server = wl_container_of(listener, server, pointer_motion);
+    struct wlr_pointer_motion_event *event = data;
+
+    if (!server->cursor || !server->output_layout) {
+        wlr_log(WLR_ERROR, "Cursor or output layout is null during motion event");
+        return;
+    }
+
+    wlr_cursor_move(server->cursor, &event->pointer->base, event->delta_x, event->delta_y);
+    wlr_log(WLR_DEBUG, "Pointer motion: cursor moved to (%f, %f)", server->cursor->x, server->cursor->y);
+    process_cursor_motion(server, event->time_msec);
 }
 
 static void server_new_pointer(struct tinywl_server *server, struct wlr_input_device *device) {
+    if (device->type != WLR_INPUT_DEVICE_POINTER) {
+        wlr_log(WLR_ERROR, "Device %p is not a pointer", device);
+        return;
+    }
     wlr_cursor_attach_input_device(server->cursor, device);
+    struct wlr_pointer *pointer = wlr_pointer_from_input_device(device);
+    if (pointer) {
+        static struct wl_listener pointer_motion_listener;
+        pointer_motion_listener.notify = server_pointer_motion;
+        wl_signal_add(&pointer->events.motion, &pointer_motion_listener);
+        wlr_log(WLR_DEBUG, "Attached motion listener for pointer %p", pointer);
+        // Set default cursor image
+        wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
+        wlr_log(WLR_INFO, "Set default cursor image for device %p", device);
+    } else {
+        wlr_log(WLR_ERROR, "Failed to get wlr_pointer from device %p", device);
+    }
 }
 
 static void server_new_input(struct wl_listener *listener, void *data) {
@@ -721,6 +888,7 @@ static void process_cursor_resize(struct tinywl_server *server) {
 }
 
 static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
+    // Preserve existing cursor mode handling
     if (server->cursor_mode == TINYWL_CURSOR_MOVE) {
         process_cursor_move(server);
         return;
@@ -728,22 +896,58 @@ static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
         process_cursor_resize(server);
         return;
     }
-
+    
     double sx, sy;
     struct wlr_seat *seat = server->seat;
     struct wlr_surface *surface = NULL;
     struct tinywl_toplevel *toplevel = desktop_toplevel_at(server,
             server->cursor->x, server->cursor->y, &surface, &sx, &sy);
+    
+    // Preserve cursor icon setting
     if (!toplevel) {
         wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
+    } else {
+        wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
     }
+    
+    // GTK fix: Handle surface focus changes more explicitly
     if (surface) {
+        // Check if this is a focus change
+        bool is_new_focus = seat->pointer_state.focused_surface != surface;
+        
+        // For GTK applications, we need to be more explicit with focus changes
+        if (is_new_focus && seat->pointer_state.focused_surface != NULL) {
+            // Clear existing focus first
+            wlr_seat_pointer_clear_focus(seat);
+            // Add frame notification to help GTK register the focus change
+            wlr_seat_pointer_notify_frame(seat);
+        }
+        
+        // Set focus and send motion
         wlr_seat_pointer_notify_enter(seat, surface, sx, sy);
         wlr_seat_pointer_notify_motion(seat, time, sx, sy);
+        
+        // Important for GTK: Always send frame after pointer events
+        wlr_seat_pointer_notify_frame(seat);
+        
+        // Flush events to ensure they're processed in order
+        wl_display_flush_clients(server->wl_display);
     } else {
+        // No surface under cursor
         wlr_seat_pointer_clear_focus(seat);
+        // Add frame notification for consistency
+        wlr_seat_pointer_notify_frame(seat);
+    }
+    
+    // Schedule frame to ensure cursor is rendered (preserve existing code)
+    struct tinywl_output *output;
+    wl_list_for_each(output, &server->outputs, link) {
+        if (output->wlr_output && output->wlr_output->enabled) {
+            wlr_output_schedule_frame(output->wlr_output);
+        }
     }
 }
+
 
 static void server_cursor_motion(struct wl_listener *listener, void *data) {
     struct tinywl_server *server = wl_container_of(listener, server, cursor_motion);
@@ -758,19 +962,114 @@ static void server_cursor_motion_absolute(struct wl_listener *listener, void *da
     wlr_cursor_warp_absolute(server->cursor, &event->pointer->base, event->x, event->y);
     process_cursor_motion(server, event->time_msec);
 }
-
+/*
 static void server_cursor_button(struct wl_listener *listener, void *data) {
     struct tinywl_server *server = wl_container_of(listener, server, cursor_button);
     struct wlr_pointer_button_event *event = data;
+
+    // Log the event for debugging
+    wlr_log(WLR_DEBUG, "Cursor button event: button=%u, state=%s, time=%u",
+            event->button, event->state == WL_POINTER_BUTTON_STATE_PRESSED ? "pressed" : "released",
+            event->time_msec);
+
+    // Find the surface under the cursor
+    double sx, sy;
+    struct wlr_surface *surface = NULL;
+    struct tinywl_toplevel *toplevel = desktop_toplevel_at(server,
+            server->cursor->x, server->cursor->y, &surface, &sx, &sy);
+
+    // Notify the seat of the button event
     wlr_seat_pointer_notify_button(server->seat, event->time_msec, event->button, event->state);
-    if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
-        reset_cursor_mode(server);
-    } else {
-        double sx, sy;
-        struct wlr_surface *surface = NULL;
-        struct tinywl_toplevel *toplevel = desktop_toplevel_at(server,
-                server->cursor->x, server->cursor->y, &surface, &sx, &sy);
+
+    if (event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
+        // On press, focus the toplevel and notify the surface
         focus_toplevel(toplevel);
+        if (surface) {
+            wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
+            wlr_seat_pointer_notify_motion(server->seat, event->time_msec, sx, sy);
+            wlr_log(WLR_DEBUG, "Notified surface %p at (%f, %f) of button press", surface, sx, sy);
+        }
+    } else if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
+        // On release, reset cursor mode and schedule a frame
+        reset_cursor_mode(server);
+        // Schedule a frame to update the cursor visually
+        struct tinywl_output *output;
+        wl_list_for_each(output, &server->outputs, link) {
+            if (output->wlr_output && output->wlr_output->enabled) {
+                wlr_output_schedule_frame(output->wlr_output);
+            }
+        }
+        wlr_log(WLR_DEBUG, "Processed button release, cursor mode reset");
+    }
+
+    // Notify the seat of the frame to finalize the event
+    wlr_seat_pointer_notify_frame(server->seat);
+}*/
+
+// Enhanced button handling with special GTK fixes
+static void server_cursor_button(struct wl_listener *listener, void *data) {
+    struct tinywl_server *server = wl_container_of(listener, server, cursor_button);
+    struct wlr_pointer_button_event *event = data;
+    
+    wlr_log(WLR_DEBUG, "Button %d %s", event->button,
+            event->state == WL_POINTER_BUTTON_STATE_PRESSED ? "pressed" : "released");
+    
+    double sx, sy;
+    struct wlr_surface *surface = NULL;
+    struct tinywl_toplevel *toplevel = desktop_toplevel_at(server,
+            server->cursor->x, server->cursor->y, &surface, &sx, &sy);
+    
+    struct wlr_seat *seat = server->seat;
+    
+    if (event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
+        if (surface) {
+            // Only clear focus if the surface is different from the current focus
+            if (seat->pointer_state.focused_surface != surface) {
+                wlr_seat_pointer_clear_focus(seat);
+                wlr_seat_pointer_notify_frame(seat);
+                wlr_seat_pointer_notify_enter(seat, surface, sx, sy);
+                wlr_seat_pointer_notify_motion(seat, event->time_msec, sx, sy);
+                wlr_seat_pointer_notify_frame(seat);
+                wl_display_flush_clients(server->wl_display);
+            } else {
+                // Surface already focused; just send motion
+                wlr_seat_pointer_notify_motion(seat, event->time_msec, sx, sy);
+                wlr_seat_pointer_notify_frame(seat);
+            }
+            
+            // Send the button event
+            wlr_seat_pointer_notify_button(seat, event->time_msec, event->button, event->state);
+            wlr_seat_pointer_notify_frame(seat);
+            wl_display_flush_clients(server->wl_display);
+            
+            // Focus the toplevel after sending button events
+            if (toplevel) {
+                focus_toplevel(toplevel);
+            }
+        } else {
+            // No surface under cursor; send button event and clear focus
+            if (seat->pointer_state.focused_surface) {
+                wlr_seat_pointer_clear_focus(seat);
+                wlr_seat_pointer_notify_frame(seat);
+            }
+            wlr_seat_pointer_notify_button(seat, event->time_msec, event->button, event->state);
+            wlr_seat_pointer_notify_frame(seat);
+            wl_display_flush_clients(server->wl_display);
+        }
+    } else {
+        // Button release
+        wlr_seat_pointer_notify_button(seat, event->time_msec, event->button, event->state);
+        wlr_seat_pointer_notify_frame(seat);
+        reset_cursor_mode(server);
+        wl_display_flush_clients(server->wl_display);
+    }
+    
+    // Schedule frame for all outputs
+    struct tinywl_output *output;
+    wl_list_for_each(output, &server->outputs, link) {
+        if (output->wlr_output && output->wlr_output->enabled) {
+            wlr_output_schedule_frame(output->wlr_output);
+        }
     }
 }
 
@@ -841,20 +1140,22 @@ static void server_cursor_frame(struct wl_listener *listener, void *data) {
 #include <wlr/render/wlr_renderer.h>
 
 static void output_frame(struct wl_listener *listener, void *data) {
-    struct tinywl_output *output_wrapper = wl_container_of(listener, output_wrapper, frame);
-  struct tinywl_output *output = wl_container_of(listener, output, frame);
-    struct wlr_output *wlr_output = output_wrapper->wlr_output;
-    struct tinywl_server *server = output_wrapper->server;
-    struct wlr_scene *scene = output->server->scene;
+    struct tinywl_output *output = wl_container_of(listener, output, frame);
+    struct wlr_output *wlr_output = output->wlr_output;
+    struct tinywl_server *server = output->server;
+    struct wlr_scene *scene = server->scene;
 
-    struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(
-        scene, output->wlr_output);
+    struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(scene, wlr_output);
+    if (!scene_output) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] No scene output for %s", wlr_output->name);
+        return;
+    }
 
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
 
     if (!wlr_output || !wlr_output->enabled) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Output '%s' not valid or not enabled.", wlr_output ? wlr_output->name : "null");
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Output '%s' not valid or not enabled.", wlr_output->name);
         return;
     }
     if (!wlr_output->renderer || !wlr_output->allocator) {
@@ -870,6 +1171,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
     GLenum err_clear_loop;
     int clear_loop_count = 0;
     while ((err_clear_loop = glGetError()) != GL_NO_ERROR && clear_loop_count < 10) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Clearing OpenGL error: 0x%x", err_clear_loop);
         clear_loop_count++;
     }
 
@@ -923,11 +1225,11 @@ static void output_frame(struct wl_listener *listener, void *data) {
     wlr_log(WLR_INFO, "[RENDER_FRAME] Rendered background for output %s (%dx%d)", 
             wlr_output->name, wlr_output->width, wlr_output->height);
 
-    // Render all toplevel views
+    // Render all toplevel views in reverse order (newest on top)
     struct tinywl_toplevel *toplevel_view;
     int window_count = 0;
     bool content_rendered = false;
-    wl_list_for_each(toplevel_view, &server->toplevels, link) {
+    wl_list_for_each_reverse(toplevel_view, &server->toplevels, link) {
         if (!toplevel_view->xdg_toplevel || !toplevel_view->xdg_toplevel->base ||
             !toplevel_view->xdg_toplevel->base->surface->mapped) {
             continue;
@@ -954,8 +1256,14 @@ static void output_frame(struct wl_listener *listener, void *data) {
         int width = surface->current.width;
         int height = surface->current.height;
 
+        // Flip texture vertically to match RDP coordinate system
         struct wlr_fbox src_box = { .x = 0, .y = 0, .width = width, .height = height };
-        struct wlr_box dst_box = { .x = (int)view_x, .y = (int)view_y, .width = width, .height = height };
+        struct wlr_box dst_box = { 
+            .x = (int)view_x, 
+            .y = wlr_output->height - (int)view_y - height,
+            .width = width, 
+            .height = height 
+        };
 
         wlr_log(WLR_INFO, "[RENDER_FRAME] Window %d: pos=(%d,%d) size=(%dx%d)", 
                 window_count, dst_box.x, dst_box.y, dst_box.width, dst_box.height);
@@ -965,8 +1273,54 @@ static void output_frame(struct wl_listener *listener, void *data) {
             .src_box = src_box,
             .dst_box = dst_box,
             .blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
+            .transform = WL_OUTPUT_TRANSFORM_FLIPPED_180,
         };
         wlr_render_pass_add_texture(pass, &tex_opts);
+    }
+
+    // Render the cursor
+    if (server->cursor && server->cursor_mgr) {
+        struct wlr_xcursor *xcursor = wlr_xcursor_manager_get_xcursor(server->cursor_mgr, "default", 1.0);
+        if (xcursor && xcursor->images[0]) {
+            struct wlr_xcursor_image *image = xcursor->images[0];
+            struct wlr_texture *cursor_texture = wlr_texture_from_pixels(
+                server->renderer, DRM_FORMAT_ARGB8888, image->width * 4,
+                image->width, image->height, image->buffer
+            );
+            if (cursor_texture) {
+                // Adjust cursor position for RDP coordinate system (origin at top-left)
+                int cursor_x = (int)server->cursor->x;
+                int cursor_y = wlr_output->height - (int)server->cursor->y - (int)image->height;
+
+                struct wlr_fbox cursor_src_box = {
+                    .x = 0, .y = 0,
+                    .width = image->width, .height = image->height
+                };
+                struct wlr_box cursor_dst_box = {
+                    .x = cursor_x - image->hotspot_x,
+                    .y = cursor_y - image->hotspot_y,
+                    .width = (int)image->width,
+                    .height = (int)image->height
+                };
+
+                struct wlr_render_texture_options cursor_tex_opts = {
+                    .texture = cursor_texture,
+                    .src_box = cursor_src_box,
+                    .dst_box = cursor_dst_box,
+                    .blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
+                };
+                wlr_render_pass_add_texture(pass, &cursor_tex_opts);
+                wlr_log(WLR_INFO, "[RENDER_FRAME] Rendered cursor at (%d,%d) size=(%dx%d)",
+                        cursor_dst_box.x, cursor_dst_box.y, cursor_dst_box.width, cursor_dst_box.height);
+                wlr_texture_destroy(cursor_texture);
+            } else {
+                wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to create cursor texture");
+            }
+        } else {
+            wlr_log(WLR_ERROR, "[RENDER_FRAME] No cursor image available");
+        }
+    } else {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Cursor or cursor manager not initialized");
     }
 
     wlr_log(WLR_INFO, "[RENDER_FRAME] Rendered %d windows", window_count);
@@ -978,55 +1332,93 @@ static void output_frame(struct wl_listener *listener, void *data) {
         return;
     }
 
-    // Only transmit if content was rendered
-    if (content_rendered) {
+    // Transmit buffer if content was rendered
+    if (content_rendered || server->cursor) {
         void *bdata;
         uint32_t bfmt;
         size_t bstride;
-        if (wlr_buffer_begin_data_ptr_access(rendered_buffer, WLR_BUFFER_DATA_PTR_ACCESS_READ, &bdata, &bfmt, &bstride)) {
+        if (wlr_buffer_begin_data_ptr_access(rendered_buffer, WLR_BUFFER_DATA_PTR_ACCESS_READ | WLR_BUFFER_DATA_PTR_ACCESS_WRITE, &bdata, &bfmt, &bstride)) {
             if (bdata && rendered_buffer->width > 5 && rendered_buffer->height > 5) {
-                unsigned char *pixels_final = (unsigned char *)bdata;
+                unsigned char *pixels = (unsigned char *)bdata;
                 size_t offset = 5 * bstride + 5 * 4;
-                if (bfmt != DRM_FORMAT_XRGB8888 && bfmt != DRM_FORMAT_ARGB8888 && bfmt != 0x34325258) {
-                    wlr_log(WLR_INFO, "[RENDER_FRAME] Readback format 0x%X might not be 4bpp as assumed for offset calculation.", bfmt);
-                }
+
+                // Log pixel data for debugging
                 if (offset + 3 < bstride * rendered_buffer->height) {
-                    unsigned char r_val = pixels_final[offset + 0];
-                    unsigned char g_val = pixels_final[offset + 1];
-                    unsigned char b_val = pixels_final[offset + 2];
-                    unsigned char a_val = pixels_final[offset + 3];
-                    printf("[RENDER_FRAME] RDP Buffer Readback Pixel (5,5) RGBA-order: %02X %02X %02X %02X (Format: 0x%X, Stride: %zu)\n",
-                           r_val, g_val, b_val, a_val, bfmt, bstride);
-                    if (r_val == (unsigned char)(background_color[0]*255.0f) &&
-                        g_val == (unsigned char)(background_color[1]*255.0f) &&
-                        b_val == (unsigned char)(background_color[2]*255.0f) ) {
-                        printf("[RENDER_FRAME] Pixel (5,5) IS BACKGROUND COLOR!\n");
-                    } else {
-                        printf("[RENDER_FRAME] Pixel (5,5) IS NOT PLAIN BACKGROUND (might be client window or other content).\n");
-                    }
-                } else {
-                    wlr_log(WLR_ERROR, "[RENDER_FRAME] Pixel readback offset out of bounds.");
+                    wlr_log(WLR_INFO, "[RENDER_FRAME] Raw pixel data at (5,5): %02X %02X %02X %02X (Format: 0x%X, Stride: %zu)",
+                            pixels[offset + 0], pixels[offset + 1], pixels[offset + 2], pixels[offset + 3], bfmt, bstride);
                 }
+
+                // Convert buffer to BGRA8888 if needed
+                if (bfmt != DRM_FORMAT_BGRA8888) {
+                    wlr_log(WLR_INFO, "[RENDER_FRAME] Converting buffer from format 0x%X to BGRA8888", bfmt);
+                    for (int y = 0; y < rendered_buffer->height; y++) {
+                        for (int x = 0; x < rendered_buffer->width; x++) {
+                            size_t src_offset = y * bstride + x * 4;
+                            unsigned char r, g, b, a;
+
+                            if (bfmt == DRM_FORMAT_XBGR8888 || bfmt == DRM_FORMAT_ABGR8888) {
+                                b = pixels[src_offset + 0];
+                                g = pixels[src_offset + 1];
+                                r = pixels[src_offset + 2];
+                                a = (bfmt == DRM_FORMAT_ABGR8888) ? pixels[src_offset + 3] : 0xFF;
+                            } else if (bfmt == DRM_FORMAT_XRGB8888) {
+                                r = pixels[src_offset + 0];
+                                g = pixels[src_offset + 1];
+                                b = pixels[src_offset + 2];
+                                a = 0xFF;
+                            } else if (bfmt == DRM_FORMAT_ARGB8888) {
+                                a = pixels[src_offset + 0];
+                                r = pixels[src_offset + 1];
+                                g = pixels[src_offset + 2];
+                                b = pixels[src_offset + 3];
+                            } else {
+                                r = pixels[src_offset + 0];
+                                g = pixels[src_offset + 1];
+                                b = pixels[src_offset + 2];
+                                a = (bfmt == DRM_FORMAT_BGRA8888) ? pixels[src_offset + 3] : 0xFF;
+                                wlr_log(WLR_ERROR, "[RENDER_FRAME] Unknown format 0x%X, assuming RGBA order", bfmt);
+                            }
+
+                            pixels[src_offset + 0] = b;
+                            pixels[src_offset + 1] = g;
+                            pixels[src_offset + 2] = r;
+                            pixels[src_offset + 3] = a;
+                        }
+                    }
+                    bfmt = DRM_FORMAT_BGRA8888;
+                    bstride = rendered_buffer->width * 4;
+                }
+
+                // Verify pixel at cursor position
+                if (server->cursor) {
+                    int cursor_pixel_x = (int)server->cursor->x;
+                    int cursor_pixel_y = wlr_output->height - (int)server->cursor->y;
+                    size_t cursor_offset = cursor_pixel_y * bstride + cursor_pixel_x * 4;
+                    if (cursor_offset + 3 < bstride * rendered_buffer->height) {
+                        wlr_log(WLR_INFO, "[RENDER_FRAME] Cursor pixel at (%d,%d): %02X %02X %02X %02X",
+                                cursor_pixel_x, cursor_pixel_y,
+                                pixels[cursor_offset + 0], pixels[cursor_offset + 1],
+                                pixels[cursor_offset + 2], pixels[cursor_offset + 3]);
+                    }
+                }
+
+                wlr_buffer_end_data_ptr_access(rendered_buffer);
+                wlr_log(WLR_INFO, "[RENDER_FRAME] Transmitting buffer with format 0x%X", bfmt);
+                rdp_transmit_surface(rendered_buffer);
+            } else {
+                wlr_log(WLR_ERROR, "[RENDER_FRAME] Invalid buffer dimensions for readback");
+                wlr_buffer_end_data_ptr_access(rendered_buffer);
             }
-            wlr_buffer_end_data_ptr_access(rendered_buffer);
         } else {
-            wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed RDP buffer pixel readback: wlr_buffer_begin_data_ptr_access failed.");
+            wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed RDP buffer pixel readback");
+            rdp_transmit_surface(rendered_buffer);
         }
-
-        rdp_transmit_surface(rendered_buffer);
     } else {
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Skipping RDP transmission: no windows rendered");
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Skipping RDP transmission: no content or cursor");
     }
-
-   
-       
-                
-        
-    
 
     wlr_egl_restore_context(&prev_ctx);
     wlr_output_state_finish(&state);
-
     wlr_scene_output_send_frame_done(scene_output, &now);
 }
 /*
@@ -2244,6 +2636,18 @@ int main(int argc, char *argv[]) {
     }
 
 
+server.seat = wlr_seat_create(server.wl_display, "seat0");
+    if (!server.seat) {
+        wlr_log(WLR_ERROR, "Failed to create seat");
+        wl_display_destroy(server.wl_display);
+        return 1;
+    }
+    server.request_cursor.notify = seat_request_cursor;
+    wl_signal_add(&server.seat->events.request_set_cursor, &server.request_cursor);
+    server.request_set_selection.notify = seat_request_set_selection;
+    wl_signal_add(&server.seat->events.request_set_selection, &server.request_set_selection);
+    wlr_log(WLR_INFO, "Compositor seat 'seat0' created: %p", (void*)server.seat);
+
 
 wlr_log(WLR_INFO, "Setting compositor display");
 wlr_backend_set_compositor_display(server.wl_display);
@@ -2256,23 +2660,27 @@ wlr_backend_set_compositor_display(server.wl_display);
  setenv("WLR_BACKENDS", "RDP",1);
 
 server.backend = wlr_RDP_backend_create(server.wl_display);
-if (!server.backend) {
-    wlr_log(WLR_ERROR, "Failed to create RDP backend");
- //   wlr_egl_free(wlr_egl);
-    wl_display_destroy(server.wl_display);
-    return 1;
-}
+  if (!server.backend) {
+            wlr_log(WLR_ERROR, "Failed to create RDP backend");
+            wlr_seat_destroy(server.seat); 
+            wl_display_destroy(server.wl_display);
+            return 1;
+        }
+        // ***** SET THE GLOBAL SEAT FOR RDP BACKEND *****
+        wlr_RDP_backend_set_compositor_seat(server.seat); 
+        wlr_log(WLR_INFO, "RDP Backend: Compositor seat '%s' (%p) set.", server.seat->name, (void*)server.seat);
+
     } else {
+        wlr_log(WLR_INFO, "Autocreating backend (not RDP).");
         server.backend = wlr_backend_autocreate(wl_display_get_event_loop(server.wl_display), NULL);
-    }
-    if (!server.backend) {
-        wlr_log(WLR_ERROR, "Failed to create backend");
-        server_destroy(&server);
-        return 1;
+        if (!server.backend) {
+            wlr_log(WLR_ERROR, "Failed to autocreate backend");
+            wlr_seat_destroy(server.seat); 
+            wl_display_destroy(server.wl_display);
+            return 1;
+        }
     }
 
-
- 
     server.renderer = wlr_gles2_renderer_create_surfaceless();
     if (server.renderer == NULL) {
         wlr_log(WLR_ERROR, "failed to create wlr_renderer");
@@ -2357,12 +2765,7 @@ const char *vendor = (const char *)glGetString(GL_VENDOR);
     wl_list_init(&server.keyboards);
     server.new_input.notify = server_new_input;
     wl_signal_add(&server.backend->events.new_input, &server.new_input);
-    server.seat = wlr_seat_create(server.wl_display, "seat0");
-    server.request_cursor.notify = seat_request_cursor;
-    wl_signal_add(&server.seat->events.request_set_cursor, &server.request_cursor);
-    server.request_set_selection.notify = seat_request_set_selection;
-    wl_signal_add(&server.seat->events.request_set_selection, &server.request_set_selection);
-
+ 
     const char *socket = wl_display_add_socket_auto(server.wl_display);
     if (!socket) {
         wlr_log(WLR_ERROR, "Unable to create wayland socket");

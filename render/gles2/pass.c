@@ -10,7 +10,8 @@
 #include "render/gles2.h"
 #include "util/matrix.h"
 #include <wlr/render/dmabuf.h> // For wlr_dmabuf_attributes
-
+#include <GLES2/gl2.h> // Add for glGetString
+#include <wlr/util/log.h> // Add for wlr_log
 
 #define MAX_QUADS 86 // 4kb
 
@@ -107,6 +108,16 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
 	bool ok = false;
 
 	push_gles2_debug(renderer); // Assumes push_gles2_debug is defined
+
+
+// Add logging for OpenGL renderer, version, and vendor
+    const char *renderer_str = (const char *)glGetString(GL_RENDERER);
+    const char *version = (const char *)glGetString(GL_VERSION);
+    const char *vendor = (const char *)glGetString(GL_VENDOR);
+    wlr_log(WLR_INFO, "OpenGL Renderer: %s, Version: %s, Vendor: %s", 
+            renderer_str ? renderer_str : "null", 
+            version ? version : "null", 
+            vendor ? vendor : "null");
 
 	if (timer) {
 		// clear disjoint flag

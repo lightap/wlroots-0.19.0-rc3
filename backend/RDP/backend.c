@@ -1,4 +1,6 @@
 #define _XOPEN_SOURCE 700
+#define _POSIX_C_SOURCE 200809L
+#include <wlr/types/wlr_input_device.h>
 #include <assert.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -12,7 +14,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <netinet/tcp.h> 
-
+#include <wlr/types/wlr_pointer.h> 
 #include <wlr/backend/interface.h>      // wlr_backend_impl
 #include <wlr/interfaces/wlr_output.h>  // wlr_output_impl, wlr_output_init
 #include <wlr/render/wlr_renderer.h>    // wlr_renderer_autocreate, wlr_renderer_destroy
@@ -50,6 +52,8 @@
 #include <freerdp/codec/nsc.h>
 #include <freerdp/codec/color.h>
 #include <winpr/stream.h>
+#include <linux/input-event-codes.h> // For BTN_LEFT, BTN_RIGHT, BTN_MIDDLE
+#include <wlr/types/wlr_pointer.h>   // For WLR_AXIS_ORIENTATION_VERTICAL, WLR_AXIS_SOURCE_WHEEL
 
 #if WLR_HAS_RDP_BACKEND
 #include <wlr/backend/RDP.h>
@@ -59,11 +63,15 @@
 #include <wlr/types/wlr_output.h>
 #include <wlr/util/log.h>
 
+#include <wlr/types/wlr_seat.h> // For struct wlr_seat
+#include <wayland-server-protocol.h> // For WL_POINTER_BUTTON_STATE_* etc.
+#include <wlr/types/wlr_input_device.h>
+#include <wlr/types/wlr_pointer.h> 
+
+static int setter_call_count = 0; 
 
 
-
-
-#define MAX_FREERDP_FDS 32  // Add this definition near the top of the file
+//#define MAX_FREERDP_FDS 32  // Add this definition near the top of the file
 
 #define DEFAULT_PIXEL_FORMAT PIXEL_FORMAT_BGRX32
 
@@ -100,11 +108,37 @@ typedef struct fake_listener {
     /* FreedRDP listener placeholders */
 } fake_listener;
 
+ struct wlr_seat *g_rdp_backend_compositor_seat = NULL;
+
+typedef struct {
+    freerdp_peer *peer;
+    pthread_mutex_t lock;
+    bool initialized;
+} RDPPeerManager;
+
+
+// Function to set the global seat (called by the compositor)
+
+void wlr_RDP_backend_set_compositor_seat(struct wlr_seat *seat) {
+    setter_call_count++;
+    wlr_log(WLR_ERROR, "!!!!!!!!!! RDP_BACKEND.C: wlr_RDP_backend_set_compositor_seat (call #%d). Received seat: %p (%s). Current g_seat before set: %p. Addr of g_seat: %p",
+            setter_call_count,
+            (void*)seat, seat ? seat->name : "NULL_ARG_SEAT", 
+            (void*)g_rdp_backend_compositor_seat, 
+            (void*)&g_rdp_backend_compositor_seat); // Log address of the global
+
+    g_rdp_backend_compositor_seat = seat; 
+
+    wlr_log(WLR_ERROR, "!!!!!!!!!! RDP_BACKEND.C: wlr_RDP_backend_set_compositor_seat EXIT. g_rdp_backend_compositor_seat is NOW: %p (%s)",
+            (void*)g_rdp_backend_compositor_seat, 
+            g_rdp_backend_compositor_seat ? g_rdp_backend_compositor_seat->name : "NULL_G_SEAT_AFTER");
+}
+
 /* ------------------------------------------------------------------------
  * wlroots RDP backend definitions
  * ------------------------------------------------------------------------ */
 
-/* Forward declarations */
+/* Forward declarations 
 struct wlr_RDP_output;
 struct wlr_RDP_backend;
 
@@ -113,7 +147,7 @@ struct rdp_peers_item {
     freerdp_peer *peer;
     uint32_t flags;
     struct wl_list link;
-    struct weston_seat *seat;
+    struct wlr_seat *seat;
 };
 
 struct rdp_peer_context {
@@ -138,19 +172,14 @@ struct rdp_peer_context {
     bool frame_ack_pending;
     struct wl_event_source *frame_timer;
     struct wlr_output *current_output;
-};
+};*/
 
 
 
-typedef struct {
-    freerdp_peer *peer;
-    pthread_mutex_t lock;
-    bool initialized;
-} RDPPeerManager;
 
 
-BOOL xf_mouseEvent(rdpInput *input, UINT16 flags, UINT16 x, UINT16 y);
-BOOL xf_extendedMouseEvent(rdpInput *input, UINT16 flags, UINT16 x, UINT16 y);
+static BOOL xf_mouseEvent(rdpInput *input, UINT16 flags, UINT16 x, UINT16 y);
+static BOOL xf_extendedMouseEvent(rdpInput *input, UINT16 flags, UINT16 x, UINT16 y);
 BOOL xf_input_keyboard_event(rdpInput *input, UINT16 flags, UINT16 code);
 BOOL xf_input_unicode_keyboard_event(rdpInput *input, UINT16 flags, UINT16 code);
 
@@ -228,6 +257,8 @@ static BOOL rdp_incoming_peer(freerdp_listener *instance, freerdp_peer *client);
 
 // First declare the function prototype at the top with other declarations
 static int rdp_listener_activity(int fd, uint32_t mask, void *data);
+
+static struct rdp_peer_context *rdp_peer_context_from_input(rdpInput *input);
 
 
 /*
@@ -534,7 +565,7 @@ static bool create_rdp_output_for_client(struct wlr_RDP_backend *backend, freerd
     return true;
 }
 
-
+/*
 static BOOL rdp_peer_activate(freerdp_peer *client) {
     wlr_log(WLR_INFO, "RDP: Peer Activation for client %p", client);
     if (!client || !client->settings) {
@@ -592,6 +623,67 @@ static BOOL rdp_peer_activate(freerdp_peer *client) {
             wlr_log(WLR_INFO, "RDP: Peer %p activated, sending initial frame signal for output '%s'",
                    (void*)client, wlr_output->name ? wlr_output->name : "unnamed");
             wlr_output_send_frame(wlr_output); // Kick off rendering for the new peer
+        } else {
+            wlr_log(WLR_INFO, "RDP: Output found but not enabled, skipping initial frame");
+        }
+    } else {
+        wlr_log(WLR_ERROR, "RDP: Invalid wlr_output structure");
+    }
+
+    return TRUE;
+}*/
+
+static BOOL rdp_peer_activate(freerdp_peer *client) {
+    wlr_log(WLR_INFO, "RDP: Peer Activation for client %p", client);
+    if (!client || !client->settings) {
+        wlr_log(WLR_ERROR, "RDP: Invalid client during activation");
+        set_global_rdp_peer(NULL);
+        return FALSE;
+    }
+    set_global_rdp_peer(client);
+    client->settings->SurfaceCommandsEnabled = TRUE;
+    wlr_log(WLR_INFO, "RDP: Peer Activated Successfully, global_rdp_peer=%p", global_rdp_peer);
+
+    if (!client->context) {
+        wlr_log(WLR_ERROR, "RDP: Invalid client context during activation");
+        return TRUE;
+    }
+
+    struct rdp_peer_context *peerCtx = (struct rdp_peer_context *)client->context;
+    struct wlr_RDP_backend *rdp_be = peerCtx->backend;
+    if (!rdp_be) {
+        wlr_log(WLR_ERROR, "RDP: No backend associated with peer context");
+        return TRUE;
+    }
+
+    // Check if outputs list is initialized and not empty
+    if (!rdp_be->outputs.next || rdp_be->outputs.next == &rdp_be->outputs) {
+        wlr_log(WLR_DEBUG, "RDP: No outputs available in backend, creating one for this client");
+        if (!create_rdp_output_for_client(rdp_be, client)) {
+            wlr_log(WLR_ERROR, "RDP: Failed to create output for client");
+            return TRUE;
+        }
+    }
+
+    // Extract output from the list
+    struct wlr_RDP_output *rdp_output_priv = NULL;
+    rdp_output_priv = wl_container_of(rdp_be->outputs.next, rdp_output_priv, link);
+
+    if (!rdp_output_priv) {
+        wlr_log(WLR_ERROR, "RDP: Could not get RDP output from list");
+        return TRUE;
+    }
+
+    struct wlr_output *wlr_output = &rdp_output_priv->wlr_output;
+    if (wlr_output) {
+        // Set the output in the peer context
+        peerCtx->current_output = wlr_output;
+        wlr_log(WLR_INFO, "RDP: Associated output '%s' with peer %p",
+                wlr_output->name ? wlr_output->name : "unnamed", (void*)client);
+        if (wlr_output->enabled) {
+            wlr_log(WLR_INFO, "RDP: Peer %p activated, sending initial frame signal for output '%s'",
+                   (void*)client, wlr_output->name ? wlr_output->name : "unnamed");
+            wlr_output_send_frame(wlr_output);
         } else {
             wlr_log(WLR_INFO, "RDP: Output found but not enabled, skipping initial frame");
         }
@@ -798,7 +890,7 @@ struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display) {
     }
 
     // Set environment variables for surfaceless rendering
-    setenv("MESA_VK_VERSION_OVERRIDE", "1.2", 1);
+     setenv("MESA_VK_VERSION_OVERRIDE", "1.2", 1);
     setenv("MESA_LOADER_DRIVER_OVERRIDE", "zink", 1);
    // setenv("GALLIUM_DRIVER", "zink", 1);
     setenv("ZINK_DEBUG", "nofp64,nofast_color_clear", 1);
@@ -1050,8 +1142,14 @@ struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display) {
         return NULL;
     }
 
+     if (!g_rdp_backend_compositor_seat) {
+        wlr_log(WLR_ERROR, "RDP Backend: Created, but compositor seat has not been set yet. Will be set before listener starts.");
+    }
+
+    wlr_log(WLR_INFO, "RDP: Backend structure created. Listener will open on backend_start.");
     return &backend->backend;
 }
+
 
 
 
@@ -1143,17 +1241,34 @@ static BOOL xf_suppress_output(rdpContext *context, BYTE allow, const RECTANGLE_
 
     return TRUE;
 }
-// Add implementations for the missing input event handlers
+#include <wlr/types/wlr_keyboard.h> // Ensure this is included for WLR_MODIFIER_* constants
 static BOOL xf_input_synchronize_event(rdpInput *input, UINT32 flags) {
-    __attribute__((unused)) struct rdp_peer_context *peerContext = 
-        (struct rdp_peer_context *)input->context;
-    
+    struct rdp_peer_context *peerCtx = rdp_peer_context_from_input(input);
+    if (!peerCtx || !peerCtx->item.seat || !peerCtx->item.keyboard) {
+        wlr_log(WLR_ERROR, "RDP: Invalid peer context, seat, or keyboard for sync event");
+        return FALSE;
+    }
     wlr_log(WLR_DEBUG, "RDP backend: Synchronize Event - Scroll Lock: %d, Num Lock: %d, Caps Lock: %d, Kana Lock: %d",
-        flags & KBD_SYNC_SCROLL_LOCK ? 1 : 0,
-        flags & KBD_SYNC_NUM_LOCK ? 1 : 0,
-        flags & KBD_SYNC_CAPS_LOCK ? 1 : 0,
-        flags & KBD_SYNC_KANA_LOCK ? 1 : 0);
-
+            flags & KBD_SYNC_SCROLL_LOCK ? 1 : 0,
+            flags & KBD_SYNC_NUM_LOCK ? 1 : 0,
+            flags & KBD_SYNC_CAPS_LOCK ? 1 : 0,
+            flags & KBD_SYNC_KANA_LOCK ? 1 : 0);
+    // Update modifier state without emitting key events
+    struct wlr_keyboard *keyboard = peerCtx->item.keyboard;
+    uint32_t modifiers = 0;
+    if (flags & KBD_SYNC_CAPS_LOCK) modifiers |= WLR_MODIFIER_CAPS;
+    if (flags & KBD_SYNC_NUM_LOCK) modifiers |= WLR_MODIFIER_MOD5; // Fixed: Use WLR_MODIFIER_MOD5 for Num Lock
+    // Note: Kana Lock and Scroll Lock may need additional handling if supported by wlr_keyboard
+    // Notify modifiers (use seat-based notification for compatibility)
+    struct wlr_seat *seat = peerCtx->item.seat;
+    wlr_seat_keyboard_notify_modifiers(seat, &keyboard->modifiers); // Fixed: Use seat-based API
+    // Ensure XKB state is clean
+    struct xkb_state *state = keyboard->xkb_state;
+    if (state) {
+        xkb_state_unref(state);
+        keyboard->xkb_state = xkb_state_new(keyboard->keymap);
+        wlr_log(WLR_DEBUG, "RDP: Reset XKB state during sync event");
+    }
     return TRUE;
 }
 static int rdp_client_activity(int fd, uint32_t mask, void *data)
@@ -1294,6 +1409,16 @@ void rdp_peer_context_free(freerdp_peer *client, rdpContext *ctx) {
         Stream_Free(context->encode_stream, TRUE);
         context->encode_stream = NULL;
     }
+    if (context->item.pointer) {
+        free(context->item.pointer->base.name);
+        free(context->item.pointer);
+        context->item.pointer = NULL;
+    }
+    if (context->item.keyboard) {
+        free(context->item.keyboard->base.name);
+        free(context->item.keyboard);
+        context->item.keyboard = NULL;
+    }
 }
 
 /*
@@ -1329,33 +1454,372 @@ static BOOL rdp_incoming_peer(freerdp_listener *instance, freerdp_peer *client)
     return TRUE;
 }
 
-BOOL xf_mouseEvent(rdpInput *input, UINT16 flags, UINT16 x, UINT16 y) {
-    // Basic implementation that logs the event
- //   struct rdp_peer_context *peerContext = (struct rdp_peer_context *)input->context;
-    wlr_log(WLR_DEBUG, "Mouse Event: flags=%d, x=%d, y=%d", flags, x, y);
+#include <wlr/types/wlr_seat.h>
+#include <wlr/types/wlr_pointer.h>
+
+#ifndef WLR_AXIS_ORIENTATION_VERTICAL
+enum wlr_axis_orientation {
+    WLR_AXIS_ORIENTATION_VERTICAL,
+    WLR_AXIS_ORIENTATION_HORIZONTAL,
+};
+#endif
+
+#ifndef WLR_AXIS_SOURCE_WHEEL
+enum wlr_axis_source {
+    WLR_AXIS_SOURCE_WHEEL,
+    WLR_AXIS_SOURCE_FINGER,
+    WLR_AXIS_SOURCE_CONTINUOUS,
+    WLR_AXIS_SOURCE_WHEEL_TILT,
+};
+#endif
+
+// FreeRDP mouse button flags
+
+
+#include <time.h>
+
+
+#include <wlr/types/wlr_pointer.h>     // For struct wlr_pointer and its event structs
+
+// ... (get_time_msec definition) ...
+// Helper function for time
+static uint32_t get_time_msec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)ts.tv_sec * 1000 + (uint32_t)ts.tv_nsec / 1000000;
+}
+
+
+static struct rdp_peer_context *rdp_peer_context_from_input(rdpInput *input) {
+    if (!input || !input->context) {
+        wlr_log(WLR_ERROR, "Invalid rdpInput or context");
+        return NULL;
+    }
+    return (struct rdp_peer_context *)input->context;
+}   
+/*
+static BOOL xf_mouseEvent(rdpInput *input, UINT16 flags, UINT16 x, UINT16 y) {
+    struct rdp_peer_context *peerCtx = rdp_peer_context_from_input(input);
+    if (!peerCtx) {
+        wlr_log(WLR_ERROR, "No peer context for RDP input");
+        return FALSE;
+    }
+
+    struct wlr_pointer *pointer = peerCtx->item.pointer;
+    if (!pointer) {
+        wlr_log(WLR_ERROR, "No pointer associated with RDP peer");
+        return FALSE;
+    }
+
+    static UINT16 last_x = 0, last_y = 0;
+    double delta_x = (double)x - last_x;
+    double delta_y = (double)y - last_y;
+    last_x = x;
+    last_y = y;
+
+    // Motion event
+    if (delta_x != 0.0 || delta_y != 0.0) {
+        struct wlr_pointer_motion_event motion_event = {
+            .pointer = pointer,
+            .time_msec = get_time_msec(), // Use wlroots timing
+            .delta_x = delta_x,
+            .delta_y = delta_y,
+            .unaccel_dx = delta_x,
+            .unaccel_dy = delta_y,
+        };
+        wl_signal_emit_mutable(&pointer->events.motion, &motion_event);
+        wlr_log(WLR_DEBUG, "RDP mouse motion: delta=(%f,%f)", delta_x, delta_y);
+    }
+
+    // Button events
+    if (flags & (PTR_FLAGS_BUTTON1 | PTR_FLAGS_BUTTON2 | PTR_FLAGS_BUTTON3)) {
+        uint32_t button;
+        enum wl_pointer_button_state state;
+
+        if (flags & PTR_FLAGS_BUTTON1) {
+            button = BTN_LEFT;
+        } else if (flags & PTR_FLAGS_BUTTON2) {
+            button = BTN_RIGHT;
+        } else if (flags & PTR_FLAGS_BUTTON3) {
+            button = BTN_MIDDLE;
+        } else {
+            return TRUE;
+        }
+
+        state = (flags & PTR_FLAGS_DOWN) ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED;
+
+        struct wlr_pointer_button_event button_event = {
+            .pointer = pointer,
+            .time_msec = get_time_msec(), // Use wlroots timing
+            .button = button,
+            .state = state,
+        };
+        wl_signal_emit_mutable(&pointer->events.button, &button_event);
+        wlr_log(WLR_DEBUG, "RDP mouse button: %u, state=%d", button, state);
+    }
+
+    return TRUE;
+}*/
+/*
+static BOOL xf_mouseEvent(rdpInput *input, UINT16 flags, UINT16 x, UINT16 y) {
+    struct rdp_peer_context *peerCtx = rdp_peer_context_from_input(input);
+    if (!peerCtx) {
+        wlr_log(WLR_ERROR, "No peer context for RDP input");
+        return FALSE;
+    }
+
+    struct wlr_pointer *pointer = peerCtx->item.pointer;
+    if (!pointer) {
+        wlr_log(WLR_ERROR, "No pointer associated with RDP peer");
+        return FALSE;
+    }
+
+    // Scale coordinates to match compositor's 1024x768 output
+    const float compositor_width = 1024.0f;
+    const float compositor_height = 768.0f;
+    // Assume client resolution (adjust based on your RDP client)
+    const float client_width = 1024.0f;  // Example, replace with actual client resolution
+    const float client_height = 768.0f; // Example, replace with actual client resolution
+    float scale_x = compositor_width / client_width;
+    float scale_y = compositor_height / client_height;
+    float scaled_x = (float)x * scale_x;
+    float scaled_y = (float)y * scale_y;
+
+    wlr_log(WLR_DEBUG, "RDP input: raw=(%u,%u), scaled=(%f,%f), scale=(%f,%f)",
+            x, y, scaled_x, scaled_y, scale_x, scale_y);
+
+    static UINT16 last_x = 0, last_y = 0;
+    double delta_x = (double)scaled_x - last_x;
+    double delta_y = (double)scaled_y - last_y;
+    last_x = scaled_x;
+    last_y = scaled_y;
+
+    // Motion event
+    if (delta_x != 0.0 || delta_y != 0.0) {
+        struct wlr_pointer_motion_event motion_event = {
+            .pointer = pointer,
+            .time_msec = get_time_msec(),
+            .delta_x = delta_x,
+            .delta_y = delta_y,
+            .unaccel_dx = delta_x,
+            .unaccel_dy = delta_y,
+        };
+        wl_signal_emit_mutable(&pointer->events.motion, &motion_event);
+        wlr_log(WLR_DEBUG, "RDP mouse motion: delta=(%f,%f), scaled_pos=(%f,%f)",
+                delta_x, delta_y, scaled_x, scaled_y);
+    }
+
+    // Button events
+    if (flags & (PTR_FLAGS_BUTTON1 | PTR_FLAGS_BUTTON2 | PTR_FLAGS_BUTTON3)) {
+        uint32_t button;
+        enum wl_pointer_button_state state;
+
+        if (flags & PTR_FLAGS_BUTTON1) {
+            button = BTN_LEFT;
+        } else if (flags & PTR_FLAGS_BUTTON2) {
+            button = BTN_RIGHT;
+        } else if (flags & PTR_FLAGS_BUTTON3) {
+            button = BTN_MIDDLE;
+        } else {
+            return TRUE;
+        }
+
+        state = (flags & PTR_FLAGS_DOWN) ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED;
+
+        struct wlr_pointer_button_event button_event = {
+            .pointer = pointer,
+            .time_msec = get_time_msec(),
+            .button = button,
+            .state = state,
+        };
+        wl_signal_emit_mutable(&pointer->events.button, &button_event);
+        wlr_log(WLR_DEBUG, "RDP mouse button: %u, state=%d, scaled_pos=(%f,%f)",
+                button, state, scaled_x, scaled_y);
+    }
+
+    return TRUE;
+}*/
+
+static BOOL xf_mouseEvent(rdpInput *input, UINT16 flags, UINT16 x, UINT16 y) {
+    struct rdp_peer_context *peerCtx = rdp_peer_context_from_input(input);
+    if (!peerCtx) {
+        wlr_log(WLR_ERROR, "No peer context for RDP input");
+        return FALSE;
+    }
+    struct wlr_pointer *pointer = peerCtx->item.pointer;
+    if (!pointer) {
+        wlr_log(WLR_ERROR, "No pointer associated with RDP peer");
+        return FALSE;
+    }
+    // Scale coordinates to match compositor's 1024x768 output
+    const float compositor_width = 1024.0f;
+    const float compositor_height = 768.0f;
+    // Assume client resolution (adjust based on your RDP client)
+    const float client_width = 1024.0f;  // Example, replace with actual client resolution
+    const float client_height = 768.0f; // Example, replace with actual client resolution
+    float scale_x = compositor_width / client_width;
+    float scale_y = compositor_height / client_height;
+    float scaled_x = (float)x * scale_x;
+    float scaled_y = (float)y * scale_y;
+    wlr_log(WLR_DEBUG, "RDP input: raw=(%u,%u), scaled=(%f,%f), scale=(%f,%f)",
+            x, y, scaled_x, scaled_y, scale_x, scale_y);
+    
+    // Send absolute motion position to the compositor
+    struct wlr_pointer_motion_absolute_event abs_event = {
+        .pointer = pointer,
+        .time_msec = get_time_msec(),
+        .x = scaled_x / compositor_width,
+        .y = scaled_y / compositor_height,
+    };
+    wl_signal_emit_mutable(&pointer->events.motion_absolute, &abs_event);
+    
+    static UINT16 last_x = 0, last_y = 0;
+    double delta_x = (double)scaled_x - last_x;
+    double delta_y = (double)scaled_y - last_y;
+    last_x = scaled_x;
+    last_y = scaled_y;
+    
+    // Motion event
+    if (delta_x != 0.0 || delta_y != 0.0) {
+        struct wlr_pointer_motion_event motion_event = {
+            .pointer = pointer,
+            .time_msec = get_time_msec(),
+            .delta_x = delta_x,
+            .delta_y = delta_y,
+            .unaccel_dx = delta_x,
+            .unaccel_dy = delta_y,
+        };
+        wl_signal_emit_mutable(&pointer->events.motion, &motion_event);
+        wlr_log(WLR_DEBUG, "RDP mouse motion: delta=(%f,%f), scaled_pos=(%f,%f)",
+                delta_x, delta_y, scaled_x, scaled_y);
+    }
+    
+    // Button events - fixed button handling for GTK apps
+    // RDP protocol uses specific bit patterns for buttons
+    // Left button: flags & PTR_FLAGS_BUTTON1 to check if bit is set, flags & PTR_FLAGS_DOWN to check if pressed
+    if (flags & PTR_FLAGS_BUTTON1) {
+        enum wl_pointer_button_state state = (flags & PTR_FLAGS_DOWN) ? 
+                                            WL_POINTER_BUTTON_STATE_PRESSED : 
+                                            WL_POINTER_BUTTON_STATE_RELEASED;
+        struct wlr_pointer_button_event button_event = {
+            .pointer = pointer,
+            .time_msec = get_time_msec(),
+            .button = BTN_LEFT,
+            .state = state,
+        };
+        wl_signal_emit_mutable(&pointer->events.button, &button_event);
+        wlr_log(WLR_DEBUG, "RDP mouse button: BTN_LEFT, state=%d, pos=(%f,%f)",
+                state, scaled_x, scaled_y);
+    }
+    
+    if (flags & PTR_FLAGS_BUTTON2) {
+        enum wl_pointer_button_state state = (flags & PTR_FLAGS_DOWN) ? 
+                                            WL_POINTER_BUTTON_STATE_PRESSED : 
+                                            WL_POINTER_BUTTON_STATE_RELEASED;
+        struct wlr_pointer_button_event button_event = {
+            .pointer = pointer,
+            .time_msec = get_time_msec(),
+            .button = BTN_RIGHT,
+            .state = state,
+        };
+        wl_signal_emit_mutable(&pointer->events.button, &button_event);
+        wlr_log(WLR_DEBUG, "RDP mouse button: BTN_RIGHT, state=%d, pos=(%f,%f)",
+                state, scaled_x, scaled_y);
+    }
+    
+    if (flags & PTR_FLAGS_BUTTON3) {
+        enum wl_pointer_button_state state = (flags & PTR_FLAGS_DOWN) ? 
+                                            WL_POINTER_BUTTON_STATE_PRESSED : 
+                                            WL_POINTER_BUTTON_STATE_RELEASED;
+        struct wlr_pointer_button_event button_event = {
+            .pointer = pointer,
+            .time_msec = get_time_msec(),
+            .button = BTN_MIDDLE,
+            .state = state,
+        };
+        wl_signal_emit_mutable(&pointer->events.button, &button_event);
+        wlr_log(WLR_DEBUG, "RDP mouse button: BTN_MIDDLE, state=%d, pos=(%f,%f)",
+                state, scaled_x, scaled_y);
+    }
+    
     return TRUE;
 }
 
-BOOL xf_extendedMouseEvent(rdpInput *input, UINT16 flags, UINT16 x, UINT16 y) {
- //   struct rdp_peer_context *peerContext = (struct rdp_peer_context *)input->context;
-    wlr_log(WLR_DEBUG, "Extended Mouse Event: flags=%d, x=%d, y=%d", flags, x, y);
+
+
+static BOOL xf_extendedMouseEvent(rdpInput *input, UINT16 flags, UINT16 x, UINT16 y)
+{
+    struct rdp_peer_context *peerContext = (struct rdp_peer_context *)input->context;
+    struct wlr_seat *seat = peerContext->item.seat;
+    if (!seat) {
+        wlr_log(WLR_ERROR, "No seat available for extended mouse event");
+        return TRUE;
+    }
+
+   
+    
+
+    // Notify frame completion
+    wlr_seat_pointer_notify_frame(seat);
+
     return TRUE;
 }
+
+
+#include <wlr/types/wlr_keyboard.h>
 
 BOOL xf_input_keyboard_event(rdpInput *input, UINT16 flags, UINT16 code) {
-  //  struct rdp_peer_context *peerContext = (struct rdp_peer_context *)input->context;
-    wlr_log(WLR_DEBUG, "Keyboard Event: flags=%d, code=%d", flags, code);
+    struct rdp_peer_context *peerCtx = rdp_peer_context_from_input(input);
+    if (!peerCtx || !peerCtx->item.seat || !peerCtx->item.keyboard) {
+        wlr_log(WLR_ERROR, "RDP: Invalid peer context, seat, or keyboard for keyboard event");
+        return FALSE;
+    }
+    
+    struct wlr_keyboard *keyboard = peerCtx->item.keyboard;
+    uint32_t keycode = code; // Adjust FreeRDP scancode
+    bool is_pressed = !(flags & KBD_FLAGS_RELEASE);
+    wlr_log(WLR_DEBUG, "RDP keyboard event: code=%u, keycode=%u, pressed=%d", code, keycode, is_pressed);
+    
+    // Create the keyboard event
+    struct wlr_keyboard_key_event key_event = {
+        .time_msec = get_time_msec(),
+        .keycode = keycode,
+        .update_state = true,
+        .state = is_pressed ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED,
+    };
+    
+    // ONLY emit the key event signal - this will be handled by wlroots and routed
+    // through your keyboard_handle_key callback which already handles seat notification
+    wl_signal_emit_mutable(&keyboard->events.key, &key_event);
+    
+    // DO NOT call wlr_seat_keyboard_notify_key here - it causes duplicate key presses!
+    // The keyboard_handle_key callback will handle notifying the seat
+    
     return TRUE;
 }
 
 BOOL xf_input_unicode_keyboard_event(rdpInput *input, UINT16 flags, UINT16 code) {
-  //  struct rdp_peer_context *peerContext = (struct rdp_peer_context *)input->context;
-    wlr_log(WLR_DEBUG, "Unicode Keyboard Event: flags=%d, code=%d", flags, code);
+    struct rdp_peer_context *peerCtx = rdp_peer_context_from_input(input);
+    if (!peerCtx || !peerCtx->item.seat || !peerCtx->item.keyboard) {  // Also check for keyboard
+        wlr_log(WLR_ERROR, "RDP: Invalid peer context, seat, or keyboard for Unicode keyboard event");
+        return FALSE;
+    }
+    
+    wlr_log(WLR_DEBUG, "RDP Unicode keyboard event: code=%u", code);
+    
+    // Unicode handling is complex - we should use xkb to map from Unicode to keysyms
+    // For now, log that we received a Unicode event but don't process it directly
+    wlr_log(WLR_INFO, "Unicode keyboard events not fully implemented (received: U+%04X)", code);
+    
+    // Return success but don't process the event as a standard key press
+    // In the future, proper Unicode handling would be implemented here
     return TRUE;
 }
 
 
-/* backend.c: rdp_peer_init */
+
+/*
+// backend.c: rdp_peer_init 
 int rdp_peer_init(freerdp_peer *client, struct wlr_RDP_backend *b)
 {
     wlr_log(WLR_ERROR, "RDP: Peer Initialization START");
@@ -1397,6 +1861,18 @@ int rdp_peer_init(freerdp_peer *client, struct wlr_RDP_backend *b)
     peerCtx->ctx = client->context;
     peerCtx->update = client->update;
     peerCtx->settings = client->settings;
+
+     if (g_rdp_backend_compositor_seat) {
+        peerCtx->item.seat = g_rdp_backend_compositor_seat;
+        wlr_log(WLR_INFO, "RDP: Peer %p using global compositor seat '%s'",
+                (void*)client, g_rdp_backend_compositor_seat->name);
+    } else {
+        wlr_log(WLR_ERROR, "RDP: Global compositor seat (g_rdp_backend_compositor_seat) is NULL when initializing peer %p. Input will not work.", (void*)client);
+        peerCtx->item.seat = NULL; // Explicitly set to NULL
+        // You might consider this a fatal error and return -1,
+        // or let it proceed without input capabilities.
+        // For now, let's log and continue, but input won't function.
+    }
 
     // Configure basic RDP settings
     rdpSettings *settings = client->context->settings;
@@ -1504,6 +1980,324 @@ int rdp_peer_init(freerdp_peer *client, struct wlr_RDP_backend *b)
     wlr_log(WLR_ERROR, "RDP: Peer Initialization COMPLETE");
     return 0;
 }
+
+*/
+// In wlr_RDP_backend.c, near the top with other wlroots includes
+
+#include <wlr/types/wlr_input_device.h> 
+#include <wlr/backend/interface.h>
+#include <wlr/types/wlr_input_device.h> // <<<< THIS IS THE IMPORTANT ONE
+#include <wlr/types/wlr_pointer.h>
+#include <wlr/types/wlr_keyboard.h> // If you add virtual keyboard later
+#include <wlr/types/wlr_seat.h>
+#include <wlr/util/log.h>
+
+
+
+
+int rdp_peer_init(freerdp_peer *client, struct wlr_RDP_backend *b)
+{
+    wlr_log(WLR_INFO, "RDP: Peer Initialization START for client %p", (void*)client);
+
+    // Validate inputs
+    if (!client) {
+        wlr_log(WLR_ERROR, "RDP: Invalid client (NULL)");
+        return -1;
+    }
+    if (!b) {
+        wlr_log(WLR_ERROR, "RDP: Invalid backend (NULL) for client %p", (void*)client);
+        return -1;
+    }
+
+    // Ensure peers list is initialized
+    if (wl_list_empty(&b->peers)) {
+        wlr_log(WLR_DEBUG, "RDP: Initializing backend peers list for client %p", (void*)client);
+        wl_list_init(&b->peers);
+    }
+
+    // Set context size and callbacks
+    client->ContextSize = sizeof(struct rdp_peer_context);
+    client->ContextNew = (psPeerContextNew)rdp_peer_context_new;
+    client->ContextFree = (psPeerContextFree)rdp_peer_context_free;
+
+    // Create peer context
+    if (!freerdp_peer_context_new(client)) {
+        wlr_log(WLR_ERROR, "RDP: freerdp_peer_context_new failed for client %p", (void*)client);
+        return -1;
+    }
+
+    struct rdp_peer_context *peerCtx = (struct rdp_peer_context *)client->context;
+    if (!peerCtx) {
+        wlr_log(WLR_ERROR, "RDP: client->context is NULL for client %p", (void*)client);
+        return -1;
+    }
+
+    // Initialize context fields
+    peerCtx->backend = b;
+    peerCtx->peer = client;
+    peerCtx->update = client->update;
+    peerCtx->settings = client->settings;
+
+    // Assign global compositor seat
+    if (g_rdp_backend_compositor_seat) {
+        peerCtx->item.seat = g_rdp_backend_compositor_seat;
+        wlr_log(WLR_INFO, "RDP: Peer %p assigned seat '%s' (%p)",
+                (void*)client, g_rdp_backend_compositor_seat->name, (void*)g_rdp_backend_compositor_seat);
+    } else {
+        wlr_log(WLR_INFO, "RDP: Global seat is NULL for peer %p", (void*)client);
+        peerCtx->item.seat = NULL;
+    }
+
+    // Create wlr_pointer
+    peerCtx->item.pointer = calloc(1, sizeof(struct wlr_pointer));
+    if (!peerCtx->item.pointer) {
+        wlr_log(WLR_ERROR, "RDP: Failed to allocate pointer for client %p", (void*)client);
+        freerdp_peer_context_free(client);
+        return -1;
+    }
+
+    // Initialize wlr_input_device (embedded in wlr_pointer)
+    struct wlr_input_device *dev = &peerCtx->item.pointer->base;
+    dev->type = WLR_INPUT_DEVICE_POINTER;
+    dev->name = strdup("rdp-pointer");
+    if (!dev->name) {
+        wlr_log(WLR_ERROR, "RDP: Failed to allocate name for pointer device");
+        free(peerCtx->item.pointer);
+        peerCtx->item.pointer = NULL;
+        freerdp_peer_context_free(client);
+        return -1;
+    }
+    dev->data = peerCtx->item.pointer; // Optional, for wlr_pointer_from_input_device
+    wl_signal_init(&dev->events.destroy);
+
+    // Initialize wlr_pointer signals
+    struct wlr_pointer *pointer = peerCtx->item.pointer;
+    wl_signal_init(&pointer->events.motion);
+    wl_signal_init(&pointer->events.motion_absolute);
+    wl_signal_init(&pointer->events.button);
+    wl_signal_init(&pointer->events.axis);
+    wl_signal_init(&pointer->events.frame);
+    wl_signal_init(&pointer->events.swipe_begin);
+    wl_signal_init(&pointer->events.swipe_update);
+    wl_signal_init(&pointer->events.swipe_end);
+    wl_signal_init(&pointer->events.pinch_begin);
+    wl_signal_init(&pointer->events.pinch_update);
+    wl_signal_init(&pointer->events.pinch_end);
+    wl_signal_init(&pointer->events.hold_begin);
+    wl_signal_init(&pointer->events.hold_end);
+
+    wlr_log(WLR_DEBUG, "RDP: Created pointer device %p for client %p", (void*)dev, (void*)client);
+// Create virtual keyboard
+struct wlr_keyboard *keyboard = calloc(1, sizeof(struct wlr_keyboard));
+if (!keyboard) {
+    wlr_log(WLR_ERROR, "RDP: Failed to allocate keyboard for client %p", (void*)client);
+    free(dev->name);
+    free(peerCtx->item.pointer);
+    peerCtx->item.pointer = NULL;
+    freerdp_peer_context_free(client);
+    return -1;
+}
+
+// Initialize wlr_input_device for keyboard
+struct wlr_input_device *keyboard_dev = &keyboard->base;
+keyboard_dev->type = WLR_INPUT_DEVICE_KEYBOARD;
+keyboard_dev->name = strdup("rdp-keyboard");
+if (!keyboard_dev->name) {
+    wlr_log(WLR_ERROR, "RDP: Failed to allocate name for keyboard device");
+    free(keyboard);
+    free(dev->name);
+    free(peerCtx->item.pointer);
+    peerCtx->item.pointer = NULL;
+    freerdp_peer_context_free(client);
+    return -1;
+}
+keyboard_dev->data = keyboard;
+wl_signal_init(&keyboard_dev->events.destroy);
+
+// Initialize wlr_keyboard signals
+wl_signal_init(&keyboard->events.key);
+wl_signal_init(&keyboard->events.modifiers);
+wl_signal_init(&keyboard->events.keymap);
+wl_signal_init(&keyboard->events.repeat_info); // Added to prevent crash
+
+// Initialize XKB context and keymap
+struct xkb_context *xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+if (!xkb_ctx) {
+    wlr_log(WLR_ERROR, "RDP: Failed to create XKB context for keyboard");
+    free(keyboard_dev->name);
+    free(keyboard);
+    free(dev->name);
+    free(peerCtx->item.pointer);
+    peerCtx->item.pointer = NULL;
+    freerdp_peer_context_free(client);
+    return -1;
+}
+
+struct xkb_keymap *xkb_keymap = xkb_keymap_new_from_names(xkb_ctx, NULL, XKB_KEYMAP_COMPILE_NO_FLAGS);
+if (!xkb_keymap) {
+    wlr_log(WLR_ERROR, "RDP: Failed to create XKB keymap for keyboard");
+    xkb_context_unref(xkb_ctx);
+    free(keyboard_dev->name);
+    free(keyboard);
+    free(dev->name);
+    free(peerCtx->item.pointer);
+    peerCtx->item.pointer = NULL;
+    freerdp_peer_context_free(client);
+    return -1;
+}
+
+// Set the keymap on the keyboard
+wlr_keyboard_set_keymap(keyboard, xkb_keymap);
+xkb_keymap_unref(xkb_keymap);
+xkb_context_unref(xkb_ctx);
+
+wlr_log(WLR_DEBUG, "RDP: Keyboard keymap initialized for device %p", (void*)keyboard_dev);
+wlr_log(WLR_DEBUG, "RDP: Created keyboard device %p for client %p", (void*)keyboard_dev, (void*)client);
+
+// Store keyboard in peer context
+peerCtx->item.keyboard = keyboard;
+
+// Emit new_input signal for keyboard
+wl_signal_emit_mutable(&peerCtx->backend->backend.events.new_input, keyboard_dev);
+wlr_log(WLR_INFO, "RDP: Emitted new_input for keyboard device '%s' (%p) for peer %p",
+        keyboard_dev->name, (void*)keyboard_dev, (void*)client);
+
+// Configure RDP settings
+    rdpSettings *settings = peerCtx->settings;
+    if (!settings) {
+        wlr_log(WLR_ERROR, "RDP: peerCtx->settings is NULL for peer %p", (void*)client);
+        free(dev->name);
+        free(peerCtx->item.pointer);
+        peerCtx->item.pointer = NULL;
+        freerdp_peer_context_free(client);
+        return -1;
+    }
+
+    settings->ServerMode = TRUE;
+    settings->ColorDepth = 32;
+    settings->NlaSecurity = FALSE;
+    settings->TlsSecurity = FALSE;
+    settings->RdpSecurity = TRUE;
+    settings->UseRdpSecurityLayer = TRUE;
+    settings->OsMajorType = OSMAJORTYPE_UNIX;
+    settings->OsMinorType = OSMINORTYPE_PSEUDO_XSERVER;
+    settings->RefreshRect = TRUE;
+    settings->RemoteFxCodec = FALSE;
+    settings->NSCodec = TRUE;
+    settings->FrameMarkerCommandEnabled = TRUE;
+    settings->SurfaceFrameMarkerEnabled = TRUE;
+    settings->RemoteApplicationMode = FALSE;
+    settings->SupportGraphicsPipeline = TRUE;
+    settings->SupportMonitorLayoutPdu = TRUE;
+    settings->RedirectClipboard = TRUE;
+    settings->HasExtendedMouseEvent = TRUE;
+    settings->HasHorizontalWheel = TRUE;
+
+    // Initialize FreeRDP peer
+    if (!client->Initialize(client)) {
+        wlr_log(WLR_ERROR, "RDP: client->Initialize failed for peer %p", (void*)client);
+        free(dev->name);
+        free(peerCtx->item.pointer);
+        peerCtx->item.pointer = NULL;
+        freerdp_peer_context_free(client);
+        return -1;
+    }
+
+    // Set FreeRDP callbacks
+    client->Capabilities = xf_peer_capabilities;
+    client->PostConnect = xf_peer_post_connect;
+    client->Activate = rdp_peer_activate;
+    client->AdjustMonitorsLayout = xf_peer_adjust_monitor_layout;
+    if (client->update) {
+        client->update->SuppressOutput = (pSuppressOutput)xf_suppress_output;
+        wlr_log(WLR_DEBUG, "RDP: Registered SuppressOutput callback for peer %p", (void*)client);
+    }
+
+    // Set input handlers
+    if (client->input) {
+        rdpInput *rdp_input = client->input;
+        rdp_input->SynchronizeEvent = xf_input_synchronize_event;
+        rdp_input->MouseEvent = xf_mouseEvent;
+        rdp_input->ExtendedMouseEvent = xf_extendedMouseEvent;
+        rdp_input->KeyboardEvent = xf_input_keyboard_event;
+        rdp_input->UnicodeKeyboardEvent = xf_input_unicode_keyboard_event;
+    } else {
+        wlr_log(WLR_ERROR, "RDP: client->input is NULL for peer %p", (void*)client);
+    }
+
+    // Add event handles to Wayland event loop
+    HANDLE handles[MAX_FREERDP_FDS];
+    int handle_count = client->GetEventHandles ? client->GetEventHandles(client, handles, MAX_FREERDP_FDS) : 0;
+    if (handle_count <= 0) {
+        wlr_log(WLR_ERROR, "RDP: Unable to retrieve event handles (count: %d) for peer %p", handle_count, (void*)client);
+        free(dev->name);
+        free(peerCtx->item.pointer);
+        peerCtx->item.pointer = NULL;
+        freerdp_peer_context_free(client);
+        return -1;
+    }
+
+    struct wl_event_loop *loop = wl_display_get_event_loop(b->display);
+    if (!loop) {
+        wlr_log(WLR_ERROR, "RDP: Failed to get event loop for peer %p", (void*)client);
+        free(dev->name);
+        free(peerCtx->item.pointer);
+        peerCtx->item.pointer = NULL;
+        freerdp_peer_context_free(client);
+        return -1;
+    }
+
+    memset(peerCtx->events, 0, sizeof(peerCtx->events));
+    for (int i = 0; i < handle_count && i < MAX_FREERDP_FDS; i++) {
+        int fd = GetEventFileDescriptor(handles[i]);
+        if (fd < 0) {
+            wlr_log(WLR_ERROR, "RDP: Invalid fd for handle %d for peer %p", i, (void*)client);
+            continue;
+        }
+        peerCtx->events[i] = wl_event_loop_add_fd(loop, fd, WL_EVENT_READABLE, rdp_client_activity, client);
+        if (!peerCtx->events[i]) {
+            wlr_log(WLR_ERROR, "RDP: Failed to add fd %d to event loop for peer %p", fd, (void*)client);
+            for (int j = 0; j < i; j++) {
+                if (peerCtx->events[j]) {
+                    wl_event_source_remove(peerCtx->events[j]);
+                    peerCtx->events[j] = NULL;
+                }
+            }
+            free(dev->name);
+            free(peerCtx->item.pointer);
+            peerCtx->item.pointer = NULL;
+            freerdp_peer_context_free(client);
+            return -1;
+        }
+    }
+
+    // Finalize peer item
+    wl_list_init(&peerCtx->item.link);
+    peerCtx->item.peer = client;
+    peerCtx->item.flags = RDP_PEER_ACTIVATED | RDP_PEER_OUTPUT_ENABLED;
+    wl_list_insert(&b->peers, &peerCtx->item.link);
+
+    // Optional RAIL initialization
+    if (settings->RemoteApplicationMode) {
+        if (rdp_rail_peer_init(client, peerCtx) != 1) {
+            wlr_log(WLR_ERROR, "RDP: RAIL initialization failed for peer %p", (void*)client);
+        }
+    }
+
+    // Emit new_input signal after all setup
+    if (peerCtx->backend && peerCtx->item.pointer) {
+        wl_signal_emit_mutable(&peerCtx->backend->backend.events.new_input, &peerCtx->item.pointer->base);
+        wlr_log(WLR_INFO, "RDP: Emitted new_input for pointer device '%s' (%p) for peer %p",
+                dev->name, (void*)dev, (void*)client);
+    } else {
+        wlr_log(WLR_ERROR, "RDP: Could not emit new_input for peer %p, backend=%p, pointer=%p",
+                (void*)client, (void*)peerCtx->backend, (void*)peerCtx->item.pointer);
+    }
+
+    wlr_log(WLR_INFO, "RDP: Peer Initialization COMPLETE for client %p", (void*)client);
+    return 0;
+}
+
 // Add event loop integration for the RDP listener
 /**/
 
@@ -1877,8 +2671,26 @@ static struct wlr_RDP_output *rdp_output_create(
  * ------------------------------------------------------------------------ */
 static bool rdp_backend_start(struct wlr_backend *wlr_backend) {
     struct wlr_RDP_backend *backend = RDP_backend_from_backend(wlr_backend);
+    wlr_log(WLR_ERROR, "!!!!!!!!!! RDP_BACKEND.C: rdp_backend_start ENTER. Checking g_rdp_backend_compositor_seat: %p (%s). Addr of g_seat: %p. Setter call count was: %d", 
+            (void*)g_rdp_backend_compositor_seat, 
+            g_rdp_backend_compositor_seat ? g_rdp_backend_compositor_seat->name : "NULL_G_SEAT_AT_START",
+            (void*)&g_rdp_backend_compositor_seat, // Log address of the global
+            setter_call_count);
+
+    if (!g_rdp_backend_compositor_seat) {
+        wlr_log(WLR_ERROR, "RDP: [FATAL CHECK] Cannot start backend, compositor seat (g_rdp_backend_compositor_seat) is not set!");
+        return false;
+    }
     wlr_log(WLR_INFO, "Starting RDP backend");
     backend->started = true; // Set early to allow commits
+    
+
+  // CRITICAL: Ensure the compositor seat has been set by now.
+    if (!g_rdp_backend_compositor_seat) {
+        wlr_log(WLR_ERROR, "RDP: Cannot start backend, compositor seat is not set! Call wlr_RDP_backend_set_compositor_seat() first.");
+        return false;
+    }
+
     struct wlr_RDP_output *out = rdp_output_create(backend, "rdp-0", 1024, 768, 60);
     if (!out) {
         wlr_log(WLR_ERROR, "Failed to create RDP output");

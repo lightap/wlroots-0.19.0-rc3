@@ -18,6 +18,9 @@ struct wlr_RDP_output;
 struct wlr_buffer;
 struct wlr_RDP_backend;
 
+#define MAX_FREERDP_FDS 32  // Add this definition near the top of the file
+
+
 /**
  * The RDP backend structure, storing global backend state and
  * references to all RDP outputs and peers.
@@ -35,8 +38,11 @@ struct wlr_RDP_backend {
     struct wl_event_source *fd_event_sources[32];
     int fd_count;
       struct wlr_egl *egl; 
-    struct wlr_egl *egl_instance;       
+    struct wlr_egl *egl_instance; 
+     struct wlr_seat *compositor_seat;       
 };
+
+
 
 /**
  * Our per-output structure: one RDP "virtual monitor."
@@ -56,6 +62,8 @@ struct wlr_RDP_output {
  * Entry point: create an RDP backend
  */
 struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display);
+
+void wlr_RDP_backend_set_compositor_seat(struct wlr_seat *seat);
 
 /**
  * Create an RDP output
@@ -88,4 +96,58 @@ freerdp_peer* get_global_rdp_peer(void);
  */
 void rdp_transmit_surface(struct wlr_buffer *buffer);
 
+
+struct wlr_RDP_output;
+struct wlr_RDP_backend;
+
+// At the top of the file with other includes and defines
+struct rdp_peers_item {
+    freerdp_peer *peer;
+    uint32_t flags;
+    struct wl_list link;
+    struct wlr_seat *seat;
+
+           // This will point to g_rdp_backend_compositor_seat
+    struct wlr_input_device *pointer_dev; // <<<< ADD THIS MEMBER
+    struct wlr_input_device *keyboard_dev; 
+
+
+    //    struct wlr_input_device *pointer_dev;  // The WLR input device
+        struct wlr_pointer *pointer;   
+        struct wlr_keyboard *keyboard;        // The actual pointer instance
+        // Any other input-related fields...
+    
+};
+
+struct rdp_peer_context {
+    rdpContext context;
+    struct wlr_RDP_backend *backend;
+    struct wlr_output *output;
+    freerdp_peer *peer;
+    rdpContext *ctx;
+    rdpUpdate *update;
+    rdpSettings *settings;
+    NSC_CONTEXT* nsc_context;
+    wStream* encode_stream;
+    
+    // Add these missing members
+    void *vcm;  // Virtual channel manager
+    struct wl_event_source *events[MAX_FREERDP_FDS];
+    int loop_task_event_source_fd;
+    struct wl_event_source *loop_task_event_source;
+    struct wl_list loop_task_list;
+    
+    struct rdp_peers_item item;
+
+    bool frame_ack_pending;
+    struct wl_event_source *frame_timer;
+    struct wlr_output *current_output;
+void *server;
+
+
+
+};
+
+
+extern struct wlr_seat *g_rdp_backend_compositor_seat;
 #endif
