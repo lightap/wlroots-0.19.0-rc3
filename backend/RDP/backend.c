@@ -117,6 +117,7 @@ typedef struct {
 } RDPPeerManager;
 
 
+void *rdp_transmit_worker(void *arg) ;
 // Function to set the global seat (called by the compositor)
 
 void wlr_RDP_backend_set_compositor_seat(struct wlr_seat *seat) {
@@ -316,103 +317,184 @@ void set_global_rdp_peer(freerdp_peer* peer) {
 }
 
 
+#include <pthread.h>
+#include <time.h>
+#include <wlr/types/wlr_buffer.h>
+#include <wlr/types/wlr_output.h>
+#include <freerdp/freerdp.h>
 
-void rdp_transmit_surface(struct wlr_buffer *buffer) {
-    static int transmission_attempts = 0;
-    transmission_attempts++;
+struct rdp_transmit_job {
+    struct wlr_buffer *buffer;
+    freerdp_peer *peer;
+    void *data;
+    uint32_t format;
+    size_t stride;
+    int width;
+    int height;
+};
 
-    freerdp_peer *peer = get_global_rdp_peer();
-    
-    wlr_log(WLR_ERROR, "RDP Transmission Attempt #%d", transmission_attempts);
-    wlr_log(WLR_ERROR, "Transmitting surface: peer=%p", (void*)peer);
+// Check if the RDP peer is still connected
+static bool is_rdp_peer_connected(freerdp_peer *peer) {
+    if (!peer || !peer->context) {
+        wlr_log(WLR_DEBUG, "RDP peer or context is NULL");
+        return false;
+    }
+    // Check if the peer's socket is still active
+    if (!peer->CheckFileDescriptor(peer)) {
+        wlr_log(WLR_DEBUG, "RDP peer socket is disconnected");
+        return false;
+    }
+    return true;
+}
 
-    if (!peer || !peer->context || !peer->context->update) {
-        wlr_log(WLR_ERROR, "Invalid peer state during surface transmission");
-        return;
+void *rdp_transmit_worker(void *arg) {
+    struct rdp_transmit_job *job = arg;
+    struct wlr_buffer *buffer = job->buffer;
+    freerdp_peer *peer = job->peer;
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    if (!is_rdp_peer_connected(peer)) {
+        wlr_log(WLR_ERROR, "RDP peer disconnected, skipping transmission");
+        wlr_buffer_unlock(buffer);
+        free(job);
+        return NULL;
     }
 
     struct rdp_peer_context *peerContext = (struct rdp_peer_context *)peer->context;
     rdpSettings *settings = peer->context->settings;
     rdpUpdate *update = peer->context->update;
 
+    wlr_log(WLR_DEBUG, "Transmitting surface: width=%d, height=%d, stride=%zu, format=0x%x",
+            job->width, job->height, job->stride, job->format);
+
+    SURFACE_BITS_COMMAND cmd = { 0 };
+    cmd.cmdType = CMDTYPE_SET_SURFACE_BITS;
+    cmd.bmp.bpp = 32;
+    cmd.bmp.width = job->width;
+    cmd.bmp.height = job->height;
+    cmd.destLeft = 0;
+    cmd.destTop = 0;
+    cmd.destRight = job->width;
+    cmd.destBottom = job->height;
+
+    if (settings->NSCodec && peerContext->nsc_context && peerContext->encode_stream &&
+        job->width * job->height > 1920 * 1080) {
+        wlr_log(WLR_DEBUG, "Using NSCodec compression");
+        cmd.bmp.codecID = settings->NSCodecId;
+
+        if (!Stream_Buffer(peerContext->encode_stream)) {
+            wlr_log(WLR_ERROR, "Invalid encode stream");
+            wlr_buffer_unlock(buffer);
+            free(job);
+            return NULL;
+        }
+
+        Stream_Clear(peerContext->encode_stream);
+        Stream_SetPosition(peerContext->encode_stream, 0);
+
+        BOOL nsc_result = nsc_compose_message(peerContext->nsc_context,
+                                            peerContext->encode_stream,
+                                            (BYTE *)job->data,
+                                            job->width,
+                                            job->height,
+                                            job->stride);
+        if (!nsc_result) {
+            wlr_log(WLR_ERROR, "NSCodec compression failed");
+            wlr_buffer_unlock(buffer);
+            free(job);
+            return NULL;
+        }
+
+        cmd.bmp.bitmapDataLength = Stream_GetPosition(peerContext->encode_stream);
+        cmd.bmp.bitmapData = Stream_Buffer(peerContext->encode_stream);
+    } else {
+        wlr_log(WLR_DEBUG, "Using raw bitmap transmission");
+        cmd.bmp.codecID = 0;
+        cmd.bmp.bitmapDataLength = job->stride * job->height;
+        cmd.bmp.bitmapData = (BYTE *)job->data;
+    }
+
+    if (!update->SurfaceBits(update->context, &cmd)) {
+        wlr_log(WLR_ERROR, "Failed to send surface bits - codec: %d, length: %u",
+                cmd.bmp.codecID, cmd.bmp.bitmapDataLength);
+    } else {
+        wlr_log(WLR_DEBUG, "Surface bits sent successfully");
+    }
+
+    wlr_buffer_unlock(buffer);
+    free(job);
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed_ms = (end.tv_sec - start.tv_sec) * 1000.0 +
+                        (end.tv_nsec - start.tv_nsec) / 1000000.0;
+    wlr_log(WLR_INFO, "rdp_transmit_worker took %.2f ms", elapsed_ms);
+
+    return NULL;
+}
+
+void rdp_transmit_surface(struct wlr_buffer *buffer) {
+    static int transmission_attempts = 0;
+    static struct timespec last_transmit = {0};
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double elapsed_ms = (now.tv_sec - last_transmit.tv_sec) * 1000.0 +
+                        (now.tv_nsec - last_transmit.tv_nsec) / 1000000.0;
+    if (elapsed_ms < 50.0) return; // Limit to ~20 FPS to reduce load
+    last_transmit = now;
+
+    transmission_attempts++;
+    wlr_log(WLR_INFO, "RDP Transmission Attempt #%d", transmission_attempts);
+
+    freerdp_peer *peer = get_global_rdp_peer();
+    if (!is_rdp_peer_connected(peer)) {
+        wlr_log(WLR_ERROR, "Invalid or disconnected RDP peer, skipping transmission");
+        return;
+    }
+
     void *data = NULL;
     uint32_t format = 0;
     size_t stride = 0;
-    
-    if (!wlr_buffer_begin_data_ptr_access(buffer, 
-                                         WLR_BUFFER_DATA_PTR_ACCESS_READ, 
-                                         &data, 
-                                         &format, 
+    if (!wlr_buffer_begin_data_ptr_access(buffer,
+                                         WLR_BUFFER_DATA_PTR_ACCESS_READ,
+                                         &data,
+                                         &format,
                                          &stride)) {
         wlr_log(WLR_ERROR, "Failed to access buffer data");
         return;
     }
 
-    wlr_log(WLR_ERROR, "Transmitting surface details:"
-            " width=%d, height=%d, stride=%zu, format=0x%x", 
-            buffer->width, buffer->height, stride, format);
-
-    // Configure surface bits command
-    SURFACE_BITS_COMMAND cmd = { 0 };
-    cmd.cmdType = CMDTYPE_SET_SURFACE_BITS;
-    cmd.bmp.bpp = 32;
-    cmd.bmp.width = buffer->width;
-    cmd.bmp.height = buffer->height;
-    cmd.destLeft = 0;
-    cmd.destTop = 0;
-    cmd.destRight = buffer->width;
-    cmd.destBottom = buffer->height;
-
-    // Try NSCodec if available
-    if (settings->NSCodec && peerContext->nsc_context && peerContext->encode_stream) {
-        wlr_log(WLR_DEBUG, "Using NSCodec compression");
-        cmd.bmp.codecID = settings->NSCodecId;
-        
-        Stream_Clear(peerContext->encode_stream);
-        Stream_SetPosition(peerContext->encode_stream, 0);
-
-        wlr_log(WLR_DEBUG, "NSCodec state - context: %p, stream: %p", 
-                (void*)peerContext->nsc_context, 
-                (void*)peerContext->encode_stream);
-
-        BOOL nsc_result = nsc_compose_message(peerContext->nsc_context,
-                                            peerContext->encode_stream,
-                                            (BYTE *)data,
-                                            buffer->width,
-                                            buffer->height,
-                                            stride);
-
-        if (!nsc_result) {
-            wlr_log(WLR_ERROR, "NSCodec compression failed");
-            wlr_buffer_end_data_ptr_access(buffer);
-            return;
-        }
-
-        size_t stream_pos = Stream_GetPosition(peerContext->encode_stream);
-        wlr_log(WLR_DEBUG, "NSCodec compressed size: %zu bytes", stream_pos);
-
-        cmd.bmp.bitmapDataLength = stream_pos;
-        cmd.bmp.bitmapData = Stream_Buffer(peerContext->encode_stream);
-
-    } else {
-        wlr_log(WLR_DEBUG, "Using raw bitmap transmission (NSCodec not available - settings: %d, context: %p)", 
-                settings->NSCodec,
-                peerContext->nsc_context);
-        // Fall back to raw bitmap if NSCodec not available
-        cmd.bmp.codecID = 0;  // Raw bitmap
-        cmd.bmp.bitmapDataLength = stride * buffer->height;
-        cmd.bmp.bitmapData = (BYTE *)data;
-    }
-
-    if (!update->SurfaceBits(update->context, &cmd)) {
-        wlr_log(WLR_ERROR, "Failed to send surface bits - codec: %d, length: %u", 
-                cmd.bmp.codecID, cmd.bmp.bitmapDataLength);
+    struct wlr_buffer *locked_buffer = wlr_buffer_lock(buffer);
+    if (!locked_buffer) {
+        wlr_log(WLR_ERROR, "Failed to lock buffer");
         wlr_buffer_end_data_ptr_access(buffer);
         return;
     }
-
-    wlr_log(WLR_DEBUG, "Surface bits sent successfully");
     wlr_buffer_end_data_ptr_access(buffer);
+
+    struct rdp_transmit_job *job = calloc(1, sizeof(*job));
+    if (!job) {
+        wlr_log(WLR_ERROR, "Failed to allocate rdp_transmit_job");
+        wlr_buffer_unlock(locked_buffer);
+        return;
+    }
+    job->buffer = locked_buffer;
+    job->peer = peer;
+    job->data = data;
+    job->format = format;
+    job->stride = stride;
+    job->width = buffer->width;
+    job->height = buffer->height;
+
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, rdp_transmit_worker, job) != 0) {
+        wlr_log(WLR_ERROR, "Failed to create transmission thread");
+        wlr_buffer_unlock(locked_buffer);
+        free(job);
+        return;
+    }
+    pthread_detach(thread);
 }
 static int rdp_listener_activity(int fd, uint32_t mask, void *data) {
     freerdp_listener* instance = (freerdp_listener*)data;
