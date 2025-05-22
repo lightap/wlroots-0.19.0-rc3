@@ -323,15 +323,6 @@ void set_global_rdp_peer(freerdp_peer* peer) {
 #include <wlr/types/wlr_output.h>
 #include <freerdp/freerdp.h>
 
-struct rdp_transmit_job {
-    struct wlr_buffer *buffer;
-    freerdp_peer *peer;
-    void *data;
-    uint32_t format;
-    size_t stride;
-    int width;
-    int height;
-};
 
 // Check if the RDP peer is still connected
 static bool is_rdp_peer_connected(freerdp_peer *peer) {
@@ -347,6 +338,28 @@ static bool is_rdp_peer_connected(freerdp_peer *peer) {
     return true;
 }
 
+#include <pthread.h>
+#include <time.h>
+#include <wlr/types/wlr_buffer.h>
+#include <wlr/types/wlr_output.h>
+#include <freerdp/freerdp.h>
+
+struct rdp_transmit_job {
+    struct wlr_buffer *buffer;
+    freerdp_peer *peer;
+    void *data;
+    uint32_t format;
+    size_t stride;
+    int width;
+    int height;
+};
+
+// Global mutex and flag to track transmission state
+static pthread_mutex_t transmit_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool transmission_in_progress = false;
+
+
+
 void *rdp_transmit_worker(void *arg) {
     struct rdp_transmit_job *job = arg;
     struct wlr_buffer *buffer = job->buffer;
@@ -359,6 +372,12 @@ void *rdp_transmit_worker(void *arg) {
         wlr_log(WLR_ERROR, "RDP peer disconnected, skipping transmission");
         wlr_buffer_unlock(buffer);
         free(job);
+        
+        // Mark transmission as complete
+        pthread_mutex_lock(&transmit_mutex);
+        transmission_in_progress = false;
+        pthread_mutex_unlock(&transmit_mutex);
+        
         return NULL;
     }
 
@@ -388,6 +407,12 @@ void *rdp_transmit_worker(void *arg) {
             wlr_log(WLR_ERROR, "Invalid encode stream");
             wlr_buffer_unlock(buffer);
             free(job);
+            
+            // Mark transmission as complete
+            pthread_mutex_lock(&transmit_mutex);
+            transmission_in_progress = false;
+            pthread_mutex_unlock(&transmit_mutex);
+            
             return NULL;
         }
 
@@ -404,6 +429,12 @@ void *rdp_transmit_worker(void *arg) {
             wlr_log(WLR_ERROR, "NSCodec compression failed");
             wlr_buffer_unlock(buffer);
             free(job);
+            
+            // Mark transmission as complete
+            pthread_mutex_lock(&transmit_mutex);
+            transmission_in_progress = false;
+            pthread_mutex_unlock(&transmit_mutex);
+            
             return NULL;
         }
 
@@ -431,18 +462,27 @@ void *rdp_transmit_worker(void *arg) {
                         (end.tv_nsec - start.tv_nsec) / 1000000.0;
     wlr_log(WLR_INFO, "rdp_transmit_worker took %.2f ms", elapsed_ms);
 
+    // Mark transmission as complete
+    pthread_mutex_lock(&transmit_mutex);
+    transmission_in_progress = false;
+    pthread_mutex_unlock(&transmit_mutex);
+
     return NULL;
 }
 
 void rdp_transmit_surface(struct wlr_buffer *buffer) {
     static int transmission_attempts = 0;
-    static struct timespec last_transmit = {0};
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    double elapsed_ms = (now.tv_sec - last_transmit.tv_sec) * 1000.0 +
-                        (now.tv_nsec - last_transmit.tv_nsec) / 1000000.0;
-    if (elapsed_ms < 50.0) return; // Limit to ~20 FPS to reduce load
-    last_transmit = now;
+
+    // Check if a transmission is already in progress
+    pthread_mutex_lock(&transmit_mutex);
+    if (transmission_in_progress) {
+        pthread_mutex_unlock(&transmit_mutex);
+        wlr_log(WLR_DEBUG, "Transmission already in progress, skipping frame");
+        return;
+    }
+    // Mark transmission as starting
+    transmission_in_progress = true;
+    pthread_mutex_unlock(&transmit_mutex);
 
     transmission_attempts++;
     wlr_log(WLR_INFO, "RDP Transmission Attempt #%d", transmission_attempts);
@@ -450,6 +490,12 @@ void rdp_transmit_surface(struct wlr_buffer *buffer) {
     freerdp_peer *peer = get_global_rdp_peer();
     if (!is_rdp_peer_connected(peer)) {
         wlr_log(WLR_ERROR, "Invalid or disconnected RDP peer, skipping transmission");
+        
+        // Mark transmission as complete since we're not starting one
+        pthread_mutex_lock(&transmit_mutex);
+        transmission_in_progress = false;
+        pthread_mutex_unlock(&transmit_mutex);
+        
         return;
     }
 
@@ -462,6 +508,12 @@ void rdp_transmit_surface(struct wlr_buffer *buffer) {
                                          &format,
                                          &stride)) {
         wlr_log(WLR_ERROR, "Failed to access buffer data");
+        
+        // Mark transmission as complete since we're not starting one
+        pthread_mutex_lock(&transmit_mutex);
+        transmission_in_progress = false;
+        pthread_mutex_unlock(&transmit_mutex);
+        
         return;
     }
 
@@ -469,6 +521,12 @@ void rdp_transmit_surface(struct wlr_buffer *buffer) {
     if (!locked_buffer) {
         wlr_log(WLR_ERROR, "Failed to lock buffer");
         wlr_buffer_end_data_ptr_access(buffer);
+        
+        // Mark transmission as complete since we're not starting one
+        pthread_mutex_lock(&transmit_mutex);
+        transmission_in_progress = false;
+        pthread_mutex_unlock(&transmit_mutex);
+        
         return;
     }
     wlr_buffer_end_data_ptr_access(buffer);
@@ -477,6 +535,12 @@ void rdp_transmit_surface(struct wlr_buffer *buffer) {
     if (!job) {
         wlr_log(WLR_ERROR, "Failed to allocate rdp_transmit_job");
         wlr_buffer_unlock(locked_buffer);
+        
+        // Mark transmission as complete since we're not starting one
+        pthread_mutex_lock(&transmit_mutex);
+        transmission_in_progress = false;
+        pthread_mutex_unlock(&transmit_mutex);
+        
         return;
     }
     job->buffer = locked_buffer;
@@ -492,6 +556,12 @@ void rdp_transmit_surface(struct wlr_buffer *buffer) {
         wlr_log(WLR_ERROR, "Failed to create transmission thread");
         wlr_buffer_unlock(locked_buffer);
         free(job);
+        
+        // Mark transmission as complete since we failed to start one
+        pthread_mutex_lock(&transmit_mutex);
+        transmission_in_progress = false;
+        pthread_mutex_unlock(&transmit_mutex);
+        
         return;
     }
     pthread_detach(thread);
