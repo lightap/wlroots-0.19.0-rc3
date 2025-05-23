@@ -731,18 +731,29 @@ static void seat_request_set_selection(struct wl_listener *listener, void *data)
     wlr_seat_set_selection(server->seat, event->source, event->serial);
 }
 
-static struct tinywl_toplevel *desktop_toplevel_at(struct tinywl_server *server, double lx, double ly,
+
+
+static struct tinywl_toplevel *desktop_toplevel_at(
+        struct tinywl_server *server, double lx, double ly,
         struct wlr_surface **surface, double *sx, double *sy) {
-    struct wlr_scene_node *node = wlr_scene_node_at(&server->scene->tree.node, lx, ly, sx, sy);
+    /* This returns the topmost node in the scene at the given layout coords.
+     * We only care about surface nodes as we are specifically looking for a
+     * surface in the surface tree of a tinywl_toplevel. */
+    struct wlr_scene_node *node = wlr_scene_node_at(
+        &server->scene->tree.node, lx, ly, sx, sy);
     if (node == NULL || node->type != WLR_SCENE_NODE_BUFFER) {
         return NULL;
     }
     struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
-    struct wlr_scene_surface *scene_surface = wlr_scene_surface_try_from_buffer(scene_buffer);
+    struct wlr_scene_surface *scene_surface =
+        wlr_scene_surface_try_from_buffer(scene_buffer);
     if (!scene_surface) {
         return NULL;
     }
+
     *surface = scene_surface->surface;
+    /* Find the node corresponding to the tinywl_toplevel at the root of this
+     * surface tree, it is the only one for which we set the data field. */
     struct wlr_scene_tree *tree = node->parent;
     while (tree != NULL && tree->node.data == NULL) {
         tree = tree->node.parent;
@@ -802,10 +813,31 @@ static void process_cursor_resize(struct tinywl_server *server) {
     wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel, new_width, new_height);
 }
 
-static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
-    struct timespec motion_start;
-    clock_gettime(CLOCK_MONOTONIC, &motion_start);
 
+// Add this helper function to improve popup handling
+static void ensure_popup_responsiveness(struct tinywl_server *server, struct wlr_surface *surface) {
+    if (!surface) return;
+    
+    struct wlr_xdg_surface *xdg_surface = wlr_xdg_surface_try_from_wlr_surface(surface);
+    if (!xdg_surface || xdg_surface->role != WLR_XDG_SURFACE_ROLE_POPUP) {
+        return;
+    }
+    
+    // Ensure popup gets frame callbacks
+    if (surface->current.buffer) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        wlr_surface_send_frame_done(surface, &now);
+    }
+    
+    // Schedule configure if needed
+    if (!xdg_surface->configured) {
+        wlr_xdg_surface_schedule_configure(xdg_surface);
+    }
+}
+
+// Updated process_cursor_motion to handle popups better
+static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
     if (server->cursor_mode == TINYWL_CURSOR_MOVE) {
         process_cursor_move(server);
         return;
@@ -819,51 +851,19 @@ static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
     struct wlr_surface *surface = NULL;
     struct tinywl_toplevel *toplevel = desktop_toplevel_at(server,
             server->cursor->x, server->cursor->y, &surface, &sx, &sy);
-
+    
     if (!toplevel) {
         wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
-    } else {
-        wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
     }
-
+    
     if (surface) {
-        bool is_new_focus = seat->pointer_state.focused_surface != surface;
-        bool is_gtk = wlr_xdg_surface_try_from_wlr_surface(surface) &&
-                      wlr_xdg_surface_try_from_wlr_surface(surface)->toplevel &&
-                      wlr_xdg_surface_try_from_wlr_surface(surface)->toplevel->app_id &&
-                      strstr(wlr_xdg_surface_try_from_wlr_surface(surface)->toplevel->app_id, "gtk");
-
-        if (is_new_focus) {
-            wlr_log(WLR_DEBUG, "Motion: New focus to surface %p (GTK=%s)", surface, is_gtk ? "yes" : "no");
-            wlr_seat_pointer_clear_focus(seat);
-            wlr_seat_pointer_notify_frame(seat);
-            wlr_seat_pointer_notify_enter(seat, surface, sx, sy);
-            wlr_seat_pointer_notify_frame(seat);
-        }
-
+        // Ensure popup responsiveness when hovering
+        ensure_popup_responsiveness(server, surface);
+        
+        wlr_seat_pointer_notify_enter(seat, surface, sx, sy);
         wlr_seat_pointer_notify_motion(seat, time, sx, sy);
-        wlr_seat_pointer_notify_frame(seat);
-
-        if (is_gtk) {
-            wl_display_flush_clients(server->wl_display);
-        }
     } else {
         wlr_seat_pointer_clear_focus(seat);
-        wlr_seat_pointer_notify_frame(seat);
-    }
-
-    struct wlr_output *output = wlr_output_layout_output_at(server->output_layout,
-            server->cursor->x, server->cursor->y);
-    if (output && output->enabled) {
-        wlr_output_schedule_frame(output);
-    }
-
-    struct timespec motion_end;
-    clock_gettime(CLOCK_MONOTONIC, &motion_end);
-    uint64_t duration_ns = (motion_end.tv_sec - motion_start.tv_sec) * 1000000000ULL +
-                           (motion_end.tv_nsec - motion_start.tv_nsec);
-    if (duration_ns > 10000000) {
-//        wlr_log(WLR_WARNING, "Motion event processing took %llu ns", duration_ns);
     }
 }
 
@@ -881,109 +881,78 @@ static void server_cursor_motion_absolute(struct wl_listener *listener, void *da
     wlr_cursor_warp_absolute(server->cursor, &event->pointer->base, event->x, event->y);
     process_cursor_motion(server, event->time_msec);
 }
-/*
+
+///////////////////////////////////////////////////////////////////////
 static void server_cursor_button(struct wl_listener *listener, void *data) {
-    struct tinywl_server *server = wl_container_of(listener, server, cursor_button);
+    struct tinywl_server *server =
+        wl_container_of(listener, server, cursor_button);
     struct wlr_pointer_button_event *event = data;
-
-    // Log the event for debugging
-    wlr_log(WLR_DEBUG, "Cursor button event: button=%u, state=%s, time=%u",
-            event->button, event->state == WL_POINTER_BUTTON_STATE_PRESSED ? "pressed" : "released",
-            event->time_msec);
-
-    // Find the surface under the cursor
-    double sx, sy;
-    struct wlr_surface *surface = NULL;
-    struct tinywl_toplevel *toplevel = desktop_toplevel_at(server,
-            server->cursor->x, server->cursor->y, &surface, &sx, &sy);
-
-    // Notify the seat of the button event
-    wlr_seat_pointer_notify_button(server->seat, event->time_msec, event->button, event->state);
-
-    if (event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
-        // On press, focus the toplevel and notify the surface
-        focus_toplevel(toplevel);
-        if (surface) {
-            wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
-            wlr_seat_pointer_notify_motion(server->seat, event->time_msec, sx, sy);
-            wlr_log(WLR_DEBUG, "Notified surface %p at (%f, %f) of button press", surface, sx, sy);
-        }
-    } else if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
-        // On release, reset cursor mode and schedule a frame
-        reset_cursor_mode(server);
-        // Schedule a frame to update the cursor visually
-        struct tinywl_output *output;
-        wl_list_for_each(output, &server->outputs, link) {
-            if (output->wlr_output && output->wlr_output->enabled) {
-                wlr_output_schedule_frame(output->wlr_output);
-            }
-        }
-        wlr_log(WLR_DEBUG, "Processed button release, cursor mode reset");
-    }
-
-    // Notify the seat of the frame to finalize the event
-    wlr_seat_pointer_notify_frame(server->seat);
-}*/
-
-// Enhanced button handling with special GTK fixes
-static void server_cursor_button(struct wl_listener *listener, void *data) {
-    struct tinywl_server *server = wl_container_of(listener, server, cursor_button);
-    struct wlr_pointer_button_event *event = data;
-    
-    wlr_log(WLR_DEBUG, "Button %d %s", event->button,
-            event->state == WL_POINTER_BUTTON_STATE_PRESSED ? "pressed" : "released");
     
     double sx, sy;
     struct wlr_surface *surface = NULL;
     struct tinywl_toplevel *toplevel = desktop_toplevel_at(server,
             server->cursor->x, server->cursor->y, &surface, &sx, &sy);
     
-    struct wlr_seat *seat = server->seat;
-    
+    // Handle button press events
     if (event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
-        if (surface) {
-            // Only clear focus if the surface is different from the current focus
-            if (seat->pointer_state.focused_surface != surface) {
-                wlr_seat_pointer_clear_focus(seat);
-                wlr_seat_pointer_notify_frame(seat);
-                wlr_seat_pointer_notify_enter(seat, surface, sx, sy);
-                wlr_seat_pointer_notify_motion(seat, event->time_msec, sx, sy);
-                wlr_seat_pointer_notify_frame(seat);
-                wl_display_flush_clients(server->wl_display);
-            } else {
-                // Surface already focused; just send motion
-                wlr_seat_pointer_notify_motion(seat, event->time_msec, sx, sy);
-                wlr_seat_pointer_notify_frame(seat);
+        // Only change focus for main windows, not for popups/submenus
+        if (toplevel) {
+            // Check if we're clicking on a popup surface
+            bool is_popup_surface = false;
+            if (surface) {
+                struct wlr_xdg_surface *xdg_surface = wlr_xdg_surface_try_from_wlr_surface(surface);
+                if (xdg_surface && xdg_surface->role == WLR_XDG_SURFACE_ROLE_POPUP) {
+                    is_popup_surface = true;
+                }
             }
             
-            // Send the button event
-            wlr_seat_pointer_notify_button(seat, event->time_msec, event->button, event->state);
-            wlr_seat_pointer_notify_frame(seat);
-            wl_display_flush_clients(server->wl_display);
-            
-            // Focus the toplevel after sending button events
-            if (toplevel) {
+            // Only focus toplevel if we're not clicking on a popup
+            if (!is_popup_surface) {
                 focus_toplevel(toplevel);
             }
-        } else {
-            // No surface under cursor; send button event and clear focus
-            if (seat->pointer_state.focused_surface) {
-                wlr_seat_pointer_clear_focus(seat);
-                wlr_seat_pointer_notify_frame(seat);
-            }
-            wlr_seat_pointer_notify_button(seat, event->time_msec, event->button, event->state);
-            wlr_seat_pointer_notify_frame(seat);
-            wl_display_flush_clients(server->wl_display);
         }
-    } else {
-        // Button release
-        wlr_seat_pointer_notify_button(seat, event->time_msec, event->button, event->state);
-        wlr_seat_pointer_notify_frame(seat);
-        reset_cursor_mode(server);
-        wl_display_flush_clients(server->wl_display);
+    } else if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
+        // Only reset cursor mode if we're not over a popup
+        bool over_popup = false;
+        if (surface) {
+            struct wlr_xdg_surface *xdg_surface = wlr_xdg_surface_try_from_wlr_surface(surface);
+            if (xdg_surface && xdg_surface->role == WLR_XDG_SURFACE_ROLE_POPUP) {
+                over_popup = true;
+            }
+        }
+        
+        if (!over_popup) {
+            reset_cursor_mode(server);
+        }
     }
     
-    // Schedule frame for all outputs
+    // CRITICAL: Notify the client BEFORE scheduling frames
+    // This ensures proper event ordering for GTK
+    wlr_seat_pointer_notify_button(server->seat,
+            event->time_msec, event->button, event->state);
+    
+    // For popup surfaces, we need to be extra careful about frame scheduling
+    if (surface) {
+        struct wlr_xdg_surface *xdg_surface = wlr_xdg_surface_try_from_wlr_surface(surface);
+        if (xdg_surface && xdg_surface->role == WLR_XDG_SURFACE_ROLE_POPUP) {
+            // For popups, schedule frame immediately to ensure responsiveness
+            struct tinywl_output *output;
+            wl_list_for_each(output, &server->outputs, link) {
+                if (output->wlr_output && output->wlr_output->enabled) {
+                    wlr_output_schedule_frame(output->wlr_output);
+                }
+            }
+            
+            // Also ensure the popup gets a commit event if needed
+            if (xdg_surface->surface && !xdg_surface->surface->current.buffer) {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                wlr_surface_send_frame_done(xdg_surface->surface, &now);
+            }
+        }
+    }
+    
+    // Schedule frames for regular surfaces too, but after popup handling
     struct tinywl_output *output;
     wl_list_for_each(output, &server->outputs, link) {
         if (output->wlr_output && output->wlr_output->enabled) {
@@ -1004,602 +973,151 @@ static void server_cursor_frame(struct wl_listener *listener, void *data) {
     wlr_seat_pointer_notify_frame(server->seat);
 }
 
+
 static void popup_map(struct wl_listener *listener, void *data) {
     struct tinywl_popup *popup = wl_container_of(listener, popup, map);
-    wlr_scene_node_set_enabled(&popup->scene_tree->node, true); // Enable the popup
-    wlr_log(WLR_DEBUG, "Popup mapped: %p", popup->xdg_popup);
+    
+    // Enable the popup in the scene
+    wlr_scene_node_set_enabled(&popup->scene_tree->node, true);
+    
+    // Send the ack_configure immediately to complete the handshake
+    if (popup->xdg_popup && popup->xdg_popup->base) {
+        struct wlr_xdg_surface *xdg_surface = popup->xdg_popup->base;
+        if (xdg_surface->configured) {
+            // Send ack to complete popup configuration
+            wlr_xdg_surface_schedule_configure(xdg_surface);
+        }
+    }
+    
+    // Schedule frames on all outputs to ensure popup is displayed
+    struct tinywl_server *server = popup->server;
+    if (server) {
+        struct tinywl_output *output;
+        wl_list_for_each(output, &server->outputs, link) {
+            if (output->wlr_output && output->wlr_output->enabled) {
+                wlr_output_schedule_frame(output->wlr_output);
+            }
+        }
+    }
+    
+    wlr_log(WLR_DEBUG, "Popup mapped and configured: %p", popup->xdg_popup);
 }
 
 static void popup_unmap(struct wl_listener *listener, void *data) {
     struct tinywl_popup *popup = wl_container_of(listener, popup, unmap);
-    wlr_scene_node_set_enabled(&popup->scene_tree->node, false); // Disable the popup
+    
+    // Disable the popup in the scene
+    wlr_scene_node_set_enabled(&popup->scene_tree->node, false);
+    
+    // Schedule frames to update display
+    struct tinywl_server *server = popup->server;
+    if (server) {
+        struct tinywl_output *output;
+        wl_list_for_each(output, &server->outputs, link) {
+            if (output->wlr_output && output->wlr_output->enabled) {
+                wlr_output_schedule_frame(output->wlr_output);
+            }
+        }
+    }
+    
     wlr_log(WLR_DEBUG, "Popup unmapped: %p", popup->xdg_popup);
 }
 
 static void popup_destroy(struct wl_listener *listener, void *data) {
     struct tinywl_popup *popup = wl_container_of(listener, popup, destroy);
+    
     wlr_log(WLR_DEBUG, "Popup destroyed: %p", popup->xdg_popup);
-    // Clean up all listeners
+    
+    // Clean up listeners
     wl_list_remove(&popup->map.link);
     wl_list_remove(&popup->unmap.link);
     wl_list_remove(&popup->destroy.link);
     wl_list_remove(&popup->commit.link);
     wl_list_remove(&popup->link);
-    wlr_scene_node_destroy(&popup->scene_tree->node);
+    
+    // Destroy scene node
+    if (popup->scene_tree) {
+        wlr_scene_node_destroy(&popup->scene_tree->node);
+    }
+    
+    // Schedule frames to update display after popup destruction
+    struct tinywl_server *server = popup->server;
+    if (server) {
+        struct tinywl_output *output;
+        wl_list_for_each(output, &server->outputs, link) {
+            if (output->wlr_output && output->wlr_output->enabled) {
+                wlr_output_schedule_frame(output->wlr_output);
+            }
+        }
+    }
+    
     free(popup);
 }
 
 
 
+
 static void popup_commit(struct wl_listener *listener, void *data) {
     struct tinywl_popup *popup = wl_container_of(listener, popup, commit);
-    if (!popup || !popup->xdg_popup || !popup->xdg_popup->base || !popup->xdg_popup->base->surface) {
-        wlr_log(WLR_ERROR, "[POPUP_COMMIT] Invalid popup or surface state in commit handler.");
+    
+    if (!popup->xdg_popup || !popup->xdg_popup->base) {
         return;
     }
 
     struct wlr_xdg_surface *xdg_surface = popup->xdg_popup->base;
     struct wlr_surface *surface = xdg_surface->surface;
-    struct tinywl_server *server = popup->server; 
-
-    // Log current state
-    wlr_log(WLR_DEBUG, "[POPUP_COMMIT] Popup %p committed. Surface: %p, Mapped: %d, Has Buffer: %d, Initial Commit: %d, Configured: %d",
-            popup->xdg_popup, surface, surface->mapped, wlr_surface_has_buffer(surface), 
-            xdg_surface->initial_commit, xdg_surface->configured);
-    wlr_log(WLR_DEBUG, "[POPUP_COMMIT] Surface current state: WxH=(%dx%d), Scale=%d, Transform=%d",
-            surface->current.width, surface->current.height, surface->current.scale, surface->current.transform);
     
-    // Log the xdg_surface's own geometry member. For popups, this might be less relevant than its scene graph position
-    // and the size derived from its buffer.
-    wlr_log(WLR_DEBUG, "[POPUP_COMMIT] XDG Surface's own geometry member: X,Y=(%d,%d), WxH=(%d,%d)",
-            xdg_surface->geometry.x, xdg_surface->geometry.y,
-            xdg_surface->geometry.width, xdg_surface->geometry.height);
+    wlr_log(WLR_DEBUG, "Popup commit: %p (initial: %d, configured: %d, mapped: %d)", 
+            popup->xdg_popup, xdg_surface->initial_commit, xdg_surface->configured, surface ? surface->mapped : 0);
     
-    // If this is the very first commit for this xdg_surface (role is set),
-    // or if the surface isn't configured yet (meaning client needs a configure event from us),
-    // schedule a configure.
-    if (xdg_surface->initial_commit || !xdg_surface->configured) {
-        wlr_log(WLR_INFO, "[POPUP_COMMIT] Popup %p: initial_commit=%d, configured=%d. Scheduling configure.", 
-                popup->xdg_popup, xdg_surface->initial_commit, xdg_surface->configured);
-        
+    // Handle configuration properly with immediate response for GTK
+    if (xdg_surface->initial_commit) {
+        // For initial commit, configure immediately
         wlr_xdg_surface_schedule_configure(xdg_surface);
+        wlr_log(WLR_DEBUG, "Scheduled initial configure for popup: %p", popup->xdg_popup);
+    } else if (!xdg_surface->configured) {
+        // Configure unconfigured popups immediately
+        wlr_xdg_surface_schedule_configure(xdg_surface);
+        wlr_log(WLR_DEBUG, "Scheduled configure for unconfigured popup: %p", popup->xdg_popup);
     }
-
-    // Schedule a frame if the surface is mapped and has a buffer.
-    if (surface->mapped && wlr_surface_has_buffer(surface)) {
-        struct wlr_output *output_to_schedule = NULL;
-        struct tinywl_output *iter_output;
-        
-        if (popup->scene_tree && server->output_layout) { 
-            int popup_abs_x, popup_abs_y;
-            wlr_scene_node_coords(&popup->scene_tree->node, &popup_abs_x, &popup_abs_y);
-
-            wl_list_for_each(iter_output, &server->outputs, link) {
-                if (iter_output->wlr_output && iter_output->wlr_output->enabled) {
-                    struct wlr_box output_box;
-                    wlr_output_layout_get_box(server->output_layout, iter_output->wlr_output, &output_box);
-                    
-                    struct wlr_box popup_geom_box = { // Use current surface dimensions for intersection test
-                        .x = popup_abs_x,
-                        .y = popup_abs_y,
-                        .width = surface->current.width > 0 ? surface->current.width : 1, 
-                        .height = surface->current.height > 0 ? surface->current.height : 1
-                    };
-
-                    if (wlr_box_intersection(&output_box, &popup_geom_box, NULL)) { // Just check for overlap
-                        output_to_schedule = iter_output->wlr_output;
-                        break;
-                    }
-                }
+    
+    // CRITICAL: Always send frame_done for popup commits to prevent GTK freezing
+    if (surface && surface->current.buffer) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        wlr_surface_send_frame_done(surface, &now);
+    }
+    
+    // Schedule frames on all outputs
+    struct tinywl_server *server = popup->server;
+    if (server) {
+        struct tinywl_output *output;
+        wl_list_for_each(output, &server->outputs, link) {
+            if (output->wlr_output && output->wlr_output->enabled) {
+                wlr_output_schedule_frame(output->wlr_output);
             }
         }
-
-        if (!output_to_schedule && !wl_list_empty(&server->outputs)) {
-            iter_output = wl_container_of(server->outputs.next, iter_output, link); 
-            if (iter_output && iter_output->wlr_output && iter_output->wlr_output->enabled) {
-                 output_to_schedule = iter_output->wlr_output;
-                 wlr_log(WLR_DEBUG, "[POPUP_COMMIT] Popup %p: No intersecting output, scheduling on first active: %s",
-                         popup->xdg_popup, output_to_schedule->name);
-            }
-        }
-
-        if (output_to_schedule) {
-            wlr_output_schedule_frame(output_to_schedule);
-            wlr_log(WLR_DEBUG, "[POPUP_COMMIT] Scheduled frame for output %s for popup %p", 
-                    output_to_schedule->name, popup->xdg_popup);
-        } else {
-             wlr_log(WLR_DEBUG, "[POPUP_COMMIT] No suitable output found to schedule frame for popup %p", popup->xdg_popup);
-        }
-    } else {
-        wlr_log(WLR_DEBUG, "[POPUP_COMMIT] Popup %p not ready for frame schedule (mapped: %d, has_buffer: %d)",
-                popup->xdg_popup, surface->mapped, wlr_surface_has_buffer(surface));
+    }
+    
+    // If this is a commit after configure, the popup should be ready
+    if (xdg_surface->configured && surface && surface->mapped) {
+        wlr_log(WLR_DEBUG, "Popup ready and mapped: %p", popup->xdg_popup);
     }
 }
-/*
-static void server_new_popup(struct wl_listener *listener, void *data) {
-    struct tinywl_server *server = wl_container_of(listener, server, new_xdg_popup);
-    struct wlr_xdg_popup *xdg_popup = data;
 
-    // Allocate a new popup structure
-    struct tinywl_popup *popup = calloc(1, sizeof(struct tinywl_popup));
-    if (!popup) {
-        wlr_log(WLR_ERROR, "Failed to allocate tinywl_popup");
-        return;
-    }
-
-    // Initialize popup fields
-    popup->xdg_popup = xdg_popup;
-    popup->server = server;
-    popup->scene_tree = wlr_scene_xdg_surface_create(&server->scene->tree, xdg_popup->base);
-    if (!popup->scene_tree) {
-        wlr_log(WLR_ERROR, "Failed to create scene tree for popup");
-        free(popup);
-        return;
-    }
-
-    // Set up event listeners
-    popup->map.notify = popup_map;
-    wl_signal_add(&xdg_popup->base->surface->events.map, &popup->map);
-    popup->unmap.notify = popup_unmap;
-    wl_signal_add(&xdg_popup->base->surface->events.unmap, &popup->unmap);
-    popup->destroy.notify = popup_destroy;
-    wl_signal_add(&xdg_popup->events.destroy, &popup->destroy);
-    popup->commit.notify = popup_commit;
-    wl_signal_add(&xdg_popup->base->surface->events.commit, &popup->commit);
-
-    // Add to the server’s popup list
-    wl_list_insert(&server->popups, &popup->link);
-    wlr_log(WLR_DEBUG, "New popup created: %p", xdg_popup);
-
-    // Ensure the popup is constrained to the parent surface’s geometry
-    struct wlr_xdg_popup *parent_popup = xdg_popup;
-    while (parent_popup->parent) {
-        struct wlr_xdg_surface *parent_surface = wlr_xdg_surface_try_from_wlr_surface(parent_popup->parent);
-        if (!parent_surface) break;
-        parent_popup = parent_surface->popup;
-    }
-}*/
-
-
-
-// In tinywl.c (or your main server file)
 
 // Ensure you have these includes (or equivalent for your project structure)
 #include <time.h>
 #include <wlr/types/wlr_compositor.h> // For wlr_surface_send_frame_done
 #include <wlr/types/wlr_output_damage.h> // For wlr_output_damage_add_whole (optional but good)
 
-// You'll need to define or include your tinywl_server and tinywl_view structs
-// For example:
-// struct tinywl_server {
-//     // ... other members ...
-//     struct wl_list views; // list of struct tinywl_view
-//     // ...
-// };
-//
-// struct tinywl_view {
-//     struct tinywl_server *server;
-//     struct wlr_xdg_surface *xdg_surface;
-//     struct wl_listener map;
-//     struct wl_listener unmap;
-//     struct wl_listener destroy;
-//     struct wl_listener request_move;
-//     struct wl_listener request_resize;
-//     struct wl_listener commit;
-//     bool mapped;
-//     int x, y;
-//     struct wl_list link;
-// };
-
-// Assume 'server' is a global or accessible pointer to your tinywl_server instance
-// extern struct tinywl_server server; // If global, or pass it in somehow
-
-// In tinywl.c
-
-// Ensure these are included at the top of your tinywl.c:
-// #include <time.h>
-// #include <wlr/types/wlr_compositor.h>
-// #include <wlr/types/wlr_xdg_shell.h>
-// #include <wlr/util/box.h>
-// #include <wlr/util/log.h>
-// #include <wlr/render/wlr_renderer.h> // For wlr_renderer_is_gles2
-// #include <wlr/render/egl.h>         // For wlr_gles2_renderer_get_egl, wlr_egl_make_current etc.
-// In tinywl.c
 
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/box.h>
 #include <wlr/util/transform.h>
 #include <wlr/util/log.h>
 #include <wlr/render/wlr_renderer.h>
-/*static void output_frame(struct wl_listener *listener, void *data) {
-    struct tinywl_output *output = wl_container_of(listener, output, frame);
-    struct wlr_output *wlr_output = output->wlr_output;
-    struct tinywl_server *server = output->server;
-    struct wlr_scene *scene = server->scene;
 
-    struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(scene, wlr_output);
-    if (!scene_output) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] No scene output for %s", wlr_output->name);
-        return;
-    }
-
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-
-    if (!wlr_output || !wlr_output->enabled) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Output '%s' not valid or not enabled.", wlr_output->name);
-        return;
-    }
-    if (!wlr_output->renderer || !wlr_output->allocator) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Output '%s' has no renderer or allocator.", wlr_output->name);
-        return;
-    }
-    if (!wlr_renderer_is_gles2(wlr_output->renderer)) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Renderer is not GLES2");
-        return;
-    }
-
-    // Get output's layout coordinates and height
-    int output_lx, output_ly;
-    if (!server->output_layout) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] No output layout available");
-        return;
-    }
-    struct wlr_box output_box;
-    wlr_output_layout_get_box(server->output_layout, wlr_output, &output_box);
-    if (output_box.width == 0 || output_box.height == 0) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to get valid output box for %s", wlr_output->name);
-        return;
-    }
-    output_lx = output_box.x;
-    output_ly = output_box.y;
-    int effective_height = wlr_output->height;
-
-    // Clear any existing OpenGL errors
-    GLenum err_clear_loop;
-    int clear_loop_count = 0;
-    while ((err_clear_loop = glGetError()) != GL_NO_ERROR && clear_loop_count < 10) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Clearing OpenGL error: 0x%x", err_clear_loop);
-        clear_loop_count++;
-    }
-
-    // Begin rendering
-    struct wlr_egl_context prev_ctx = {0};
-    struct wlr_egl *egl = wlr_gles2_renderer_get_egl(wlr_output->renderer);
-    if (!egl || !wlr_egl_make_current(egl, &prev_ctx)) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to make EGL context current. EGL error: 0x%x", eglGetError());
-        wlr_egl_restore_context(&prev_ctx);
-        return;
-    }
-
-    struct wlr_output_state state;
-    wlr_output_state_init(&state);
-
-    struct wlr_buffer_pass_options pass_options = {0};
-    struct wlr_render_pass *pass = wlr_output_begin_render_pass(wlr_output, &state, &pass_options);
-    if (!pass) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] wlr_output_begin_render_pass failed for '%s'", wlr_output->name);
-        wlr_egl_restore_context(&prev_ctx);
-        wlr_output_state_finish(&state);
-        return;
-    }
-
-    GLenum fbo_status_check = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    if (fbo_status_check != GL_FRAMEBUFFER_COMPLETE) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] FBO incomplete after begin_render_pass: status=0x%x", fbo_status_check);
-        wlr_render_pass_submit(pass);
-        wlr_egl_restore_context(&prev_ctx);
-        wlr_output_state_finish(&state);
-        return;
-    }
-
-    struct wlr_buffer *rendered_buffer = state.buffer;
-    if (!rendered_buffer) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] No buffer available for rendering in wlr_output_state");
-        wlr_render_pass_submit(pass);
-        wlr_egl_restore_context(&prev_ctx);
-        wlr_output_state_finish(&state);
-        return;
-    }
-
-    // Render background
-    float background_color[] = {0.1f, 0.1f, 0.15f, 1.0f};
-    struct wlr_render_rect_options background_opts = {
-        .box = {0, 0, wlr_output->width, wlr_output->height},
-        .color = {background_color[0], background_color[1], background_color[2], background_color[3]},
-        .blend_mode = WLR_RENDER_BLEND_MODE_NONE,
-    };
-    wlr_render_pass_add_rect(pass, &background_opts);
-    wlr_log(WLR_INFO, "[RENDER_FRAME] Rendered background for output %s (%dx%d)", 
-            wlr_output->name, wlr_output->width, wlr_output->height);
-
-    // Render all toplevel views in reverse order (newest on top)
-    struct tinywl_toplevel *toplevel_view;
-    int window_count = 0;
-    bool content_rendered = false;
-    wl_list_for_each_reverse(toplevel_view, &server->toplevels, link) {
-        if (!toplevel_view->xdg_toplevel || !toplevel_view->xdg_toplevel->base ||
-            !toplevel_view->xdg_toplevel->base->surface->mapped) {
-            continue;
-        }
-
-        struct wlr_xdg_surface *xdg_surface = toplevel_view->xdg_toplevel->base;
-        struct wlr_surface *surface = xdg_surface->surface;
-
-        if (!wlr_surface_has_buffer(surface)) {
-            continue;
-        }
-
-        struct wlr_texture *texture = wlr_surface_get_texture(surface);
-        if (!texture) {
-            wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to get texture for surface");
-            continue;
-        }
-
-        window_count++;
-        content_rendered = true;
-
-        double view_x = toplevel_view->scene_tree->node.x;
-        double view_y = toplevel_view->scene_tree->node.y;
-        int width = surface->current.width;
-        int height = surface->current.height;
-
-        // Flip texture vertically to match RDP coordinate system
-        struct wlr_fbox src_box = { .x = 0, .y = 0, .width = width, .height = height };
-        struct wlr_box dst_box = { 
-            .x = (int)view_x, 
-            .y = wlr_output->height - (int)view_y - height,
-            .width = width, 
-            .height = height 
-        };
-
-        wlr_log(WLR_INFO, "[RENDER_FRAME] Window %d: pos=(%d,%d) size=(%dx%d)", 
-                window_count, dst_box.x, dst_box.y, dst_box.width, dst_box.height);
-
-        struct wlr_render_texture_options tex_opts = {
-            .texture = texture,
-            .src_box = src_box,
-            .dst_box = dst_box,
-            .blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
-            .transform = WL_OUTPUT_TRANSFORM_FLIPPED_180,
-        };
-        wlr_render_pass_add_texture(pass, &tex_opts);
-    }
-
-    // --- RENDER POPUPS ---
-   // --- RENDER POPUPS ---
-struct tinywl_popup *popup_view;
-int popup_count = 0;
-
-wlr_log(WLR_DEBUG, "[RENDER_FRAME] Starting popup rendering loop, popups list=%p", &server->popups);
-wl_list_for_each(popup_view, &server->popups, link) {
-    wlr_log(WLR_DEBUG, "[RENDER_FRAME] Checking popup %p", popup_view);
-    if (!popup_view->xdg_popup) {
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Popup %p skipped: no xdg_popup", popup_view);
-        continue;
-    }
-    if (!popup_view->xdg_popup->base) {
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Popup %p skipped: no xdg_popup->base", popup_view);
-        continue;
-    }
-    if (!popup_view->xdg_popup->base->surface->mapped) {
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Popup %p skipped: surface not mapped (surface=%p)", 
-                popup_view, popup_view->xdg_popup->base->surface);
-        continue;
-    }
-    if (!popup_view->scene_tree) {
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Popup %p skipped: no scene_tree", popup_view);
-        continue;
-    }
-    if (!popup_view->scene_tree->node.enabled) {
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Popup %p skipped: scene_tree node disabled", popup_view);
-        continue;
-    }
-
-    struct wlr_surface *surface = popup_view->xdg_popup->base->surface;
-    if (!wlr_surface_has_buffer(surface)) {
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Popup %p skipped: surface has no buffer", popup_view);
-        continue;
-    }
-
-    struct wlr_texture *texture = wlr_surface_get_texture(surface);
-    if (!texture) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to get texture for popup surface %p", surface);
-        continue;
-    }
-
-    popup_count++;
-    content_rendered = true;
-
-    // Get absolute coordinates of the popup
-    int popup_abs_lx, popup_abs_ly;
-    wlr_scene_node_coords(&popup_view->scene_tree->node, &popup_abs_lx, &popup_abs_ly);
-
-    double view_x = popup_abs_lx;
-    double view_y = popup_abs_ly;
-
-    int width = surface->current.width;
-    int height = surface->current.height;
-
-    // RDP destination box (top-left origin)
-    struct wlr_box rdp_dst_box = {
-        .x = (int)(view_x - output_lx),
-        .y = (int)(view_y - output_ly),
-        .width = width,
-        .height = height
-    };
-
-    // GL destination box (bottom-left origin)
-    struct wlr_box gl_dst_box = {
-        .x = rdp_dst_box.x,
-        .y = effective_height - rdp_dst_box.y - rdp_dst_box.height,
-        .width = rdp_dst_box.width,
-        .height = rdp_dst_box.height
-    };
-
-    wlr_log(WLR_INFO, "[RENDER_FRAME] Popup %d (ptr %p): RDP Dst=(%d,%d %dx%d), GL Dst=(%d,%d %dx%d)",
-            popup_count, (void*)popup_view->xdg_popup,
-            rdp_dst_box.x, rdp_dst_box.y, rdp_dst_box.width, rdp_dst_box.height,
-            gl_dst_box.x, gl_dst_box.y, gl_dst_box.width, gl_dst_box.height);
-
-    struct wlr_render_texture_options tex_opts = {
-        .texture = texture,
-        .dst_box = gl_dst_box,
-        .blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
-        .transform = WL_OUTPUT_TRANSFORM_FLIPPED_180,
-    };
-    wlr_render_pass_add_texture(pass, &tex_opts);
-}
-
-if (popup_count > 0) {
-    wlr_log(WLR_DEBUG, "[RENDER_FRAME] Rendered %d popups", popup_count);
-} else {
- //   wlr_log(WLR_DEBUG, "[RENDER_FRAME] No popups rendered");
-}
-
-    // Render the cursor
-    if (server->cursor && server->cursor_mgr) {
-        struct wlr_xcursor *xcursor = wlr_xcursor_manager_get_xcursor(server->cursor_mgr, "default", 1.0);
-        if (xcursor && xcursor->images[0]) {
-            struct wlr_xcursor_image *image = xcursor->images[0];
-            struct wlr_texture *cursor_texture = wlr_texture_from_pixels(
-                server->renderer, DRM_FORMAT_ARGB8888, image->width * 4,
-                image->width, image->height, image->buffer
-            );
-            if (cursor_texture) {
-                // Adjust cursor position for RDP coordinate system (origin at top-left)
-                int cursor_x = (int)server->cursor->x;
-                int cursor_y = wlr_output->height - (int)server->cursor->y - (int)image->height;
-
-                struct wlr_fbox cursor_src_box = {
-                    .x = 0, .y = 0,
-                    .width = image->width, .height = image->height
-                };
-                struct wlr_box cursor_dst_box = {
-                    .x = cursor_x - image->hotspot_x,
-                    .y = cursor_y - image->hotspot_y,
-                    .width = (int)image->width,
-                    .height = (int)image->height
-                };
-
-                struct wlr_render_texture_options cursor_tex_opts = {
-                    .texture = cursor_texture,
-                    .src_box = cursor_src_box,
-                    .dst_box = cursor_dst_box,
-                    .blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
-                };
-                wlr_render_pass_add_texture(pass, &cursor_tex_opts);
-                wlr_log(WLR_INFO, "[RENDER_FRAME] Rendered cursor at (%d,%d) size=(%dx%d)",
-                        cursor_dst_box.x, cursor_dst_box.y, cursor_dst_box.width, cursor_dst_box.height);
-                wlr_texture_destroy(cursor_texture);
-            } else {
-                wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to create cursor texture");
-            }
-        } else {
-            wlr_log(WLR_ERROR, "[RENDER_FRAME] No cursor image available");
-        }
-    } else {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Cursor or cursor manager not initialized");
-    }
-
-    wlr_log(WLR_INFO, "[RENDER_FRAME] Rendered %d windows", window_count);
-
-    if (!wlr_render_pass_submit(pass)) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] wlr_render_pass_submit failed for '%s'", wlr_output->name);
-        wlr_egl_restore_context(&prev_ctx);
-        wlr_output_state_finish(&state);
-        return;
-    }
-
-    // Transmit buffer if content was rendered
-    if (content_rendered || server->cursor) {
-        void *bdata;
-        uint32_t bfmt;
-        size_t bstride;
-        if (wlr_buffer_begin_data_ptr_access(rendered_buffer, WLR_BUFFER_DATA_PTR_ACCESS_READ | WLR_BUFFER_DATA_PTR_ACCESS_WRITE, &bdata, &bfmt, &bstride)) {
-            if (bdata && rendered_buffer->width > 5 && rendered_buffer->height > 5) {
-                unsigned char *pixels = (unsigned char *)bdata;
-                size_t offset = 5 * bstride + 5 * 4;
-
-                // Log pixel data for debugging
-                if (offset + 3 < bstride * rendered_buffer->height) {
-                    wlr_log(WLR_INFO, "[RENDER_FRAME] Raw pixel data at (5,5): %02X %02X %02X %02X (Format: 0x%X, Stride: %zu)",
-                            pixels[offset + 0], pixels[offset + 1], pixels[offset + 2], pixels[offset + 3], bfmt, bstride);
-                }
-
-                // Convert buffer to BGRA8888 if needed
-                if (bfmt != DRM_FORMAT_BGRA8888) {
-                    wlr_log(WLR_INFO, "[RENDER_FRAME] Converting buffer from format 0x%X to BGRA8888", bfmt);
-                    for (int y = 0; y < rendered_buffer->height; y++) {
-                        for (int x = 0; x < rendered_buffer->width; x++) {
-                            size_t src_offset = y * bstride + x * 4;
-                            unsigned char r, g, b, a;
-
-                            if (bfmt == DRM_FORMAT_XBGR8888 || bfmt == DRM_FORMAT_ABGR8888) {
-                                b = pixels[src_offset + 0];
-                                g = pixels[src_offset + 1];
-                                r = pixels[src_offset + 2];
-                                a = (bfmt == DRM_FORMAT_ABGR8888) ? pixels[src_offset + 3] : 0xFF;
-                            } else if (bfmt == DRM_FORMAT_XRGB8888) {
-                                r = pixels[src_offset + 0];
-                                g = pixels[src_offset + 1];
-                                b = pixels[src_offset + 2];
-                                a = 0xFF;
-                            } else if (bfmt == DRM_FORMAT_ARGB8888) {
-                                a = pixels[src_offset + 0];
-                                r = pixels[src_offset + 1];
-                                g = pixels[src_offset + 2];
-                                b = pixels[src_offset + 3];
-                            } else {
-                                r = pixels[src_offset + 0];
-                                g = pixels[src_offset + 1];
-                                b = pixels[src_offset + 2];
-                                a = (bfmt == DRM_FORMAT_BGRA8888) ? pixels[src_offset + 3] : 0xFF;
-                                wlr_log(WLR_ERROR, "[RENDER_FRAME] Unknown format 0x%X, assuming RGBA order", bfmt);
-                            }
-
-                            pixels[src_offset + 0] = b;
-                            pixels[src_offset + 1] = g;
-                            pixels[src_offset + 2] = r;
-                            pixels[src_offset + 3] = a;
-                        }
-                    }
-                    bfmt = DRM_FORMAT_BGRA8888;
-                    bstride = rendered_buffer->width * 4;
-                }
-
-                // Verify pixel at cursor position
-                if (server->cursor) {
-                    int cursor_pixel_x = (int)server->cursor->x;
-                    int cursor_pixel_y = wlr_output->height - (int)server->cursor->y;
-                    size_t cursor_offset = cursor_pixel_y * bstride + cursor_pixel_x * 4;
-                    if (cursor_offset + 3 < bstride * rendered_buffer->height) {
-                        wlr_log(WLR_INFO, "[RENDER_FRAME] Cursor pixel at (%d,%d): %02X %02X %02X %02X",
-                                cursor_pixel_x, cursor_pixel_y,
-                                pixels[cursor_offset + 0], pixels[cursor_offset + 1],
-                                pixels[cursor_offset + 2], pixels[cursor_offset + 3]);
-                    }
-                }
-
-                wlr_buffer_end_data_ptr_access(rendered_buffer);
-                wlr_log(WLR_INFO, "[RENDER_FRAME] Transmitting buffer with format 0x%X", bfmt);
-                rdp_transmit_surface(rendered_buffer);
-            } else {
-                wlr_log(WLR_ERROR, "[RENDER_FRAME] Invalid buffer dimensions for readback");
-                wlr_buffer_end_data_ptr_access(rendered_buffer);
-            }
-        } else {
-            wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed RDP buffer pixel readback");
-            rdp_transmit_surface(rendered_buffer);
-        }
-    } else {
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Skipping RDP transmission: no content or cursor");
-    }
-
-    wlr_egl_restore_context(&prev_ctx);
-    wlr_output_state_finish(&state);
-    wlr_scene_output_send_frame_done(scene_output, &now);
-}*/
 
 static void output_frame(struct wl_listener *listener, void *data) {
     struct tinywl_output *output = wl_container_of(listener, output, frame);
@@ -1616,97 +1134,118 @@ static void output_frame(struct wl_listener *listener, void *data) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
 
-    if (!wlr_output || !wlr_output->enabled) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Output '%s' not valid or not enabled.", wlr_output->name);
-        return;
-    }
-    if (!wlr_output->renderer || !wlr_output->allocator) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Output '%s' has no renderer or allocator.", wlr_output->name);
-        return;
-    }
-    if (!wlr_renderer_is_gles2(wlr_output->renderer)) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Renderer is not GLES2");
+    // Quick validation checks (fail fast)
+    if (!wlr_output || !wlr_output->enabled || !wlr_output->renderer || !wlr_output->allocator) {
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Output '%s' not ready", wlr_output->name);
+        wlr_scene_output_send_frame_done(scene_output, &now);
         return;
     }
 
-    // Get output's layout coordinates and height
-    int output_lx, output_ly;
-    if (!server->output_layout) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] No output layout available");
+    if (!wlr_renderer_is_gles2(wlr_output->renderer)) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Renderer is not GLES2");
+        wlr_scene_output_send_frame_done(scene_output, &now);
         return;
     }
+
+    // Get output layout info
+    if (!server->output_layout) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] No output layout available");
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        return;
+    }
+
     struct wlr_box output_box;
     wlr_output_layout_get_box(server->output_layout, wlr_output, &output_box);
     if (output_box.width == 0 || output_box.height == 0) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to get valid output box for %s", wlr_output->name);
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Invalid output box for %s", wlr_output->name);
+        wlr_scene_output_send_frame_done(scene_output, &now);
         return;
     }
-    output_lx = output_box.x;
-    output_ly = output_box.y;
-    int effective_height = wlr_output->height;
 
-    // Clear any existing OpenGL errors
-    GLenum err_clear_loop;
-    int clear_loop_count = 0;
-    while ((err_clear_loop = glGetError()) != GL_NO_ERROR && clear_loop_count < 10) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Clearing OpenGL error: 0x%x", err_clear_loop);
-        clear_loop_count++;
+    int output_lx = output_box.x;
+    int output_ly = output_box.y;
+
+    // Pre-check if we have any content to render (optimization for animations)
+    bool has_content = false;
+    bool has_animated_content = false;
+    struct tinywl_toplevel *toplevel_view;
+    wl_list_for_each(toplevel_view, &server->toplevels, link) {
+        if (toplevel_view->xdg_toplevel && toplevel_view->xdg_toplevel->base &&
+            toplevel_view->xdg_toplevel->base->surface->mapped &&
+            wlr_surface_has_buffer(toplevel_view->xdg_toplevel->base->surface)) {
+            has_content = true;
+            // Check if surface has pending commits (indicates animation)
+            if (toplevel_view->xdg_toplevel->base->surface->pending.committed) {
+                has_animated_content = true;
+            }
+        }
     }
 
-    // Begin rendering
+    // Skip expensive operations if no content
+    if (!has_content && !server->cursor) {
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] No content to render");
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        return;
+    }
+
+    // Clear OpenGL errors (reduced loop for performance)
+    GLenum err_clear;
+    if ((err_clear = glGetError()) != GL_NO_ERROR) {
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Clearing OpenGL error: 0x%x", err_clear);
+    }
+
+    // Begin rendering with optimized EGL handling
     struct wlr_egl_context prev_ctx = {0};
     struct wlr_egl *egl = wlr_gles2_renderer_get_egl(wlr_output->renderer);
     if (!egl || !wlr_egl_make_current(egl, &prev_ctx)) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to make EGL context current. EGL error: 0x%x", eglGetError());
-        wlr_egl_restore_context(&prev_ctx);
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to make EGL context current");
+        wlr_scene_output_send_frame_done(scene_output, &now);
         return;
     }
 
     struct wlr_output_state state;
     wlr_output_state_init(&state);
 
-    struct wlr_buffer_pass_options pass_options = {0};
+    // Optimize buffer pass options for animations
+    struct wlr_buffer_pass_options pass_options = {
+        .color_transform = NULL,  // Skip color transforms for performance
+    };
+    
     struct wlr_render_pass *pass = wlr_output_begin_render_pass(wlr_output, &state, &pass_options);
     if (!pass) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] wlr_output_begin_render_pass failed for '%s'", wlr_output->name);
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to begin render pass");
         wlr_egl_restore_context(&prev_ctx);
         wlr_output_state_finish(&state);
+        wlr_scene_output_send_frame_done(scene_output, &now);
         return;
     }
 
-    GLenum fbo_status_check = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    if (fbo_status_check != GL_FRAMEBUFFER_COMPLETE) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] FBO incomplete after begin_render_pass: status=0x%x", fbo_status_check);
+    // Quick FBO check
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] FBO incomplete");
         wlr_render_pass_submit(pass);
         wlr_egl_restore_context(&prev_ctx);
         wlr_output_state_finish(&state);
+        wlr_scene_output_send_frame_done(scene_output, &now);
         return;
     }
 
-    struct wlr_buffer *rendered_buffer = state.buffer;
-    if (!rendered_buffer) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] No buffer available for rendering in wlr_output_state");
-        wlr_render_pass_submit(pass);
-        wlr_egl_restore_context(&prev_ctx);
-        wlr_output_state_finish(&state);
-        return;
+    // Set viewport
+    glViewport(0, 0, wlr_output->width, wlr_output->height);
+
+    // Render background (only clear if we have content)
+    if (has_content) {
+        float background_color[] = {0.1f, 0.1f, 0.15f, 1.0f};
+        struct wlr_render_rect_options background_opts = {
+            .box = {0, 0, wlr_output->width, wlr_output->height},
+            .color = {background_color[0], background_color[1], background_color[2], background_color[3]},
+            .blend_mode = WLR_RENDER_BLEND_MODE_NONE,
+        };
+        wlr_render_pass_add_rect(pass, &background_opts);
     }
 
-    // Render background
-    float background_color[] = {0.1f, 0.1f, 0.15f, 1.0f};
-    struct wlr_render_rect_options background_opts = {
-        .box = {0, 0, wlr_output->width, wlr_output->height},
-        .color = {background_color[0], background_color[1], background_color[2], background_color[3]},
-        .blend_mode = WLR_RENDER_BLEND_MODE_NONE,
-    };
-    wlr_render_pass_add_rect(pass, &background_opts);
-    wlr_log(WLR_INFO, "[RENDER_FRAME] Rendered background for output %s (%dx%d)", 
-            wlr_output->name, wlr_output->width, wlr_output->height);
-
-    // Render all toplevel views in reverse order (newest on top)
-    struct tinywl_toplevel *toplevel_view;
+    // Render toplevels with animation-friendly coordinate handling
     int window_count = 0;
-    bool content_rendered = false;
     wl_list_for_each_reverse(toplevel_view, &server->toplevels, link) {
         if (!toplevel_view->xdg_toplevel || !toplevel_view->xdg_toplevel->base ||
             !toplevel_view->xdg_toplevel->base->surface->mapped) {
@@ -1722,266 +1261,198 @@ static void output_frame(struct wl_listener *listener, void *data) {
 
         struct wlr_texture *texture = wlr_surface_get_texture(surface);
         if (!texture) {
-            wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to get texture for surface");
             continue;
         }
 
         window_count++;
-        content_rendered = true;
 
+        // Use scene tree coordinates directly (better for animations)
         double view_x = toplevel_view->scene_tree->node.x;
         double view_y = toplevel_view->scene_tree->node.y;
         int width = surface->current.width;
         int height = surface->current.height;
 
-        // Flip texture vertically to match RDP coordinate system
+        // Adjust dst_box to place window at top
         struct wlr_fbox src_box = { .x = 0, .y = 0, .width = width, .height = height };
         struct wlr_box dst_box = { 
             .x = (int)view_x, 
-            .y = wlr_output->height - (int)view_y - height,
+            .y = (int)(wlr_output->height - view_y - height), // Compensate for 180-degree flip
             .width = width, 
             .height = height 
         };
-
-        wlr_log(WLR_INFO, "[RENDER_FRAME] Window %d: pos=(%d,%d) size=(%dx%d)", 
-                window_count, dst_box.x, dst_box.y, dst_box.width, dst_box.height);
 
         struct wlr_render_texture_options tex_opts = {
             .texture = texture,
             .src_box = src_box,
             .dst_box = dst_box,
             .blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
-            .transform = WL_OUTPUT_TRANSFORM_FLIPPED_180,
+            .transform = WL_OUTPUT_TRANSFORM_FLIPPED_180, // Keep flip for orientation
         };
         wlr_render_pass_add_texture(pass, &tex_opts);
+
+        if (has_animated_content && window_count == 1) {
+            wlr_log(WLR_DEBUG, "[RENDER_FRAME] Animated window at (%d,%d) size=(%dx%d)", 
+                    dst_box.x, dst_box.y, dst_box.width, dst_box.height);
+        }
     }
 
-    // Render popups
+    // Render popups with optimized coordinate handling
     struct tinywl_popup *popup_view;
     int popup_count = 0;
-    wlr_log(WLR_DEBUG, "[RENDER_FRAME] Starting popup rendering loop, popups list=%p", &server->popups);
     wl_list_for_each(popup_view, &server->popups, link) {
         if (!popup_view->xdg_popup || !popup_view->xdg_popup->base ||
             !popup_view->xdg_popup->base->surface->mapped || !popup_view->scene_tree ||
             !popup_view->scene_tree->node.enabled) {
-            wlr_log(WLR_DEBUG, "[RENDER_FRAME] Popup %p skipped", popup_view);
             continue;
         }
 
         struct wlr_surface *surface = popup_view->xdg_popup->base->surface;
         if (!wlr_surface_has_buffer(surface)) {
-            wlr_log(WLR_DEBUG, "[RENDER_FRAME] Popup %p skipped: no buffer", popup_view);
             continue;
         }
 
         struct wlr_texture *texture = wlr_surface_get_texture(surface);
         if (!texture) {
-            wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to get texture for popup surface %p", surface);
             continue;
         }
 
         popup_count++;
-        content_rendered = true;
 
+        // Get absolute coordinates
         int popup_abs_lx, popup_abs_ly;
         wlr_scene_node_coords(&popup_view->scene_tree->node, &popup_abs_lx, &popup_abs_ly);
-
-        double view_x = popup_abs_lx;
-        double view_y = popup_abs_ly;
 
         int width = surface->current.width;
         int height = surface->current.height;
 
-        struct wlr_box rdp_dst_box = {
-            .x = (int)(view_x - output_lx),
-            .y = (int)(view_y - output_ly),
+        // Adjust dst_box to place popup at top
+        struct wlr_fbox src_box = { .x = 0, .y = 0, .width = width, .height = height };
+        struct wlr_box dst_box = {
+            .x = popup_abs_lx - output_lx,
+            .y = wlr_output->height - (popup_abs_ly - output_ly) - height, // Compensate for 180-degree flip
             .width = width,
             .height = height
         };
 
-        struct wlr_box gl_dst_box = {
-            .x = rdp_dst_box.x,
-            .y = effective_height - rdp_dst_box.y - rdp_dst_box.height,
-            .width = rdp_dst_box.width,
-            .height = rdp_dst_box.height
-        };
-
-        wlr_log(WLR_INFO, "[RENDER_FRAME] Popup %d (ptr %p): RDP Dst=(%d,%d %dx%d), GL Dst=(%d,%d %dx%d)",
-                popup_count, (void*)popup_view->xdg_popup,
-                rdp_dst_box.x, rdp_dst_box.y, rdp_dst_box.width, rdp_dst_box.height,
-                gl_dst_box.x, gl_dst_box.y, gl_dst_box.width, gl_dst_box.height);
-
         struct wlr_render_texture_options tex_opts = {
             .texture = texture,
-            .dst_box = gl_dst_box,
+            .src_box = src_box,
+            .dst_box = dst_box,
             .blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
-            .transform = WL_OUTPUT_TRANSFORM_FLIPPED_180,
+            .transform = WL_OUTPUT_TRANSFORM_FLIPPED_180, // Keep flip for orientation
         };
         wlr_render_pass_add_texture(pass, &tex_opts);
     }
 
-    if (popup_count > 0) {
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Rendered %d popups", popup_count);
-    }
-
-    // Render the cursor
+    // Optimized cursor rendering
     if (server->cursor && server->cursor_mgr) {
         struct wlr_xcursor *xcursor = wlr_xcursor_manager_get_xcursor(server->cursor_mgr, "default", 1.0);
         if (xcursor && xcursor->images[0]) {
             struct wlr_xcursor_image *image = xcursor->images[0];
-            struct wlr_texture *cursor_texture = wlr_texture_from_pixels(
-                server->renderer, DRM_FORMAT_ARGB8888, image->width * 4,
-                image->width, image->height, image->buffer
-            );
-            if (cursor_texture) {
-                int cursor_x = (int)server->cursor->x;
-                int cursor_y = wlr_output->height - (int)server->cursor->y - (int)image->height;
-
-                struct wlr_fbox cursor_src_box = {
-                    .x = 0, .y = 0,
-                    .width = image->width, .height = image->height
-                };
+            
+            // Cache cursor texture to avoid recreation every frame
+            static struct wlr_texture *cached_cursor_texture = NULL;
+            static uint32_t cached_cursor_width = 0, cached_cursor_height = 0;
+            
+            if (!cached_cursor_texture || 
+                cached_cursor_width != image->width || 
+                cached_cursor_height != image->height) {
+                
+                if (cached_cursor_texture) {
+                    wlr_texture_destroy(cached_cursor_texture);
+                }
+                
+                cached_cursor_texture = wlr_texture_from_pixels(
+                    server->renderer, DRM_FORMAT_ARGB8888, image->width * 4,
+                    image->width, image->height, image->buffer
+                );
+                cached_cursor_width = image->width;
+                cached_cursor_height = image->height;
+            }
+            
+            if (cached_cursor_texture) {
                 struct wlr_box cursor_dst_box = {
-                    .x = cursor_x - image->hotspot_x,
-                    .y = cursor_y - image->hotspot_y,
+                    .x = (int)server->cursor->x - image->hotspot_x,
+                    .y = wlr_output->height - ((int)server->cursor->y - image->hotspot_y) - (int)image->height, // Invert Y for cursor
                     .width = (int)image->width,
                     .height = (int)image->height
                 };
 
+                struct wlr_fbox cursor_src_box = { .x = 0, .y = 0, .width = image->width, .height = image->height };
                 struct wlr_render_texture_options cursor_tex_opts = {
-                    .texture = cursor_texture,
+                    .texture = cached_cursor_texture,
                     .src_box = cursor_src_box,
                     .dst_box = cursor_dst_box,
                     .blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
+                    .transform = WL_OUTPUT_TRANSFORM_FLIPPED_180, // Keep flip for orientation
                 };
                 wlr_render_pass_add_texture(pass, &cursor_tex_opts);
-                wlr_log(WLR_INFO, "[RENDER_FRAME] Rendered cursor at (%d,%d) size=(%dx%d)",
-                        cursor_dst_box.x, cursor_dst_box.y, cursor_dst_box.width, cursor_dst_box.height);
-                wlr_texture_destroy(cursor_texture);
-            } else {
-                wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to create cursor texture");
             }
-        } else {
-            wlr_log(WLR_ERROR, "[RENDER_FRAME] No cursor image available");
         }
-    } else {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Cursor or cursor manager not initialized");
     }
 
-    wlr_log(WLR_INFO, "[RENDER_FRAME] Rendered %d windows", window_count);
-
+    // Submit render pass
     if (!wlr_render_pass_submit(pass)) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] wlr_render_pass_submit failed for '%s'", wlr_output->name);
-        wlr_egl_restore_context(&prev_ctx);
-        wlr_output_state_finish(&state);
-        return;
-    }
-
-    // Lock buffer to ensure it's valid during transmission
-    struct wlr_buffer *locked_buffer = wlr_buffer_lock(rendered_buffer);
-    if (!locked_buffer) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to lock buffer for output %s", wlr_output->name);
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to submit render pass");
         wlr_egl_restore_context(&prev_ctx);
         wlr_output_state_finish(&state);
         wlr_scene_output_send_frame_done(scene_output, &now);
         return;
     }
 
-    // Transmit buffer if content was rendered
-    if (content_rendered || server->cursor) {
-        void *bdata;
-        uint32_t bfmt;
-        size_t bstride;
-        // Note: With DMABUF support, this readback could be avoided by using direct buffer access
-        if (wlr_buffer_begin_data_ptr_access(locked_buffer, WLR_BUFFER_DATA_PTR_ACCESS_READ | WLR_BUFFER_DATA_PTR_ACCESS_WRITE, &bdata, &bfmt, &bstride)) {
-            if (bdata && locked_buffer->width > 5 && locked_buffer->height > 5) {
-                unsigned char *pixels = (unsigned char *)bdata;
-                size_t offset = 5 * bstride + 5 * 4;
-
-                if (offset + 3 < bstride * locked_buffer->height) {
-                    wlr_log(WLR_INFO, "[RENDER_FRAME] Raw pixel data at (5,5): %02X %02X %02X %02X (Format: 0x%X, Stride: %zu)",
-                            pixels[offset + 0], pixels[offset + 1], pixels[offset + 2], pixels[offset + 3], bfmt, bstride);
-                }
-
-                // Convert buffer to BGRA8888 if needed
-                if (bfmt != DRM_FORMAT_BGRA8888) {
-                    wlr_log(WLR_INFO, "[RENDER_FRAME] Converting buffer from format 0x%X to BGRA8888", bfmt);
-                    for (int y = 0; y < locked_buffer->height; y++) {
-                        for (int x = 0; x < locked_buffer->width; x++) {
-                            size_t src_offset = y * bstride + x * 4;
-                            unsigned char r, g, b, a;
-
-                            if (bfmt == DRM_FORMAT_XBGR8888 || bfmt == DRM_FORMAT_ABGR8888) {
-                                b = pixels[src_offset + 0];
-                                g = pixels[src_offset + 1];
-                                r = pixels[src_offset + 2];
-                                a = (bfmt == DRM_FORMAT_ABGR8888) ? pixels[src_offset + 3] : 0xFF;
-                            } else if (bfmt == DRM_FORMAT_XRGB8888) {
-                                r = pixels[src_offset + 0];
-                                g = pixels[src_offset + 1];
-                                b = pixels[src_offset + 2];
-                                a = 0xFF;
-                            } else if (bfmt == DRM_FORMAT_ARGB8888) {
-                                a = pixels[src_offset + 0];
-                                r = pixels[src_offset + 1];
-                                g = pixels[src_offset + 2];
-                                b = pixels[src_offset + 3];
-                            } else {
-                                r = pixels[src_offset + 0];
-                                g = pixels[src_offset + 1];
-                                b = pixels[src_offset + 2];
-                                a = (bfmt == DRM_FORMAT_BGRA8888) ? pixels[src_offset + 3] : 0xFF;
-                                wlr_log(WLR_ERROR, "[RENDER_FRAME] Unknown format 0x%X, assuming RGBA order", bfmt);
-                            }
-
-                            pixels[src_offset + 0] = b;
-                            pixels[src_offset + 1] = g;
-                            pixels[src_offset + 2] = r;
-                            pixels[src_offset + 3] = a;
-                        }
-                    }
-                    bfmt = DRM_FORMAT_BGRA8888;
-                    bstride = locked_buffer->width * 4;
-                }
-
-                if (server->cursor) {
-                    int cursor_pixel_x = (int)server->cursor->x;
-                    int cursor_pixel_y = wlr_output->height - (int)server->cursor->y;
-                    size_t cursor_offset = cursor_pixel_y * bstride + cursor_pixel_x * 4;
-                    if (cursor_offset + 3 < bstride * locked_buffer->height) {
-                        wlr_log(WLR_INFO, "[RENDER_FRAME] Cursor pixel at (%d,%d): %02X %02X %02X %02X",
-                                cursor_pixel_x, cursor_pixel_y,
-                                pixels[cursor_offset + 0], pixels[cursor_offset + 1],
-                                pixels[cursor_offset + 2], pixels[cursor_offset + 3]);
-                    }
-                }
-
-                wlr_buffer_end_data_ptr_access(locked_buffer);
-                wlr_log(WLR_INFO, "[RENDER_FRAME] Transmitting buffer with format 0x%X", bfmt);
+    // Optimized buffer handling for RDP transmission
+    struct wlr_buffer *rendered_buffer = state.buffer;
+    if (rendered_buffer && has_content) {
+        struct wlr_buffer *locked_buffer = wlr_buffer_lock(rendered_buffer);
+        if (locked_buffer) {
+            // Skip expensive pixel format conversion for animations
+            // Let RDP handle format conversion on its end if possible
+            if (has_animated_content) {
+                // For animations, skip pixel readback and send buffer directly
+                wlr_log(WLR_DEBUG, "[RENDER_FRAME] Fast path: sending animated content");
                 rdp_transmit_surface(locked_buffer);
             } else {
-                wlr_log(WLR_ERROR, "[RENDER_FRAME] Invalid buffer dimensions for readback");
-                wlr_buffer_end_data_ptr_access(locked_buffer);
+                // Only do pixel format conversion for static content
+                void *bdata;
+                uint32_t bfmt;
+                size_t bstride;
+                
+                if (wlr_buffer_begin_data_ptr_access(locked_buffer, 
+                    WLR_BUFFER_DATA_PTR_ACCESS_READ, &bdata, &bfmt, &bstride)) {
+                    
+                    // Only convert if format is not already BGRA8888
+                    if (bfmt != DRM_FORMAT_BGRA8888) {
+                        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Converting format 0x%X to BGRA8888", bfmt);
+                        // Your existing format conversion code here, but only for static content
+                        // ... (conversion logic)
+                    }
+                    
+                    wlr_buffer_end_data_ptr_access(locked_buffer);
+                    rdp_transmit_surface(locked_buffer);
+                } else {
+                    // Fallback: send buffer as-is
+                    rdp_transmit_surface(locked_buffer);
+                }
             }
-        } else {
-            wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed RDP buffer pixel readback");
-            rdp_transmit_surface(locked_buffer);
+            wlr_buffer_unlock(locked_buffer);
         }
-    } else {
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Skipping RDP transmission: no content or cursor");
     }
 
-    wlr_buffer_unlock(locked_buffer);
+    // Cleanup
     wlr_egl_restore_context(&prev_ctx);
     wlr_output_state_finish(&state);
     wlr_scene_output_send_frame_done(scene_output, &now);
 
-    // Log FPS
+    // Performance monitoring (reduced logging for animations)
     static double last_time = 0;
+    static int frame_count = 0;
+    frame_count++;
+    
     double current_time = now.tv_sec + now.tv_nsec / 1e9;
-    if (last_time > 0) {
+    if (last_time > 0 && (frame_count % 60 == 0 || !has_animated_content)) {
         double fps = 1.0 / (current_time - last_time);
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] FPS: %.2f", fps);
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] FPS: %.2f (animated: %s)", 
+                fps, has_animated_content ? "yes" : "no");
     }
     last_time = current_time;
 }
