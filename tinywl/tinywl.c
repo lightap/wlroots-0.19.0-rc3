@@ -285,6 +285,9 @@ struct tinywl_toplevel {
     struct wl_listener request_resize;
     struct wl_listener request_maximize;
     struct wl_listener request_fullscreen;
+     struct wlr_texture *cached_texture;
+    uint32_t last_commit_seq;  // Track surface commits
+    bool needs_redraw;
 };
 
 
@@ -1119,22 +1122,65 @@ static void popup_commit(struct wl_listener *listener, void *data) {
 #include <wlr/render/wlr_renderer.h>
 
 
+
+// Helper function to check if surface has been damaged/changed
+static bool surface_needs_update(struct tinywl_toplevel *toplevel_view) {
+    struct wlr_surface *surface = toplevel_view->xdg_toplevel->base->surface;
+    
+    // Check if surface has new commits since last render
+    if (surface->current.seq != toplevel_view->last_commit_seq) {
+        toplevel_view->last_commit_seq = surface->current.seq;
+        return true;
+    }
+    
+    // Check if we've marked it for redraw
+    if (toplevel_view->needs_redraw) {
+        return true;
+    }
+    
+    // Check surface damage
+    if (surface->current.committed & WLR_SURFACE_STATE_SURFACE_DAMAGE) {
+        pixman_region32_t surface_damage;
+        pixman_region32_init(&surface_damage);
+        wlr_surface_get_effective_damage(surface, &surface_damage);
+        bool has_damage = pixman_region32_not_empty(&surface_damage);
+        pixman_region32_fini(&surface_damage);
+        if (has_damage) {
+            wlr_log(WLR_DEBUG, "Surface %p has damage, needs update", surface);
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+
 static void output_frame(struct wl_listener *listener, void *data) {
     struct tinywl_output *output = wl_container_of(listener, output, frame);
     struct wlr_output *wlr_output = output->wlr_output;
     struct tinywl_server *server = output->server;
     struct wlr_scene *scene = server->scene;
 
+    // Check if a frame is already pending
+    if (wlr_output->frame_pending) {
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Frame pending for %s, skipping", wlr_output->name);
+        return;
+    }
+
     struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(scene, wlr_output);
     if (!scene_output) {
         wlr_log(WLR_ERROR, "[RENDER_FRAME] No scene output for %s", wlr_output->name);
+        wlr_output_schedule_frame(wlr_output);
         return;
     }
+
+
+
 
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
 
-    // Quick validation checks (fail fast)
+    // Validate output state
     if (!wlr_output || !wlr_output->enabled || !wlr_output->renderer || !wlr_output->allocator) {
         wlr_log(WLR_DEBUG, "[RENDER_FRAME] Output '%s' not ready", wlr_output->name);
         wlr_scene_output_send_frame_done(scene_output, &now);
@@ -1147,7 +1193,6 @@ static void output_frame(struct wl_listener *listener, void *data) {
         return;
     }
 
-    // Get output layout info
     if (!server->output_layout) {
         wlr_log(WLR_ERROR, "[RENDER_FRAME] No output layout available");
         wlr_scene_output_send_frame_done(scene_output, &now);
@@ -1162,143 +1207,223 @@ static void output_frame(struct wl_listener *listener, void *data) {
         return;
     }
 
-    int output_lx = output_box.x;
-    int output_ly = output_box.y;
+    // Initialize damage tracking
+    struct pixman_region32 damage;
+    pixman_region32_init(&damage);
+    
+    // Get damage from scene output - use simpler approach for compatibility
+    bool needs_frame = false;
+    
+    // Check if scene output needs rendering
+    if (scene_output && scene_output->damage_ring.current.data) {
+        pixman_region32_copy(&damage, &scene_output->damage_ring.current);
+        needs_frame = pixman_region32_not_empty(&damage);
+    } else {
+        // Fallback: assume full damage if we can't get specific damage info
+        pixman_region32_init_rect(&damage, 0, 0, wlr_output->width, wlr_output->height);
+        needs_frame = true;
+    }
 
-    // Pre-check if we have any content to render (optimization for animations)
-    bool has_content = false;
-    bool has_animated_content = false;
-    struct tinywl_toplevel *toplevel_view;
-    wl_list_for_each(toplevel_view, &server->toplevels, link) {
-        if (toplevel_view->xdg_toplevel && toplevel_view->xdg_toplevel->base &&
-            toplevel_view->xdg_toplevel->base->surface->mapped &&
-            wlr_surface_has_buffer(toplevel_view->xdg_toplevel->base->surface)) {
-            has_content = true;
-            // Check if surface has pending commits (indicates animation)
-            if (toplevel_view->xdg_toplevel->base->surface->pending.committed) {
-                has_animated_content = true;
+    // Add cursor damage
+    static double last_cursor_x = -1, last_cursor_y = -1;
+    bool cursor_moved = false;
+    if (server->cursor && server->cursor_mgr && server->output_layout) {
+        double cursor_x = fmax(0, fmin(server->cursor->x, output_box.width - 1));
+        double cursor_y = fmax(0, fmin(server->cursor->y, output_box.height - 1));
+        double dx = cursor_x - last_cursor_x;
+        double dy = cursor_y - last_cursor_y;
+        if (fabs(dx) > 1.0 || fabs(dy) > 1.0) {
+            cursor_moved = true;
+            struct wlr_xcursor *xcursor = wlr_xcursor_manager_get_xcursor(server->cursor_mgr, "default", 1.0);
+            if (xcursor && xcursor->images[0]) {
+                struct wlr_xcursor_image *image = xcursor->images[0];
+                // Damage the previous and current cursor regions
+                pixman_region32_t cursor_damage;
+                pixman_region32_init_rect(&cursor_damage,
+                    (int)last_cursor_x - image->hotspot_x,
+                    (int)last_cursor_y - image->hotspot_y,
+                    image->width, image->height);
+                pixman_region32_union_rect(&cursor_damage, &cursor_damage,
+                    (int)cursor_x - image->hotspot_x,
+                    (int)cursor_y - image->hotspot_y,
+                    image->width, image->height);
+                pixman_region32_union(&damage, &damage, &cursor_damage);
+                pixman_region32_fini(&cursor_damage);
+                wlr_log(WLR_DEBUG, "[RENDER_FRAME] Cursor moved: (%.2f,%.2f)", cursor_x, cursor_y);
+                last_cursor_x = cursor_x;
+                last_cursor_y = cursor_y;
             }
         }
     }
 
-    // Skip expensive operations if no content
-    if (!has_content && !server->cursor) {
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] No content to render");
+    // Skip rendering if no damage or cursor movement
+    if (!needs_frame && !cursor_moved) {
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] No damage or cursor movement, skipping render");
         wlr_scene_output_send_frame_done(scene_output, &now);
+        pixman_region32_fini(&damage);
         return;
     }
 
-    // Clear OpenGL errors (reduced loop for performance)
-    GLenum err_clear;
-    if ((err_clear = glGetError()) != GL_NO_ERROR) {
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Clearing OpenGL error: 0x%x", err_clear);
-    }
-
-    // Begin rendering with optimized EGL handling
+    // Begin rendering
+       // Begin rendering
     struct wlr_egl_context prev_ctx = {0};
     struct wlr_egl *egl = wlr_gles2_renderer_get_egl(wlr_output->renderer);
     if (!egl || !wlr_egl_make_current(egl, &prev_ctx)) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to make EGL context current");
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to make EGL context current"); // Corrected log prefix
         wlr_scene_output_send_frame_done(scene_output, &now);
+        pixman_region32_fini(&damage);
         return;
     }
 
-    struct wlr_output_state state;
+    struct wlr_output_state state; // This is the state for this commit operation
     wlr_output_state_init(&state);
 
-    // Optimize buffer pass options for animations
+    // --- (A) ADD THIS BLOCK TO PREPARE 'state' ---
+    wlr_output_state_set_enabled(&state, true);
+
+    struct wlr_output_mode *current_wlr_mode = wlr_output->current_mode;
+    if (current_wlr_mode) {
+        wlr_output_state_set_mode(&state, current_wlr_mode);
+    } else {
+        wlr_log(WLR_ERROR, "[TINYWL_OUTPUT_FRAME] wlr_output->current_mode is NULL! Cannot set mode in output state for commit. This is a critical error.");
+        // You MUST have a mode on the output for it to be valid for commits.
+        // Your rdp_output_create should ensure this.
+        // For now, if this happens, the commit will likely fail, but let's proceed to see the logs.
+    }
+
+    // 'damage' is the pixman_region32_t you calculated earlier. Set it on 'state'.
+    wlr_output_state_set_damage(&state, &damage);
+    // Now 'state.committed' will have ENABLED, MODE (if mode was set), and DAMAGE bits set.
+    // 'state.enabled' will be true.
+    // 'state.mode' will be set (if current_wlr_mode was not NULL).
+    // 'state.damage' will be a copy of your calculated 'damage'.
+    // --- END OF (A) ---
+
     struct wlr_buffer_pass_options pass_options = {
-        .color_transform = NULL,  // Skip color transforms for performance
+        .color_transform = NULL,
     };
-    
+
+    // Now, wlr_output_begin_render_pass receives the 'state' that has been properly prepared.
+    // This call will additionally set state.buffer (if successful)
+    // and set the WLR_OUTPUT_STATE_BUFFER bit in state.committed.
     struct wlr_render_pass *pass = wlr_output_begin_render_pass(wlr_output, &state, &pass_options);
     if (!pass) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to begin render pass");
+        wlr_log(WLR_ERROR, "[TINYWL_OUTPUT_FRAME] Failed to begin render pass"); // Corrected log prefix
         wlr_egl_restore_context(&prev_ctx);
         wlr_output_state_finish(&state);
         wlr_scene_output_send_frame_done(scene_output, &now);
+        pixman_region32_fini(&damage);
         return;
     }
 
-    // Quick FBO check
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
         wlr_log(WLR_ERROR, "[RENDER_FRAME] FBO incomplete");
         wlr_render_pass_submit(pass);
         wlr_egl_restore_context(&prev_ctx);
         wlr_output_state_finish(&state);
         wlr_scene_output_send_frame_done(scene_output, &now);
+        pixman_region32_fini(&damage);
         return;
     }
 
-    // Set viewport
     glViewport(0, 0, wlr_output->width, wlr_output->height);
 
-    // Render background (only clear if we have content)
-    if (has_content) {
-        float background_color[] = {0.1f, 0.1f, 0.15f, 1.0f};
+    // Only render background in damaged regions
+    float background_color[] = {0.1f, 0.1f, 0.15f, 1.0f};
+    int nrects;
+    pixman_box32_t *rects = pixman_region32_rectangles(&damage, &nrects);
+    for (int i = 0; i < nrects; i++) {
         struct wlr_render_rect_options background_opts = {
-            .box = {0, 0, wlr_output->width, wlr_output->height},
+            .box = {
+                .x = rects[i].x1,
+                .y = rects[i].y1,
+                .width = rects[i].x2 - rects[i].x1,
+                .height = rects[i].y2 - rects[i].y1,
+            },
             .color = {background_color[0], background_color[1], background_color[2], background_color[3]},
             .blend_mode = WLR_RENDER_BLEND_MODE_NONE,
         };
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Rendering background rect at (%d,%d) size=(%dx%d)",
+                background_opts.box.x, background_opts.box.y,
+                background_opts.box.width, background_opts.box.height);
         wlr_render_pass_add_rect(pass, &background_opts);
     }
 
-    // Render toplevels with animation-friendly coordinate handling
-    int window_count = 0;
-    wl_list_for_each_reverse(toplevel_view, &server->toplevels, link) {
-        if (!toplevel_view->xdg_toplevel || !toplevel_view->xdg_toplevel->base ||
-            !toplevel_view->xdg_toplevel->base->surface->mapped) {
-            continue;
-        }
-
-        struct wlr_xdg_surface *xdg_surface = toplevel_view->xdg_toplevel->base;
-        struct wlr_surface *surface = xdg_surface->surface;
-
-        if (!wlr_surface_has_buffer(surface)) {
-            continue;
-        }
-
-        struct wlr_texture *texture = wlr_surface_get_texture(surface);
-        if (!texture) {
-            continue;
-        }
-
-        window_count++;
-
-        // Use scene tree coordinates directly (better for animations)
-        double view_x = toplevel_view->scene_tree->node.x;
-        double view_y = toplevel_view->scene_tree->node.y;
-        int width = surface->current.width;
-        int height = surface->current.height;
-
-        // Adjust dst_box to place window at top
-        struct wlr_fbox src_box = { .x = 0, .y = 0, .width = width, .height = height };
-        struct wlr_box dst_box = { 
-            .x = (int)view_x, 
-            .y = (int)(wlr_output->height - view_y - height), // Compensate for 180-degree flip
-            .width = width, 
-            .height = height 
-        };
-
-        struct wlr_render_texture_options tex_opts = {
-            .texture = texture,
-            .src_box = src_box,
-            .dst_box = dst_box,
-            .blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
-            .transform = WL_OUTPUT_TRANSFORM_FLIPPED_180, // Keep flip for orientation
-        };
-        wlr_render_pass_add_texture(pass, &tex_opts);
-
-        if (has_animated_content && window_count == 1) {
-            wlr_log(WLR_DEBUG, "[RENDER_FRAME] Animated window at (%d,%d) size=(%dx%d)", 
-                    dst_box.x, dst_box.y, dst_box.width, dst_box.height);
-        }
+  
+// Updated render function
+// Render toplevels
+int window_count = 0;
+struct tinywl_toplevel *toplevel_view;
+wl_list_for_each_reverse(toplevel_view, &server->toplevels, link) {
+    if (!toplevel_view->xdg_toplevel || !toplevel_view->xdg_toplevel->base ||
+        !toplevel_view->xdg_toplevel->base->surface->mapped) {
+        continue;
     }
+    
+    struct wlr_xdg_surface *xdg_surface = toplevel_view->xdg_toplevel->base;
+    struct wlr_surface *surface = xdg_surface->surface;
+    
+    if (!wlr_surface_has_buffer(surface)) {
+        continue;
+    }
+    
+    // Check if we need to update the cached texture
+    bool needs_update = surface_needs_update(toplevel_view);
+    
+    if (needs_update || !toplevel_view->cached_texture) {
+        // Get fresh texture and cache it
+        toplevel_view->cached_texture = wlr_surface_get_texture(surface);
+        toplevel_view->needs_redraw = false;
+        
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Updated cached texture for toplevel");
+    }
+    
+    if (!toplevel_view->cached_texture) {
+        continue;
+    }
+    
+    // Only render if this window or its region has damage
+    // You might want to add more sophisticated damage region checking here
+    bool has_damage = surface->current.committed & WLR_SURFACE_STATE_BUFFER;
+    
+    // For now, we'll render if there's any damage or if it's the first frame
+    if (!has_damage && toplevel_view->last_commit_seq != 0) {
+        // Skip rendering this window - no changes
+        continue;
+    }
+    
+    window_count++;
+    double view_x = toplevel_view->scene_tree->node.x;
+    double view_y = toplevel_view->scene_tree->node.y;
+    int width = surface->current.width;
+    int height = surface->current.height;
+    
+    struct wlr_fbox src_box = { .x = 0, .y = 0, .width = width, .height = height };
+    struct wlr_box dst_box = {
+        .x = (int)view_x,
+        .y = wlr_output->height - (int)view_y - height,
+        .width = width,
+        .height = height
+    };
+    
+    struct wlr_render_texture_options tex_opts = {
+        .texture = toplevel_view->cached_texture,  // Use cached texture
+        .src_box = src_box,
+        .dst_box = dst_box,
+        .blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
+        .transform = WL_OUTPUT_TRANSFORM_FLIPPED_180,
+    };
+    
+    wlr_log(WLR_DEBUG, "[RENDER_FRAME] Rendering toplevel %d at (%d,%d) size=(%dx%d)",
+            window_count, dst_box.x, dst_box.y, dst_box.width, dst_box.height);
+    
+    wlr_render_pass_add_texture(pass, &tex_opts);
+}
 
-    // Render popups with optimized coordinate handling
-    struct tinywl_popup *popup_view;
+
+    // Render popups
     int popup_count = 0;
+    struct tinywl_popup *popup_view;
     wl_list_for_each(popup_view, &server->popups, link) {
         if (!popup_view->xdg_popup || !popup_view->xdg_popup->base ||
             !popup_view->xdg_popup->base->surface->mapped || !popup_view->scene_tree ||
@@ -1318,18 +1443,16 @@ static void output_frame(struct wl_listener *listener, void *data) {
 
         popup_count++;
 
-        // Get absolute coordinates
         int popup_abs_lx, popup_abs_ly;
         wlr_scene_node_coords(&popup_view->scene_tree->node, &popup_abs_lx, &popup_abs_ly);
 
         int width = surface->current.width;
         int height = surface->current.height;
 
-        // Adjust dst_box to place popup at top
         struct wlr_fbox src_box = { .x = 0, .y = 0, .width = width, .height = height };
         struct wlr_box dst_box = {
-            .x = popup_abs_lx - output_lx,
-            .y = wlr_output->height - (popup_abs_ly - output_ly) - height, // Compensate for 180-degree flip
+            .x = popup_abs_lx - output_box.x,
+            .y = wlr_output->height - (popup_abs_ly - output_box.y) - height,
             .width = width,
             .height = height
         };
@@ -1339,29 +1462,27 @@ static void output_frame(struct wl_listener *listener, void *data) {
             .src_box = src_box,
             .dst_box = dst_box,
             .blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
-            .transform = WL_OUTPUT_TRANSFORM_FLIPPED_180, // Keep flip for orientation
+            .transform = WL_OUTPUT_TRANSFORM_FLIPPED_180,
         };
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Rendering popup %d at (%d,%d) size=(%dx%d)",
+                popup_count, dst_box.x, dst_box.y, dst_box.width, dst_box.height);
         wlr_render_pass_add_texture(pass, &tex_opts);
     }
 
-    // Optimized cursor rendering
-    if (server->cursor && server->cursor_mgr) {
+    // Render cursor
+    if (server->cursor && server->cursor_mgr && server->output_layout) {
         struct wlr_xcursor *xcursor = wlr_xcursor_manager_get_xcursor(server->cursor_mgr, "default", 1.0);
         if (xcursor && xcursor->images[0]) {
             struct wlr_xcursor_image *image = xcursor->images[0];
-            
-            // Cache cursor texture to avoid recreation every frame
             static struct wlr_texture *cached_cursor_texture = NULL;
             static uint32_t cached_cursor_width = 0, cached_cursor_height = 0;
-            
-            if (!cached_cursor_texture || 
-                cached_cursor_width != image->width || 
+
+            if (!cached_cursor_texture ||
+                cached_cursor_width != image->width ||
                 cached_cursor_height != image->height) {
-                
                 if (cached_cursor_texture) {
                     wlr_texture_destroy(cached_cursor_texture);
                 }
-                
                 cached_cursor_texture = wlr_texture_from_pixels(
                     server->renderer, DRM_FORMAT_ARGB8888, image->width * 4,
                     image->width, image->height, image->buffer
@@ -1369,11 +1490,13 @@ static void output_frame(struct wl_listener *listener, void *data) {
                 cached_cursor_width = image->width;
                 cached_cursor_height = image->height;
             }
-            
+
             if (cached_cursor_texture) {
+                double cursor_x = fmax(0, fmin(server->cursor->x, output_box.width - 1));
+                double cursor_y = fmax(0, fmin(server->cursor->y, output_box.height - 1));
                 struct wlr_box cursor_dst_box = {
-                    .x = (int)server->cursor->x - image->hotspot_x,
-                    .y = wlr_output->height - ((int)server->cursor->y - image->hotspot_y) - (int)image->height, // Invert Y for cursor
+                    .x = (int)cursor_x - image->hotspot_x,
+                    .y = wlr_output->height - ((int)cursor_y - image->hotspot_y) - (int)image->height,
                     .width = (int)image->width,
                     .height = (int)image->height
                 };
@@ -1384,12 +1507,547 @@ static void output_frame(struct wl_listener *listener, void *data) {
                     .src_box = cursor_src_box,
                     .dst_box = cursor_dst_box,
                     .blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
-                    .transform = WL_OUTPUT_TRANSFORM_FLIPPED_180, // Keep flip for orientation
+                    .transform = WL_OUTPUT_TRANSFORM_FLIPPED_180,
                 };
+                wlr_log(WLR_DEBUG, "[RENDER_FRAME] Rendering cursor at (%d,%d) size=(%dx%d)",
+                        cursor_dst_box.x, cursor_dst_box.y, cursor_dst_box.width, cursor_dst_box.height);
                 wlr_render_pass_add_texture(pass, &cursor_tex_opts);
             }
         }
     }
+
+       // Submit render pass
+    if (!wlr_render_pass_submit(pass)) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to submit render pass");
+        wlr_egl_restore_context(&prev_ctx);
+        wlr_output_state_finish(&state); // state is from wlr_output_begin_render_pass
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        pixman_region32_fini(&damage);
+        return;
+    }
+    // At this point, rendering is done. The 'state' variable (used with wlr_output_begin_render_pass)
+    // now contains state.buffer which is the rendered frame.
+    // We also need to ensure 'state' has other necessary fields set for a valid commit.
+
+    // --- ENSURE 'state' IS FULLY PREPARED FOR COMMIT ---
+    // The 'enabled' and 'mode' should have been set by wlr_output_begin_render_pass
+    // if it was going to change them, or it uses the output's current.
+    // However, it's safer to explicitly set what we intend to commit.
+    wlr_output_state_set_enabled(&state, true);
+ //   struct wlr_output_mode *current_wlr_mode = wlr_output->current_mode;
+    if (current_wlr_mode) {
+        wlr_output_state_set_mode(&state, current_wlr_mode);
+    } else {
+        wlr_log(WLR_ERROR, "[TINYWL_OUTPUT_FRAME] CRITICAL: wlr_output->current_mode is NULL before commit for %s.", wlr_output->name);
+        // This is a problem, the output needs a mode to be valid.
+    }
+    // 'damage' is the pixman_region32_t you calculated. Set it into 'state.damage'.
+    wlr_output_state_set_damage(&state, &damage);
+    // --- End of ensuring 'state' is prepared ---
+
+
+    // --- LOGGING BEFORE COMMIT (using the 'state' variable from begin_render_pass) ---
+    struct timespec _pre_commit_ts, _post_commit_ts;
+    wlr_log(WLR_ERROR, "--- TINYWL_OUTPUT_FRAME: Inspecting 'state' (from begin_render_pass) BEFORE commit for %s ---",
+            wlr_output->name ? wlr_output->name : "(null)");
+    wlr_log(WLR_ERROR, "  state.committed: 0x%X", state.committed);
+    wlr_log(WLR_ERROR, "  state.enabled: %d", state.enabled);
+    if (state.committed & WLR_OUTPUT_STATE_MODE) {
+        if (state.mode) {
+            wlr_log(WLR_ERROR, "  state.mode: %p (%dx%d @ %dHz)",
+                    (void*)state.mode, state.mode->width, state.mode->height, state.mode->refresh);
+        } else { wlr_log(WLR_ERROR, "  state.mode: NULL (but MODE bit is set!)"); }
+    } else { wlr_log(WLR_ERROR, "  WLR_OUTPUT_STATE_MODE is NOT SET in committed flags."); }
+
+    if (state.committed & WLR_OUTPUT_STATE_BUFFER) {
+        if (state.buffer) {
+            wlr_log(WLR_ERROR, "  state.buffer: %p (w:%d, h:%d)",
+                    (void*)state.buffer, state.buffer->width, state.buffer->height);
+        } else { wlr_log(WLR_ERROR, "  state.buffer: NULL (but BUFFER bit is set!)"); }
+    } else { wlr_log(WLR_ERROR, "  WLR_OUTPUT_STATE_BUFFER is NOT SET in committed flags."); }
+
+    if (state.committed & WLR_OUTPUT_STATE_DAMAGE) {
+        wlr_log(WLR_ERROR, "  WLR_OUTPUT_STATE_DAMAGE is SET in committed flags. Damage empty: %d",
+                !pixman_region32_not_empty(&state.damage));
+    } else { wlr_log(WLR_ERROR, "  WLR_OUTPUT_STATE_DAMAGE is NOT SET in committed flags."); }
+    // --- END OF INSPECTION LOG ---
+
+    clock_gettime(CLOCK_MONOTONIC, &_pre_commit_ts);
+    wlr_log(WLR_ERROR, "TINYWL_OUTPUT_FRAME: PRE wlr_output_commit_state() for %s. Timestamp: %ld.%09ld",
+            wlr_output->name ? wlr_output->name : "(null)", _pre_commit_ts.tv_sec, _pre_commit_ts.tv_nsec);
+
+   // bool committed = wlr_output_commit_state(wlr_output, &state); // COMMIT THE 'state' VARIABLE
+
+    clock_gettime(CLOCK_MONOTONIC, &_post_commit_ts);
+  //  long commit_ns_diff = (_post_commit_ts.tv_sec - _pre_commit_ts.tv_sec) * 1000000000L + (_post_commit_ts.tv_nsec - _pre_commit_ts.tv_nsec);
+   // wlr_log(WLR_ERROR, "TINYWL_OUTPUT_FRAME: POST wlr_output_commit_state() for %s. Committed: %d. Call took %ld ns. Timestamp: %ld.%09ld",
+     //       wlr_output->name ? wlr_output->name : "(null)",
+       //     committed, commit_ns_diff, _post_commit_ts.tv_sec, _post_commit_ts.tv_nsec);
+    // --- END OF CRUCIAL PART ---
+
+    // RDP transmission (only for damaged regions)
+    // This should now use 'state.buffer' which was committed.
+    struct wlr_buffer *rendered_buffer = state.buffer;
+    // ... (rest of your RDP transmission logic) ...
+ //   if (rendered_buffer && (needs_frame || cursor_moved)) {
+        struct wlr_buffer *locked_buffer = wlr_buffer_lock(rendered_buffer);
+        if (locked_buffer) {
+            void *bdata;
+            uint32_t bfmt;
+            size_t bstride;
+            if (wlr_buffer_begin_data_ptr_access(locked_buffer,
+                WLR_BUFFER_DATA_PTR_ACCESS_READ, &bdata, &bfmt, &bstride)) {
+               
+                wlr_buffer_end_data_ptr_access(locked_buffer);
+                rdp_transmit_surface(locked_buffer);
+            } else {
+                rdp_transmit_surface(locked_buffer);
+            }
+            wlr_buffer_unlock(locked_buffer);
+        }
+  //  }
+//
+    // Cleanup
+    wlr_egl_restore_context(&prev_ctx);
+    wlr_output_state_finish(&state);
+    wlr_scene_output_send_frame_done(scene_output, &now);
+    pixman_region32_fini(&damage);
+}
+
+
+
+/*
+static void output_frame(struct wl_listener *listener, void *data) {
+    struct tinywl_output *output = wl_container_of(listener, output, frame);
+    struct wlr_output *wlr_output = output->wlr_output;
+    struct tinywl_server *server = output->server;
+    struct wlr_scene *scene = server->scene;
+
+    // Check if a frame is already pending
+    if (wlr_output->frame_pending) {
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Frame pending for %s, skipping", wlr_output->name);
+        return;
+    }
+
+    struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(scene, wlr_output);
+    if (!scene_output) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] No scene output for %s", wlr_output->name);
+        wlr_output_schedule_frame(wlr_output);
+        return;
+    }
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    // Validate output state
+    if (!wlr_output || !wlr_output->enabled || !wlr_output->renderer || !wlr_output->allocator) {
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Output '%s' not ready", wlr_output->name);
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        return;
+    }
+
+    if (!wlr_renderer_is_gles2(wlr_output->renderer)) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Renderer is not GLES2");
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        return;
+    }
+
+    if (!server->output_layout) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] No output layout available");
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        return;
+    }
+
+    struct wlr_box output_box;
+    wlr_output_layout_get_box(server->output_layout, wlr_output, &output_box);
+    if (output_box.width == 0 || output_box.height == 0) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Invalid output box for %s", wlr_output->name);
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        return;
+    }
+
+    // Initialize damage tracking
+    struct pixman_region32 damage;
+    pixman_region32_init(&damage);
+    
+    // Get damage from scene output
+    bool needs_frame = false;
+    if (scene_output && scene_output->damage_ring.current.data) {
+        pixman_region32_copy(&damage, &scene_output->damage_ring.current);
+        needs_frame = pixman_region32_not_empty(&damage);
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Damage ring copied, needs_frame=%d, damage empty=%d",
+                needs_frame, !pixman_region32_not_empty(&damage));
+    } else {
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Damage ring null or invalid: scene_output=%p, damage_ring.current.data=%p",
+                scene_output, scene_output ? scene_output->damage_ring.current.data : NULL);
+        needs_frame = false;
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Skipping full damage fallback, checking manual sources");
+    }
+
+ // Manually collect damage from toplevels
+struct pixman_region32 toplevel_damage;
+pixman_region32_init(&toplevel_damage);
+struct tinywl_toplevel *toplevel_view;
+bool toplevel_damaged = false;
+wl_list_for_each(toplevel_view, &server->toplevels, link) {
+    if (!toplevel_view->xdg_toplevel || !toplevel_view->xdg_toplevel->base ||
+        !toplevel_view->xdg_toplevel->base->surface->mapped) {
+        continue;
+    }
+    struct wlr_xdg_surface *xdg_surface = toplevel_view->xdg_toplevel->base;
+    struct wlr_surface *surface = xdg_surface->surface;
+    if (!wlr_surface_has_buffer(surface)) {
+        continue;
+    }
+
+    // Check if surface has damage
+    pixman_region32_t surface_damage;
+    pixman_region32_init(&surface_damage);
+    bool has_damage = false;
+    if (surface->current.committed & WLR_SURFACE_STATE_SURFACE_DAMAGE) {
+        wlr_surface_get_effective_damage(surface, &surface_damage);
+        has_damage = pixman_region32_not_empty(&surface_damage);
+    }
+
+    if (has_damage) {
+        // Transform surface damage to output coordinates
+        double view_x = toplevel_view->scene_tree->node.x;
+        double view_y = toplevel_view->scene_tree->node.y;
+        pixman_region32_t transformed_damage;
+        pixman_region32_init(&transformed_damage);
+        pixman_region32_copy(&transformed_damage, &surface_damage);
+        pixman_region32_translate(&transformed_damage, (int)view_x, (int)view_y);
+        pixman_region32_union(&toplevel_damage, &toplevel_damage, &transformed_damage);
+        pixman_region32_fini(&transformed_damage);
+        toplevel_damaged = true;
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Toplevel damage added for surface %p at (%d,%d)", 
+                surface, (int)view_x, (int)view_y);
+    }
+    pixman_region32_fini(&surface_damage);
+}
+if (toplevel_damaged) {
+    pixman_region32_union(&damage, &damage, &toplevel_damage);
+    needs_frame = true;
+}
+pixman_region32_fini(&toplevel_damage);
+
+    // Add cursor damage
+    static double last_cursor_x = -1, last_cursor_y = -1;
+    bool cursor_moved = false;
+    if (server->cursor && server->cursor_mgr && server->output_layout) {
+        double cursor_x = fmax(0, fmin(server->cursor->x, output_box.width - 1));
+        double cursor_y = fmax(0, fmin(server->cursor->y, output_box.height - 1));
+        double dx = cursor_x - last_cursor_x;
+        double dy = cursor_y - last_cursor_y;
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Cursor delta: dx=%.2f, dy=%.2f", dx, dy);
+        if (fabs(dx) > 0.5 || fabs(dy) > 0.5) {
+            cursor_moved = true;
+            struct wlr_xcursor *xcursor = wlr_xcursor_manager_get_xcursor(server->cursor_mgr, "default", 1.0);
+            if (xcursor && xcursor->images[0]) {
+                struct wlr_xcursor_image *image = xcursor->images[0];
+                pixman_region32_t cursor_damage;
+                pixman_region32_init_rect(&cursor_damage,
+                    (int)last_cursor_x - image->hotspot_x,
+                    (int)last_cursor_y - image->hotspot_y,
+                    image->width, image->height);
+                pixman_region32_union_rect(&cursor_damage, &cursor_damage,
+                    (int)cursor_x - image->hotspot_x,
+                    (int)cursor_y - image->hotspot_y,
+                    image->width, image->height);
+                pixman_region32_union(&damage, &damage, &cursor_damage);
+                pixman_region32_fini(&cursor_damage);
+                wlr_log(WLR_DEBUG, "[RENDER_FRAME] Cursor moved: (%d,%d)", (int)cursor_x, (int)cursor_y);
+                needs_frame = true;
+                last_cursor_x = cursor_x;
+                last_cursor_y = cursor_y;
+            }
+        }
+    } else {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Cursor or output layout null: cursor=%p, cursor_mgr=%p, output_layout=%p",
+                server->cursor, server->cursor_mgr, server->output_layout);
+    }
+
+    // Log damage rectangles
+    int nrects;
+    pixman_box32_t *rects = pixman_region32_rectangles(&damage, &nrects);
+    wlr_log(WLR_DEBUG, "[RENDER_FRAME] Damage regions: nrects=%d", nrects);
+    for (int i = 0; i < nrects; i++) {
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Damage rect %d: (%d,%d) size=(%dx%d)",
+                i, rects[i].x1, rects[i].y1, rects[i].x2 - rects[i].x1, rects[i].y2 - rects[i].y1);
+    }
+
+    // Skip rendering if no damage or cursor movement
+    if (!needs_frame && !cursor_moved) {
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] No damage or cursor movement, skipping render");
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        pixman_region32_fini(&damage);
+        return;
+    }
+
+    // Begin rendering
+    struct wlr_egl_context prev_ctx = {0};
+    struct wlr_egl *egl = wlr_gles2_renderer_get_egl(wlr_output->renderer);
+    if (!egl || !wlr_egl_make_current(egl, &prev_ctx)) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to make EGL context current");
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        pixman_region32_fini(&damage);
+        return;
+    }
+
+    struct wlr_output_state state;
+    wlr_output_state_init(&state);
+
+    wlr_output_state_set_enabled(&state, true);
+
+    struct wlr_output_mode *current_wlr_mode = wlr_output->current_mode;
+    if (current_wlr_mode) {
+        wlr_output_state_set_mode(&state, current_wlr_mode);
+    } else {
+        wlr_log(WLR_ERROR, "[TINYWL_OUTPUT_FRAME] wlr_output->current_mode is NULL! Cannot set mode in output state for commit. This is a critical error.");
+    }
+
+    wlr_output_state_set_damage(&state, &damage);
+
+    struct wlr_buffer_pass_options pass_options = {
+        .color_transform = NULL,
+    };
+
+    struct wlr_render_pass *pass = wlr_output_begin_render_pass(wlr_output, &state, &pass_options);
+    if (!pass) {
+        wlr_log(WLR_ERROR, "[TINYWL_OUTPUT_FRAME] Failed to begin render pass");
+        wlr_egl_restore_context(&prev_ctx);
+        wlr_output_state_finish(&state);
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        pixman_region32_fini(&damage);
+        return;
+    }
+
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] FBO incomplete");
+        wlr_render_pass_submit(pass);
+        wlr_egl_restore_context(&prev_ctx);
+        wlr_output_state_finish(&state);
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        pixman_region32_fini(&damage);
+        return;
+    }
+
+    glViewport(0, 0, wlr_output->width, wlr_output->height);
+
+    // Render background in damaged regions
+    float background_color[] = {0.1f, 0.1f, 0.15f, 1.0f};
+    for (int i = 0; i < nrects; i++) {
+        int height = rects[i].y2 - rects[i].y1;
+        int flipped_y = wlr_output->height - rects[i].y1 - height;
+        struct wlr_render_rect_options background_opts = {
+            .box = {
+                .x = rects[i].x1,
+                .y = flipped_y,
+                .width = rects[i].x2 - rects[i].x1,
+                .height = height,
+            },
+            .color = {background_color[0], background_color[1], background_color[2], background_color[3]},
+            .blend_mode = WLR_RENDER_BLEND_MODE_NONE,
+        };
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Rendering background rect at (%d,%d) size=(%dx%d)",
+                background_opts.box.x, background_opts.box.y,
+                background_opts.box.width, background_opts.box.height);
+        wlr_render_pass_add_rect(pass, &background_opts);
+    }
+
+    // Render toplevels
+// Render toplevels
+int window_count = 0;
+wl_list_for_each_reverse(toplevel_view, &server->toplevels, link) {
+    if (!toplevel_view->xdg_toplevel || !toplevel_view->xdg_toplevel->base ||
+        !toplevel_view->xdg_toplevel->base->surface->mapped) {
+        continue;
+    }
+    
+    struct wlr_xdg_surface *xdg_surface = toplevel_view->xdg_toplevel->base;
+    struct wlr_surface *surface = xdg_surface->surface;
+    
+    if (!wlr_surface_has_buffer(surface)) {
+        continue;
+    }
+    
+    bool needs_update = surface_needs_update(toplevel_view);
+    
+    if (needs_update || !toplevel_view->cached_texture) {
+        toplevel_view->cached_texture = wlr_surface_get_texture(surface);
+        toplevel_view->needs_redraw = false;
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Updated cached texture for toplevel, needs_update=%d", needs_update);
+    }
+    
+    if (!toplevel_view->cached_texture) {
+        continue;
+    }
+    
+    // Get surface damage
+    pixman_region32_t surface_damage;
+    pixman_region32_init(&surface_damage);
+    bool has_damage = false;
+    if (surface->current.committed & WLR_SURFACE_STATE_SURFACE_DAMAGE) {
+        wlr_surface_get_effective_damage(surface, &surface_damage);
+        has_damage = pixman_region32_not_empty(&surface_damage);
+    }
+    
+    if (!has_damage && toplevel_view->last_commit_seq != 0) {
+        pixman_region32_fini(&surface_damage);
+        continue;
+    }
+    
+    window_count++;
+    double view_x = toplevel_view->scene_tree->node.x;
+    double view_y = toplevel_view->scene_tree->node.y;
+    int width = surface->current.width;
+    int height = surface->current.height;
+    
+    // Render only the damaged regions
+    int nrects;
+    pixman_box32_t *rects = pixman_region32_rectangles(&surface_damage, &nrects);
+    for (int i = 0; i < nrects; i++) {
+        struct wlr_fbox src_box = {
+            .x = rects[i].x1,
+            .y = rects[i].y1,
+            .width = rects[i].x2 - rects[i].x1,
+            .height = rects[i].y2 - rects[i].y1
+        };
+        struct wlr_box dst_box = {
+            .x = (int)view_x + rects[i].x1,
+            .y = wlr_output->height - ((int)view_y + rects[i].y1) - (rects[i].y2 - rects[i].y1),
+            .width = rects[i].x2 - rects[i].x1,
+            .height = rects[i].y2 - rects[i].y1
+        };
+        
+        struct wlr_render_texture_options tex_opts = {
+            .texture = toplevel_view->cached_texture,
+            .src_box = src_box,
+            .dst_box = dst_box,
+            .blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
+            .transform = WL_OUTPUT_TRANSFORM_FLIPPED_180,
+        };
+        
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Rendering toplevel %d rect %d at (%d,%d) size=(%dx%d)",
+                window_count, i, dst_box.x, dst_box.y, dst_box.width, dst_box.height);
+        wlr_render_pass_add_texture(pass, &tex_opts);
+    }
+    
+    pixman_region32_fini(&surface_damage);
+}
+
+    // Render popups
+// Render popups
+int popup_count = 0;
+struct tinywl_popup *popup_view;
+wl_list_for_each(popup_view, &server->popups, link) {
+    if (!popup_view->xdg_popup || !popup_view->xdg_popup->base ||
+        !popup_view->xdg_popup->base->surface->mapped || !popup_view->scene_tree ||
+        !popup_view->scene_tree->node.enabled) {
+        continue;
+    }
+
+    struct wlr_surface *surface = popup_view->xdg_popup->base->surface;
+    if (!wlr_surface_has_buffer(surface)) {
+        continue;
+    }
+
+    struct wlr_texture *texture = wlr_surface_get_texture(surface);
+    if (!texture) {
+        continue;
+    }
+
+    // Get popup damage
+    pixman_region32_t surface_damage;
+    pixman_region32_init(&surface_damage);
+    bool has_damage = false;
+    if (surface->current.committed & WLR_SURFACE_STATE_SURFACE_DAMAGE) {
+        wlr_surface_get_effective_damage(surface, &surface_damage);
+        has_damage = pixman_region32_not_empty(&surface_damage);
+    }
+
+    if (!has_damage) {
+        pixman_region32_fini(&surface_damage);
+        continue;
+    }
+
+    popup_count++;
+
+    int popup_abs_lx, popup_abs_ly;
+    wlr_scene_node_coords(&popup_view->scene_tree->node, &popup_abs_lx, &popup_abs_ly);
+
+    int width = surface->current.width;
+    int height = surface->current.height;
+
+    // Render each damaged rectangle
+    int nrects;
+    pixman_box32_t *rects = pixman_region32_rectangles(&surface_damage, &nrects);
+    for (int i = 0; i < nrects; i++) {
+        struct wlr_fbox src_box = {
+            .x = rects[i].x1,
+            .y = rects[i].y1,
+            .width = rects[i].x2 - rects[i].x1,
+            .height = rects[i].y2 - rects[i].y1
+        };
+        struct wlr_box dst_box = {
+            .x = popup_abs_lx - output_box.x + rects[i].x1,
+            .y = wlr_output->height - (popup_abs_ly - output_box.y + rects[i].y1) - (rects[i].y2 - rects[i].y1),
+            .width = rects[i].x2 - rects[i].x1,
+            .height = rects[i].y2 - rects[i].y1
+        };
+
+        struct wlr_render_texture_options tex_opts = {
+            .texture = texture,
+            .src_box = src_box,
+            .dst_box = dst_box,
+            .blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
+            .transform = WL_OUTPUT_TRANSFORM_FLIPPED_180,
+        };
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Rendering popup %d rect %d at (%d,%d) size=(%dx%d)",
+                popup_count, i, dst_box.x, dst_box.y, dst_box.width, dst_box.height);
+        wlr_render_pass_add_texture(pass, &tex_opts);
+    }
+    pixman_region32_fini(&surface_damage);
+}
+
+
+ cursor_moved = false;
+if (server->cursor && server->cursor_mgr && server->output_layout) {
+    double cursor_x = fmax(0, fmin(server->cursor->x, output_box.width - 1));
+    double cursor_y = fmax(0, fmin(server->cursor->y, output_box.height - 1));
+    double dx = cursor_x - last_cursor_x;
+    double dy = cursor_y - last_cursor_y;
+    wlr_log(WLR_DEBUG, "[RENDER_FRAME] Cursor delta: dx=%.2f, dy=%.2f", dx, dy);
+    if (fabs(dx) > 0.5 || fabs(dy) > 0.5) {
+        cursor_moved = true;
+        struct wlr_xcursor *xcursor = wlr_xcursor_manager_get_xcursor(server->cursor_mgr, "default", 1.0);
+        if (xcursor && xcursor->images[0]) {
+            struct wlr_xcursor_image *image = xcursor->images[0];
+            pixman_region32_t cursor_damage;
+            pixman_region32_init_rect(&cursor_damage,
+                (int)last_cursor_x - image->hotspot_x,
+                (int)last_cursor_y - image->hotspot_y,
+                image->width, image->height);
+            pixman_region32_union_rect(&cursor_damage, &cursor_damage,
+                (int)cursor_x - image->hotspot_x,
+                (int)cursor_y - image->hotspot_y,
+                image->width, image->height);
+            // Intersect cursor damage with output damage
+            pixman_region32_intersect(&cursor_damage, &cursor_damage, &damage);
+            if (pixman_region32_not_empty(&cursor_damage)) {
+                pixman_region32_union(&damage, &damage, &cursor_damage);
+                wlr_log(WLR_DEBUG, "[RENDER_FRAME] Cursor moved: (%d,%d)", (int)cursor_x, (int)cursor_y);
+                needs_frame = true;
+                last_cursor_x = cursor_x;
+                last_cursor_y = cursor_y;
+            }
+            pixman_region32_fini(&cursor_damage);
+        }
+    }
+} else {
+    wlr_log(WLR_ERROR, "[RENDER_FRAME] Cursor or output layout null: cursor=%p, cursor_mgr=%p, output_layout=%p",
+            server->cursor, server->cursor_mgr, server->output_layout);
+}
 
     // Submit render pass
     if (!wlr_render_pass_submit(pass)) {
@@ -1397,42 +2055,66 @@ static void output_frame(struct wl_listener *listener, void *data) {
         wlr_egl_restore_context(&prev_ctx);
         wlr_output_state_finish(&state);
         wlr_scene_output_send_frame_done(scene_output, &now);
+        pixman_region32_fini(&damage);
         return;
     }
 
-    // Optimized buffer handling for RDP transmission
+    wlr_output_state_set_enabled(&state, true);
+    if (current_wlr_mode) {
+        wlr_output_state_set_mode(&state, current_wlr_mode);
+    } else {
+        wlr_log(WLR_ERROR, "[TINYWL_OUTPUT_FRAME] CRITICAL: wlr_output->current_mode is NULL before commit for %s.", wlr_output->name);
+    }
+    wlr_output_state_set_damage(&state, &damage);
+
+    // Logging before commit
+    struct timespec _pre_commit_ts, _post_commit_ts;
+    wlr_log(WLR_ERROR, "--- TINYWL_OUTPUT_FRAME: Inspecting 'state' (from begin_render_pass) BEFORE commit for %s ---",
+            wlr_output->name ? wlr_output->name : "(null)");
+    wlr_log(WLR_ERROR, "  state.committed: 0x%X", state.committed);
+    wlr_log(WLR_ERROR, "  state.enabled: %d", state.enabled);
+    if (state.committed & WLR_OUTPUT_STATE_MODE) {
+        if (state.mode) {
+            wlr_log(WLR_ERROR, "  state.mode: %p (%dx%d @ %dHz)",
+                    (void*)state.mode, state.mode->width, state.mode->height, state.mode->refresh);
+        } else { wlr_log(WLR_ERROR, "  state.mode: NULL (but MODE bit is set!)"); }
+    } else { wlr_log(WLR_ERROR, "  WLR_OUTPUT_STATE_MODE is NOT SET in committed flags."); }
+
+    if (state.committed & WLR_OUTPUT_STATE_BUFFER) {
+        if (state.buffer) {
+            wlr_log(WLR_ERROR, "  state.buffer: %p (w:%d, h:%d)",
+                    (void*)state.buffer, state.buffer->width, state.buffer->height);
+        } else { wlr_log(WLR_ERROR, "  state.buffer: NULL (but BUFFER bit is set!)"); }
+    } else { wlr_log(WLR_ERROR, "  WLR_OUTPUT_STATE_BUFFER is NOT SET in committed flags."); }
+
+    if (state.committed & WLR_OUTPUT_STATE_DAMAGE) {
+        wlr_log(WLR_ERROR, "  WLR_OUTPUT_STATE_DAMAGE is SET in committed flags. Damage empty: %d",
+                !pixman_region32_not_empty(&state.damage));
+    } else { wlr_log(WLR_ERROR, "  WLR_OUTPUT_STATE_DAMAGE is NOT SET in committed flags."); }
+
+    clock_gettime(CLOCK_MONOTONIC, &_pre_commit_ts);
+    wlr_log(WLR_ERROR, "TINYWL_OUTPUT_FRAME: PRE wlr_output_commit_state() for %s. Timestamp: %ld.%09ld",
+            wlr_output->name ? wlr_output->name : "(null)", _pre_commit_ts.tv_sec, _pre_commit_ts.tv_nsec);
+
+    // Note: The commit section is commented out in the original code, so we'll keep it commented
+    // bool committed = wlr_output_commit_state(wlr_output, &state);
+
+    clock_gettime(CLOCK_MONOTONIC, &_post_commit_ts);
+
+    // RDP transmission only for damaged regions
     struct wlr_buffer *rendered_buffer = state.buffer;
-    if (rendered_buffer && has_content) {
+    if (rendered_buffer && (needs_frame || cursor_moved)) {
         struct wlr_buffer *locked_buffer = wlr_buffer_lock(rendered_buffer);
         if (locked_buffer) {
-            // Skip expensive pixel format conversion for animations
-            // Let RDP handle format conversion on its end if possible
-            if (has_animated_content) {
-                // For animations, skip pixel readback and send buffer directly
-                wlr_log(WLR_DEBUG, "[RENDER_FRAME] Fast path: sending animated content");
+            void *bdata;
+            uint32_t bfmt;
+            size_t bstride;
+            if (wlr_buffer_begin_data_ptr_access(locked_buffer,
+                WLR_BUFFER_DATA_PTR_ACCESS_READ, &bdata, &bfmt, &bstride)) {
+                wlr_buffer_end_data_ptr_access(locked_buffer);
                 rdp_transmit_surface(locked_buffer);
             } else {
-                // Only do pixel format conversion for static content
-                void *bdata;
-                uint32_t bfmt;
-                size_t bstride;
-                
-                if (wlr_buffer_begin_data_ptr_access(locked_buffer, 
-                    WLR_BUFFER_DATA_PTR_ACCESS_READ, &bdata, &bfmt, &bstride)) {
-                    
-                    // Only convert if format is not already BGRA8888
-                    if (bfmt != DRM_FORMAT_BGRA8888) {
-                        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Converting format 0x%X to BGRA8888", bfmt);
-                        // Your existing format conversion code here, but only for static content
-                        // ... (conversion logic)
-                    }
-                    
-                    wlr_buffer_end_data_ptr_access(locked_buffer);
-                    rdp_transmit_surface(locked_buffer);
-                } else {
-                    // Fallback: send buffer as-is
-                    rdp_transmit_surface(locked_buffer);
-                }
+                rdp_transmit_surface(locked_buffer);
             }
             wlr_buffer_unlock(locked_buffer);
         }
@@ -1442,20 +2124,8 @@ static void output_frame(struct wl_listener *listener, void *data) {
     wlr_egl_restore_context(&prev_ctx);
     wlr_output_state_finish(&state);
     wlr_scene_output_send_frame_done(scene_output, &now);
-
-    // Performance monitoring (reduced logging for animations)
-    static double last_time = 0;
-    static int frame_count = 0;
-    frame_count++;
-    
-    double current_time = now.tv_sec + now.tv_nsec / 1e9;
-    if (last_time > 0 && (frame_count % 60 == 0 || !has_animated_content)) {
-        double fps = 1.0 / (current_time - last_time);
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] FPS: %.2f (animated: %s)", 
-                fps, has_animated_content ? "yes" : "no");
-    }
-    last_time = current_time;
-}
+    pixman_region32_fini(&damage);
+}*/
 
 
 

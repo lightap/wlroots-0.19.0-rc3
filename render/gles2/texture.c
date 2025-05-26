@@ -14,6 +14,16 @@
 #include "render/gles2.h"
 #include "render/pixel_format.h"
 
+struct gl_state_cache {
+	GLint unpack_row_length;
+	GLint unpack_skip_pixels; 
+	GLint unpack_skip_rows;
+	GLint pack_alignment;
+	bool dirty;
+};
+
+static struct gl_state_cache gl_cache = {0};
+
 static const struct wlr_texture_impl texture_impl;
 
 bool wlr_texture_is_gles2(struct wlr_texture *wlr_texture) {
@@ -159,7 +169,7 @@ static bool gles2_texture_bind(struct wlr_gles2_texture *texture) {
 
 	return true;
 }
-
+/*
 static bool gles2_texture_read_pixels(struct wlr_texture *wlr_texture,
 		const struct wlr_texture_read_pixels_options *options) {
 	struct wlr_gles2_texture *texture = gles2_get_texture(wlr_texture);
@@ -216,6 +226,111 @@ static bool gles2_texture_read_pixels(struct wlr_texture *wlr_texture,
 			uint32_t y = src.y + i;
 			glReadPixels(src.x, y, src.width, 1, fmt->gl_format,
 				fmt->gl_type, p + i * options->stride);
+		}
+	}
+
+	wlr_egl_restore_context(&prev_ctx);
+	pop_gles2_debug(texture->renderer);
+
+	return glGetError() == GL_NO_ERROR;
+}*/
+
+
+// Heavily optimized: Removed glFinish() and batched pixel reads
+static bool gles2_texture_read_pixels(struct wlr_texture *wlr_texture,
+		const struct wlr_texture_read_pixels_options *options) {
+	struct wlr_gles2_texture *texture = gles2_get_texture(wlr_texture);
+
+	struct wlr_box src;
+	wlr_texture_read_pixels_options_get_src_box(options, wlr_texture, &src);
+
+	const struct wlr_gles2_pixel_format *fmt =
+		get_gles2_format_from_drm(options->format);
+	if (fmt == NULL || !is_gles2_pixel_format_supported(texture->renderer, fmt)) {
+		wlr_log(WLR_ERROR, "Cannot read pixels: unsupported pixel format 0x%"PRIX32, options->format);
+		return false;
+	}
+
+	if (fmt->gl_format == GL_BGRA_EXT && !texture->renderer->exts.EXT_read_format_bgra) {
+		wlr_log(WLR_ERROR,
+			"Cannot read pixels: missing GL_EXT_read_format_bgra extension");
+		return false;
+	}
+
+	const struct wlr_pixel_format_info *drm_fmt =
+		drm_get_pixel_format_info(fmt->drm_format);
+	assert(drm_fmt);
+	if (pixel_format_info_pixels_per_block(drm_fmt) != 1) {
+		wlr_log(WLR_ERROR, "Cannot read pixels: block formats are not supported");
+		return false;
+	}
+
+	push_gles2_debug(texture->renderer);
+	struct wlr_egl_context prev_ctx;
+	if (!wlr_egl_make_current(texture->renderer->egl, &prev_ctx)) {
+		pop_gles2_debug(texture->renderer);
+		return false;
+	}
+
+	if (!gles2_texture_bind(texture)) {
+		wlr_egl_restore_context(&prev_ctx);
+		pop_gles2_debug(texture->renderer);
+		return false;
+	}
+
+	// REMOVED: glFinish() - this was causing major stalls!
+	// Use glFlush() instead for async operation
+	glFlush();
+
+	glGetError(); // Clear any existing errors
+
+	unsigned char *p = wlr_texture_read_pixel_options_get_data(options);
+
+	// Set pack alignment once
+	if (gl_cache.dirty || gl_cache.pack_alignment != 1) {
+		glPixelStorei(GL_PACK_ALIGNMENT, 1);
+		gl_cache.pack_alignment = 1;
+	}
+
+	uint32_t pack_stride = pixel_format_info_min_stride(drm_fmt, src.width);
+	
+	// Optimization: Always try single read first, fall back to row-by-row only if needed
+	if (pack_stride == options->stride && options->dst_x == 0) {
+		// Single optimized read
+		glReadPixels(src.x, src.y, src.width, src.height, fmt->gl_format, fmt->gl_type, p);
+	} else {
+		// Batch row reads in chunks to reduce overhead
+		const int chunk_size = 8; // Read 8 rows at a time
+		for (int32_t i = 0; i < src.height; i += chunk_size) {
+			int32_t rows_to_read = (src.height - i < chunk_size) ? src.height - i : chunk_size;
+			uint32_t y = src.y + i;
+			
+			if (rows_to_read == 1) {
+				// Single row read
+				glReadPixels(src.x, y, src.width, 1, fmt->gl_format,
+					fmt->gl_type, p + i * options->stride);
+			} else {
+				// Multi-row read into temporary buffer, then copy
+				unsigned char *temp = malloc(pack_stride * rows_to_read);
+				if (temp) {
+					glReadPixels(src.x, y, src.width, rows_to_read, fmt->gl_format,
+						fmt->gl_type, temp);
+					
+					// Copy rows with correct stride
+					for (int32_t row = 0; row < rows_to_read; row++) {
+						memcpy(p + (i + row) * options->stride,
+						       temp + row * pack_stride,
+						       pack_stride);
+					}
+					free(temp);
+				} else {
+					// Fallback to single row reads
+					for (int32_t row = 0; row < rows_to_read; row++) {
+						glReadPixels(src.x, y + row, src.width, 1, fmt->gl_format,
+							fmt->gl_type, p + (i + row) * options->stride);
+					}
+				}
+			}
 		}
 	}
 

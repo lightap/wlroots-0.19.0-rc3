@@ -134,6 +134,7 @@ static bool check_list_integrity(struct wl_list *list, const char *name) {
     }
     return true;
 }
+
 struct wlr_gles2_buffer *gles2_buffer_get_or_create(struct wlr_gles2_renderer *renderer,
         struct wlr_buffer *wlr_buffer) {
     struct wlr_addon *addon =
@@ -195,8 +196,8 @@ struct wlr_gles2_buffer *gles2_buffer_get_or_create(struct wlr_gles2_renderer *r
     wlr_log(WLR_DEBUG, "Buffer data: ptr=%p, format=0x%x, stride=%zu", data_ptr, format, stride);
 
     // Validate buffer format
-    if (format != DRM_FORMAT_XRGB8888) {
-        wlr_log(WLR_ERROR, "Unsupported buffer format: 0x%x, expected XRGB8888", format);
+    if (format != DRM_FORMAT_XRGB8888 && format != DRM_FORMAT_ARGB8888) {
+        wlr_log(WLR_ERROR, "Unsupported buffer format: 0x%x, expected XRGB8888 or ARGB8888", format);
         wlr_buffer_end_data_ptr_access(wlr_buffer);
         free(buffer);
         return NULL;
@@ -298,7 +299,7 @@ struct wlr_gles2_buffer *gles2_buffer_get_or_create(struct wlr_gles2_renderer *r
    // GLenum internal_format = has_bgra ? GL_BGRA_EXT : GL_RGBA;
   //  GLenum data_format = has_bgra ? GL_BGRA_EXT : GL_RGBA;
     uint8_t *temp_buffer = NULL;
-
+/*
    if (!has_bgra) {
     // Convert BGRA (XRGB8888) to RGBA
     temp_buffer = malloc(wlr_buffer->width * wlr_buffer->height * 4);
@@ -328,12 +329,13 @@ struct wlr_gles2_buffer *gles2_buffer_get_or_create(struct wlr_gles2_renderer *r
         temp_buffer[i + 3] = src[i + 3]; // A
     }
     data_ptr = temp_buffer;
-}
+}*/
 
    wlr_log(WLR_DEBUG, "Calling glTexImage2D: internalFmt=GL_RGBA, w=%d, h=%d, format=GL_BGRA_EXT, type=GL_UNSIGNED_BYTE",
         wlr_buffer->width, wlr_buffer->height);
+GLenum gl_format = (format == DRM_FORMAT_ARGB8888) ? GL_BGRA_EXT : GL_RGBA;
 glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, wlr_buffer->width, wlr_buffer->height,
-             0, GL_BGRA_EXT, GL_UNSIGNED_BYTE, data_ptr);
+             0, gl_format, GL_UNSIGNED_BYTE, data_ptr);
 GLenum tex_upload_err = glGetError();
 if (tex_upload_err != GL_NO_ERROR) {
     wlr_log(WLR_ERROR, "!!!!!!!! GL Error after glTexImage2D (BGRA_EXT): 0x%x !!!!!!!!", tex_upload_err);

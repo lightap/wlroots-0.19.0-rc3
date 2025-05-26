@@ -22,180 +22,180 @@
 #endif
 
 void wlr_allocator_init(struct wlr_allocator *alloc,
-		const struct wlr_allocator_interface *impl, uint32_t buffer_caps) {
-	assert(impl && impl->destroy && impl->create_buffer);
-	*alloc = (struct wlr_allocator){
-		.impl = impl,
-		.buffer_caps = buffer_caps,
-	};
+        const struct wlr_allocator_interface *impl, uint32_t buffer_caps) {
+    assert(impl && impl->destroy && impl->create_buffer);
+    *alloc = (struct wlr_allocator){
+        .impl = impl,
+        .buffer_caps = buffer_caps,
+    };
 
-	wl_signal_init(&alloc->events.destroy);
+    wl_signal_init(&alloc->events.destroy);
 }
 
 
 static int reopen_drm_node(int drm_fd, bool allow_render_node) {
-	if (drmIsMaster(drm_fd)) {
-		// Only recent kernels support empty leases
-		uint32_t lessee_id;
-		int lease_fd = drmModeCreateLease(drm_fd, NULL, 0, O_CLOEXEC, &lessee_id);
-		if (lease_fd >= 0) {
-			return lease_fd;
-		} else if (lease_fd != -EINVAL && lease_fd != -EOPNOTSUPP) {
-			wlr_log_errno(WLR_ERROR, "drmModeCreateLease failed");
-			return -1;
-		}
-		wlr_log(WLR_DEBUG, "drmModeCreateLease failed, "
-			"falling back to plain open");
-	}
+    if (drmIsMaster(drm_fd)) {
+        // Only recent kernels support empty leases
+        uint32_t lessee_id;
+        int lease_fd = drmModeCreateLease(drm_fd, NULL, 0, O_CLOEXEC, &lessee_id);
+        if (lease_fd >= 0) {
+            return lease_fd;
+        } else if (lease_fd != -EINVAL && lease_fd != -EOPNOTSUPP) {
+            wlr_log_errno(WLR_ERROR, "drmModeCreateLease failed");
+            return -1;
+        }
+        wlr_log(WLR_DEBUG, "drmModeCreateLease failed, "
+            "falling back to plain open");
+    }
 
-	char *name = NULL;
-	if (allow_render_node) {
-		name = drmGetRenderDeviceNameFromFd(drm_fd);
-	}
-	if (name == NULL) {
-		// Either the DRM device has no render node, either the caller wants
-		// a primary node
-		name = drmGetDeviceNameFromFd2(drm_fd);
-		if (name == NULL) {
-			wlr_log(WLR_ERROR, "drmGetDeviceNameFromFd2 failed");
-			return -1;
-		}
-	}
+    char *name = NULL;
+    if (allow_render_node) {
+        name = drmGetRenderDeviceNameFromFd(drm_fd);
+    }
+    if (name == NULL) {
+        // Either the DRM device has no render node, either the caller wants
+        // a primary node
+        name = drmGetDeviceNameFromFd2(drm_fd);
+        if (name == NULL) {
+            wlr_log(WLR_ERROR, "drmGetDeviceNameFromFd2 failed");
+            return -1;
+        }
+    }
 
-	int new_fd = open(name, O_RDWR | O_CLOEXEC);
-	if (new_fd < 0) {
-		wlr_log_errno(WLR_ERROR, "Failed to open DRM node '%s'", name);
-		free(name);
-		return -1;
-	}
+    int new_fd = open(name, O_RDWR | O_CLOEXEC);
+    if (new_fd < 0) {
+        wlr_log_errno(WLR_ERROR, "Failed to open DRM node '%s'", name);
+        free(name);
+        return -1;
+    }
 
-	free(name);
+    free(name);
 
-	// If we're using a DRM primary node and we are DRM master (e.g. because
-	// we're running under the DRM backend), we need to use the legacy DRM
-	// authentication mechanism to have the permission to manipulate DRM dumb
-	// buffers.
-	if (drmIsMaster(drm_fd) && drmGetNodeTypeFromFd(new_fd) == DRM_NODE_PRIMARY) {
-		drm_magic_t magic;
-		if (drmGetMagic(new_fd, &magic) < 0) {
-			wlr_log_errno(WLR_ERROR, "drmGetMagic failed");
-			close(new_fd);
-			return -1;
-		}
+    // If we're using a DRM primary node and we are DRM master (e.g. because
+    // we're running under the DRM backend), we need to use the legacy DRM
+    // authentication mechanism to have the permission to manipulate DRM dumb
+    // buffers.
+    if (drmIsMaster(drm_fd) && drmGetNodeTypeFromFd(new_fd) == DRM_NODE_PRIMARY) {
+        drm_magic_t magic;
+        if (drmGetMagic(new_fd, &magic) < 0) {
+            wlr_log_errno(WLR_ERROR, "drmGetMagic failed");
+            close(new_fd);
+            return -1;
+        }
 
-		if (drmAuthMagic(drm_fd, magic) < 0) {
-			wlr_log_errno(WLR_ERROR, "drmAuthMagic failed");
-			close(new_fd);
-			return -1;
-		}
-	}
+        if (drmAuthMagic(drm_fd, magic) < 0) {
+            wlr_log_errno(WLR_ERROR, "drmAuthMagic failed");
+            close(new_fd);
+            return -1;
+        }
+    }
 
-	return new_fd;
+    return new_fd;
 }
 
 struct wlr_allocator *wlr_allocator_autocreate(struct wlr_backend *backend,
-		struct wlr_renderer *renderer) {
-	uint32_t backend_caps = backend->buffer_caps;
-	uint32_t renderer_caps = renderer->render_buffer_caps;
+        struct wlr_renderer *renderer) {
+    uint32_t backend_caps = backend->buffer_caps;
+    uint32_t renderer_caps = renderer->render_buffer_caps;
 
-	// Note, drm_fd may be negative if unavailable
-	int drm_fd = wlr_backend_get_drm_fd(backend);
-	if (drm_fd < 0) {
-		drm_fd = wlr_renderer_get_drm_fd(renderer);
-	}
+    // Note, drm_fd may be negative if unavailable
+    int drm_fd = wlr_backend_get_drm_fd(backend);
+    if (drm_fd < 0) {
+        drm_fd = wlr_renderer_get_drm_fd(renderer);
+    }
 
-	struct wlr_allocator *alloc = NULL;
+    struct wlr_allocator *alloc = NULL;
 
-	uint32_t gbm_caps = WLR_BUFFER_CAP_DMABUF;
-	if ((backend_caps & gbm_caps) && (renderer_caps & gbm_caps)
-			&& drm_fd >= 0) {
+    uint32_t gbm_caps = WLR_BUFFER_CAP_DMABUF;
+    if ((backend_caps & gbm_caps) && (renderer_caps & gbm_caps)
+            && drm_fd >= 0) {
 #if WLR_HAS_GBM_ALLOCATOR
-		wlr_log(WLR_DEBUG, "Trying to create gbm allocator");
-		int gbm_fd = reopen_drm_node(drm_fd, true);
-		if (gbm_fd < 0) {
-			return NULL;
-		}
-		if ((alloc = wlr_gbm_allocator_create(gbm_fd)) != NULL) {
-			return alloc;
-		}
-		close(gbm_fd);
-		wlr_log(WLR_DEBUG, "Failed to create gbm allocator");
+        wlr_log(WLR_DEBUG, "Trying to create gbm allocator");
+        int gbm_fd = reopen_drm_node(drm_fd, true);
+        if (gbm_fd < 0) {
+            return NULL;
+        }
+        if ((alloc = wlr_gbm_allocator_create(gbm_fd)) != NULL) {
+            return alloc;
+        }
+        close(gbm_fd);
+        wlr_log(WLR_DEBUG, "Failed to create gbm allocator");
 #else
-		wlr_log(WLR_DEBUG, "Skipping gbm allocator: disabled at compile-time");
+        wlr_log(WLR_DEBUG, "Skipping gbm allocator: disabled at compile-time");
 #endif
-	}
+    }
 
-	uint32_t shm_caps = WLR_BUFFER_CAP_SHM | WLR_BUFFER_CAP_DATA_PTR;
-	if ((backend_caps & shm_caps) && (renderer_caps & shm_caps)) {
-		wlr_log(WLR_DEBUG, "Trying to create shm allocator");
-		if ((alloc = wlr_shm_allocator_create()) != NULL) {
-			return alloc;
-		}
-		wlr_log(WLR_DEBUG, "Failed to create shm allocator");
-	}
+    uint32_t shm_caps = WLR_BUFFER_CAP_SHM | WLR_BUFFER_CAP_DATA_PTR;
+    if ((backend_caps & shm_caps) && (renderer_caps & shm_caps)) {
+        wlr_log(WLR_DEBUG, "Trying to create shm allocator");
+        if ((alloc = wlr_shm_allocator_create()) != NULL) {
+            return alloc;
+        }
+        wlr_log(WLR_DEBUG, "Failed to create shm allocator");
+    }
 
-	uint32_t drm_caps = WLR_BUFFER_CAP_DMABUF | WLR_BUFFER_CAP_DATA_PTR;
-	if ((backend_caps & drm_caps) && (renderer_caps & drm_caps)
-			&& drm_fd >= 0 && drmIsMaster(drm_fd)) {
-		wlr_log(WLR_DEBUG, "Trying to create drm dumb allocator");
-		int dumb_fd = reopen_drm_node(drm_fd, false);
-		if (dumb_fd < 0) {
-			return NULL;
-		}
-		if ((alloc = wlr_drm_dumb_allocator_create(dumb_fd)) != NULL) {
-			return alloc;
-		}
-		close(dumb_fd);
-		wlr_log(WLR_DEBUG, "Failed to create drm dumb allocator");
-	}
+    uint32_t drm_caps = WLR_BUFFER_CAP_DMABUF | WLR_BUFFER_CAP_DATA_PTR;
+    if ((backend_caps & drm_caps) && (renderer_caps & drm_caps)
+            && drm_fd >= 0 && drmIsMaster(drm_fd)) {
+        wlr_log(WLR_DEBUG, "Trying to create drm dumb allocator");
+        int dumb_fd = reopen_drm_node(drm_fd, false);
+        if (dumb_fd < 0) {
+            return NULL;
+        }
+        if ((alloc = wlr_drm_dumb_allocator_create(dumb_fd)) != NULL) {
+            return alloc;
+        }
+        close(dumb_fd);
+        wlr_log(WLR_DEBUG, "Failed to create drm dumb allocator");
+    }
 
-	uint32_t udmabuf_caps = WLR_BUFFER_CAP_DMABUF | WLR_BUFFER_CAP_SHM;
-	if ((backend_caps & udmabuf_caps) && (renderer_caps & udmabuf_caps) &&
-			drm_fd < 0) {
+    uint32_t udmabuf_caps = WLR_BUFFER_CAP_DMABUF | WLR_BUFFER_CAP_SHM;
+    if ((backend_caps & udmabuf_caps) && (renderer_caps & udmabuf_caps) &&
+            drm_fd < 0) {
 #if WLR_HAS_UDMABUF_ALLOCATOR
-		wlr_log(WLR_DEBUG, "Trying udmabuf allocator");
-		if ((alloc = wlr_udmabuf_allocator_create()) != NULL) {
-			return alloc;
-		}
-		wlr_log(WLR_DEBUG, "Failed to create udmabuf allocator");
+        wlr_log(WLR_DEBUG, "Trying udmabuf allocator");
+        if ((alloc = wlr_udmabuf_allocator_create()) != NULL) {
+            return alloc;
+        }
+        wlr_log(WLR_DEBUG, "Failed to create udmabuf allocator");
 #else
-		wlr_log(WLR_DEBUG, "Skipping udmabuf allocator: disabled at compile-time");
+        wlr_log(WLR_DEBUG, "Skipping udmabuf allocator: disabled at compile-time");
 #endif
-	}
+    }
 
-	wlr_log(WLR_ERROR, "Failed to create allocator");
-	return NULL;
+    wlr_log(WLR_ERROR, "Failed to create allocator");
+    return NULL;
 }
 
 void wlr_allocator_destroy(struct wlr_allocator *alloc) {
-	if (alloc == NULL) {
-		return;
-	}
-	wl_signal_emit_mutable(&alloc->events.destroy, NULL);
+    if (alloc == NULL) {
+        return;
+    }
+    wl_signal_emit_mutable(&alloc->events.destroy, NULL);
 
-	assert(wl_list_empty(&alloc->events.destroy.listener_list));
+    assert(wl_list_empty(&alloc->events.destroy.listener_list));
 
-	alloc->impl->destroy(alloc);
+    alloc->impl->destroy(alloc);
 }
 
 struct wlr_buffer *wlr_allocator_create_buffer(struct wlr_allocator *alloc,
-		int width, int height, const struct wlr_drm_format *format) {
-	struct wlr_buffer *buffer =
-		alloc->impl->create_buffer(alloc, width, height, format);
-	if (buffer == NULL) {
-		return NULL;
-	}
-	if (alloc->buffer_caps & WLR_BUFFER_CAP_DATA_PTR) {
-		assert(buffer->impl->begin_data_ptr_access &&
-			buffer->impl->end_data_ptr_access);
-	}
-	if (alloc->buffer_caps & WLR_BUFFER_CAP_DMABUF) {
-		assert(buffer->impl->get_dmabuf);
-	}
-	if (alloc->buffer_caps & WLR_BUFFER_CAP_SHM) {
-		assert(buffer->impl->get_shm);
-	}
-	return buffer;
+        int width, int height, const struct wlr_drm_format *format) {
+    struct wlr_buffer *buffer =
+        alloc->impl->create_buffer(alloc, width, height, format);
+    if (buffer == NULL) {
+        return NULL;
+    }
+    if (alloc->buffer_caps & WLR_BUFFER_CAP_DATA_PTR) {
+        assert(buffer->impl->begin_data_ptr_access &&
+            buffer->impl->end_data_ptr_access);
+    }
+    if (alloc->buffer_caps & WLR_BUFFER_CAP_DMABUF) {
+        assert(buffer->impl->get_dmabuf);
+    }
+    if (alloc->buffer_caps & WLR_BUFFER_CAP_SHM) {
+        assert(buffer->impl->get_shm);
+    }
+    return buffer;
 }
 */
 
@@ -431,7 +431,7 @@ static struct wlr_buffer *rdp_allocator_create_buffer(
     wlr_log(WLR_INFO, "RDP buffer created successfully: %p", buffer);
     return &buffer->base;
 }*/
-
+/*
 static struct wlr_buffer *rdp_allocator_create_buffer(
     struct wlr_allocator *wlr_alloc,
     int width, int height,
@@ -467,17 +467,27 @@ static struct wlr_buffer *rdp_allocator_create_buffer(
 
     // Check for reusable buffers
     struct rdp_buffer *buffer;
-    time_t now = time(NULL);
-    wl_list_for_each(buffer, &pool->buffers, link) {
-        if (!buffer->in_use && (now - buffer->last_used >= 5)) {
-            wlr_log(WLR_DEBUG, "Reusing buffer %p from pool %dx%d", buffer, width, height);
-            memset(buffer->data, 0, buffer->stride * height);  // Reinitialize data
-            wlr_buffer_init(&buffer->base, &rdp_buffer_impl, width, height);
-            buffer->in_use = true;
-            buffer->last_used = now;
-            return &buffer->base;
-        }
+time_t now = time(NULL);
+
+wl_list_for_each(buffer, &pool->buffers, link) {
+    if (!buffer->in_use && (now - buffer->last_used >= 1)) {
+        wlr_log(WLR_DEBUG, "Reusing buffer %p from pool %dx%d", 
+                buffer, width, height);
+        
+        // Clear buffer data for security/cleanliness
+        memset(buffer->data, 0, buffer->stride * height);
+        
+        // Don't reinitialize an already initialized buffer
+        // Just mark it as in use and update timestamp
+        buffer->in_use = true;
+        buffer->last_used = now;
+        
+        // If buffer dimensions don't match, you may need to handle this case
+        // For now, assuming dimensions are compatible
+        
+        return &buffer->base;
     }
+}
 
     // Create new buffer if no reusable ones are available
     buffer = calloc(1, sizeof(struct rdp_buffer));
@@ -507,7 +517,134 @@ static struct wlr_buffer *rdp_allocator_create_buffer(
 
     wlr_log(WLR_INFO, "RDP buffer created successfully: %p", buffer);
     return &buffer->base;
+}*/
+
+static struct wlr_buffer *rdp_allocator_create_buffer(
+    struct wlr_allocator *wlr_alloc,
+    int width, int height,
+    const struct wlr_drm_format *format) {
+    
+    struct rdp_allocator *alloc = wl_container_of(wlr_alloc, alloc, base);
+    
+    // Validate input parameters
+    if (width <= 0 || height <= 0) {
+        wlr_log(WLR_ERROR, "Invalid buffer dimensions: %dx%d", width, height);
+        return NULL;
+    }
+    
+    // Check if format is NULL and handle it properly
+    if (!format) {
+        wlr_log(WLR_ERROR, "Format is NULL, cannot allocate RDP buffer");
+        return NULL;
+    }
+            
+    // Validate format - only support XRGB8888
+    uint32_t desired_format = format->format;
+    if (desired_format != DRM_FORMAT_XRGB8888) {
+        wlr_log(WLR_ERROR, "Unsupported format 0x%x, only XRGB8888 supported", desired_format);
+        return NULL;
+    }
+    
+    struct rdp_buffer_pool *pool = rdp_get_pool(alloc, width, height);
+    if (!pool) {
+        wlr_log(WLR_ERROR, "Failed to get RDP buffer pool");
+        return NULL;
+    }
+    
+    // Fast path: check for immediately available buffers
+    // Use cached time to avoid repeated system calls
+    static time_t cached_time = 0;
+    static int time_check_counter = 0;
+    
+    // Only update time every 10th call to reduce system call overhead
+    if (++time_check_counter >= 10) {
+        cached_time = time(NULL);
+        time_check_counter = 0;
+    }
+    
+    struct rdp_buffer *buffer;
+    
+    // Quick scan for available buffers (limit iterations to prevent stalling)
+    int search_count = 0;
+    const int max_search = 16; // Limit search to prevent stalling
+    
+    wl_list_for_each(buffer, &pool->buffers, link) {
+        if (++search_count > max_search) break;
+        
+        if (!buffer->in_use) {
+            // Use existing last_used field with cached time
+            if (cached_time - buffer->last_used >= 0.1) {
+                wlr_log(WLR_DEBUG, "Reusing buffer %p from pool %dx%d", 
+                        buffer, width, height);
+                
+                // DON'T clear buffer data here - let the renderer handle it
+                // This avoids expensive memset() on the critical path
+                // memset(buffer->data, 0, buffer->stride * height); // REMOVED
+                
+                buffer->in_use = true;
+                buffer->last_used = cached_time;
+                
+                return &buffer->base;
+            }
+        }
+    }
+    
+    // Allocate new buffer - this is the expensive path
+    // Consider doing this asynchronously in a background thread for production
+    buffer = calloc(1, sizeof(struct rdp_buffer));
+    if (!buffer) {
+        wlr_log(WLR_ERROR, "Failed to allocate RDP buffer structure");
+        return NULL;
+    }
+    
+    // Calculate stride and size with overflow protection
+    size_t stride = (size_t)width * 4; // XRGB8888 = 4 bytes per pixel
+    size_t size = stride * (size_t)height;
+    
+    // Check for integer overflow
+    if (size / stride != (size_t)height || stride / 4 != (size_t)width) {
+        wlr_log(WLR_ERROR, "Buffer size calculation overflow for %dx%d", width, height);
+        free(buffer);
+        return NULL;
+    }
+    
+    // For very large buffers, consider using mmap instead of calloc
+    // This could be faster for large allocations
+    if (size > (1024 * 1024)) { // 1MB threshold
+        wlr_log(WLR_DEBUG, "Large buffer allocation: %zu bytes", size);
+    }
+    
+    // Use malloc + explicit clear only if needed, or consider lazy clearing
+    buffer->data = malloc(size);
+    if (!buffer->data) {
+        wlr_log(WLR_ERROR, "Failed to allocate buffer data (%zu bytes)", size);
+        free(buffer);
+        return NULL;
+    }
+    
+    // For performance: only clear if security/correctness requires it
+    // Consider lazy clearing or letting the renderer handle clearing
+    // memset(buffer->data, 0, size); // Consider removing this
+    
+    // Initialize the wlr_buffer base structure
+    wlr_buffer_init(&buffer->base, &rdp_buffer_impl, width, height);
+    
+    // Set up buffer properties
+    buffer->stride = stride;
+    buffer->in_use = true;
+    buffer->last_used = cached_time;
+    buffer->pool = pool;
+    
+    // Add to pool's buffer list
+    wl_list_insert(&pool->buffers, &buffer->link);
+    
+    wlr_log(WLR_DEBUG, "RDP buffer created: %p (%dx%d, stride=%zu)", 
+            buffer, width, height, stride);
+    
+    return &buffer->base;
 }
+
+
 
 // Clean up unused buffers
 void wlr_rdp_allocator_cleanup(struct wlr_allocator *wlr_alloc) {
@@ -663,4 +800,3 @@ void wlr_allocator_destroy(struct wlr_allocator *alloc) {
     wl_signal_emit_mutable(&alloc->events.destroy, NULL);
     alloc->impl->destroy(alloc);
 }
-

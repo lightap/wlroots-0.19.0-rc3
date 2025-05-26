@@ -143,7 +143,7 @@ struct rdp_peer_context {
     struct wl_event_source *frame_timer;
     struct wlr_output *current_output;
 void *server;
-
+bool sync_received;  // Add this line
 
 
 };

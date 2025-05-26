@@ -86,10 +86,11 @@ bool wlr_renderer_init_wl_shm(struct wlr_renderer *r,
     static const uint32_t formats[] = {
         DRM_FORMAT_ARGB8888,
         DRM_FORMAT_XRGB8888,
+        DRM_FORMAT_RGB565,    // Low memory/bandwidth
     };
     
     // Create SHM with just these two formats
-    struct wlr_shm *shm = wlr_shm_create(wl_display, 2, formats, 2);
+    struct wlr_shm *shm = wlr_shm_create(wl_display, 2, formats, 3);
     
     return shm != NULL;
 }
@@ -124,7 +125,8 @@ bool wlr_renderer_init_wl_display(struct wlr_renderer *r,
 
 struct wlr_renderer *renderer_autocreate_with_drm_fd(int drm_fd) {
 	const char *renderer_env = getenv("WLR_RENDERER");
-const char *vendor = (const char *)glGetString(GL_VENDOR);
+
+	const char *vendor = (const char *)glGetString(GL_VENDOR);
     const char *renderer = (const char *)glGetString(GL_RENDERER);
     const char *version = (const char *)glGetString(GL_VERSION);
     const char *shading_lang = (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);

@@ -20,7 +20,7 @@ LIBS=\
 	$(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) $(PKG_CONFIG) --libs libpng) \
 	$(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) $(PKG_CONFIG) --libs freerdp2) \
 	$(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) $(PKG_CONFIG) --libs winpr2) \
-	-lEGL
+	-lEGL -lm
 # Define CFLAGS with all required includes
 CFLAGS_PKG_CONFIG=$(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) $(PKG_CONFIG) --cflags wlroots wayland-server xkbcommon pixman-1 libdrm glesv2 libpng freerdp2 winpr2)
 CFLAGS+=$(CFLAGS_PKG_CONFIG) -I. -Iinclude -DWLR_USE_UNSTABLE -g -Werror

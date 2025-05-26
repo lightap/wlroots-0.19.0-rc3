@@ -11,5 +11,5 @@ uniform samplerExternalOES texture0;
 uniform float alpha;
 
 void main() {
-	gl_FragColor = texture2D(texture0, v_texcoord) * alpha;
+	gl_FragColor = texture2D(texture0, v_texcoord).bgra * alpha;
 }

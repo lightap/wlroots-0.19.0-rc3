@@ -29,7 +29,7 @@ wlr_deps += [
 wlr_files += files(
 	'backend.c',
 	#'input_device.c',
-	#'output.c',
+	#  'output.c',
 )
 
 features += { 'RDP-backend': true }

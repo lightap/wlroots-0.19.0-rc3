@@ -784,7 +784,7 @@ static BOOL rdp_peer_activate(freerdp_peer *client) {
 
     return TRUE;
 }*/
-
+/*
 static BOOL rdp_peer_activate(freerdp_peer *client) {
     wlr_log(WLR_INFO, "RDP: Peer Activation for client %p", client);
     if (!client || !client->settings) {
@@ -843,6 +843,67 @@ static BOOL rdp_peer_activate(freerdp_peer *client) {
         wlr_log(WLR_ERROR, "RDP: Invalid wlr_output structure");
     }
 
+    return TRUE;
+}*/
+
+static BOOL rdp_peer_activate(freerdp_peer *client) {
+     wlr_log(WLR_INFO, "RDP: Peer Activation for client %p", client);
+    if (!client || !client->settings) {
+        wlr_log(WLR_ERROR, "RDP: Invalid client during activation");
+        set_global_rdp_peer(NULL);
+        return FALSE;
+    }
+    set_global_rdp_peer(client);
+    client->settings->SurfaceCommandsEnabled = TRUE;
+    wlr_log(WLR_INFO, "RDP: Peer Activated Successfully, global_rdp_peer=%p", global_rdp_peer);
+
+    if (!client->context) {
+        wlr_log(WLR_ERROR, "RDP: Invalid client context during activation");
+        return TRUE; // Continue with activation but skip frame rendering
+    }
+
+    // Get the backend from the peer context
+    struct rdp_peer_context *peerCtx = (struct rdp_peer_context *)client->context;
+    struct wlr_RDP_backend *rdp_be = peerCtx->backend;
+    if (!rdp_be) {
+        wlr_log(WLR_ERROR, "RDP: No backend associated with peer context");
+        return TRUE; // Continue with activation but skip frame rendering
+    }
+
+    // Check if outputs list is initialized and not empty
+    if (!rdp_be->outputs.next || rdp_be->outputs.next == &rdp_be->outputs) {
+        wlr_log(WLR_DEBUG, "RDP: No outputs available in backend, creating one for this client");
+
+        // Create an output for this session
+        if (!create_rdp_output_for_client(rdp_be, client)) {
+            wlr_log(WLR_ERROR, "RDP: Failed to create output for client");
+            return TRUE; // Continue with activation but skip frame rendering
+        }
+
+        // Check again if output was created successfully
+        if (!rdp_be->outputs.next || rdp_be->outputs.next == &rdp_be->outputs) {
+            wlr_log(WLR_ERROR, "RDP: Output creation succeeded but output list is still empty");
+            return TRUE; // Continue with activation but skip frame rendering
+        }
+    }
+
+    // Extract output from the list
+    struct wlr_RDP_output *rdp_output_priv = NULL;
+    rdp_output_priv = wl_container_of(rdp_be->outputs.next, rdp_output_priv, link);
+
+    if (!rdp_output_priv) {
+        wlr_log(WLR_ERROR, "RDP: Could not get RDP output from list");
+        return TRUE; // Continue with activation but skip frame rendering
+    }
+
+    struct wlr_output *wlr_output = &rdp_output_priv->wlr_output;
+    
+    // Only send frame if output already exists and is ready
+    if (wlr_output && wlr_output->enabled) {
+        // Consider making this async or rate-limited
+        wlr_output_send_frame(wlr_output);
+    }
+    
     return TRUE;
 }
 
@@ -1791,7 +1852,7 @@ static BOOL xf_mouseEvent(rdpInput *input, UINT16 flags, UINT16 x, UINT16 y) {
 
     return TRUE;
 }*/
-
+/*
 static BOOL xf_mouseEvent(rdpInput *input, UINT16 flags, UINT16 x, UINT16 y) {
     struct rdp_peer_context *peerCtx = rdp_peer_context_from_input(input);
     if (!peerCtx) {
@@ -1849,6 +1910,109 @@ static BOOL xf_mouseEvent(rdpInput *input, UINT16 flags, UINT16 x, UINT16 y) {
     // Button events - fixed button handling for GTK apps
     // RDP protocol uses specific bit patterns for buttons
     // Left button: flags & PTR_FLAGS_BUTTON1 to check if bit is set, flags & PTR_FLAGS_DOWN to check if pressed
+    if (flags & PTR_FLAGS_BUTTON1) {
+        enum wl_pointer_button_state state = (flags & PTR_FLAGS_DOWN) ? 
+                                            WL_POINTER_BUTTON_STATE_PRESSED : 
+                                            WL_POINTER_BUTTON_STATE_RELEASED;
+        struct wlr_pointer_button_event button_event = {
+            .pointer = pointer,
+            .time_msec = get_time_msec(),
+            .button = BTN_LEFT,
+            .state = state,
+        };
+        wl_signal_emit_mutable(&pointer->events.button, &button_event);
+        wlr_log(WLR_DEBUG, "RDP mouse button: BTN_LEFT, state=%d, pos=(%f,%f)",
+                state, scaled_x, scaled_y);
+    }
+    
+    if (flags & PTR_FLAGS_BUTTON2) {
+        enum wl_pointer_button_state state = (flags & PTR_FLAGS_DOWN) ? 
+                                            WL_POINTER_BUTTON_STATE_PRESSED : 
+                                            WL_POINTER_BUTTON_STATE_RELEASED;
+        struct wlr_pointer_button_event button_event = {
+            .pointer = pointer,
+            .time_msec = get_time_msec(),
+            .button = BTN_RIGHT,
+            .state = state,
+        };
+        wl_signal_emit_mutable(&pointer->events.button, &button_event);
+        wlr_log(WLR_DEBUG, "RDP mouse button: BTN_RIGHT, state=%d, pos=(%f,%f)",
+                state, scaled_x, scaled_y);
+    }
+    
+    if (flags & PTR_FLAGS_BUTTON3) {
+        enum wl_pointer_button_state state = (flags & PTR_FLAGS_DOWN) ? 
+                                            WL_POINTER_BUTTON_STATE_PRESSED : 
+                                            WL_POINTER_BUTTON_STATE_RELEASED;
+        struct wlr_pointer_button_event button_event = {
+            .pointer = pointer,
+            .time_msec = get_time_msec(),
+            .button = BTN_MIDDLE,
+            .state = state,
+        };
+        wl_signal_emit_mutable(&pointer->events.button, &button_event);
+        wlr_log(WLR_DEBUG, "RDP mouse button: BTN_MIDDLE, state=%d, pos=(%f,%f)",
+                state, scaled_x, scaled_y);
+    }
+    
+    return TRUE;
+}*/
+
+static BOOL xf_mouseEvent(rdpInput *input, UINT16 flags, UINT16 x, UINT16 y) {
+    struct rdp_peer_context *peerCtx = rdp_peer_context_from_input(input);
+    if (!peerCtx) {
+        wlr_log(WLR_ERROR, "No peer context for RDP input");
+        return FALSE;
+    }
+    struct wlr_pointer *pointer = peerCtx->item.pointer;
+    if (!pointer) {
+        wlr_log(WLR_ERROR, "No pointer associated with RDP peer");
+        return FALSE;
+    }
+ 
+    // Scale coordinates to match compositor's 1024x768 output
+    const float compositor_width = 1024.0f;
+    const float compositor_height = 768.0f;
+    const float client_width = 1024.0f;  // Replace with actual client resolution
+    const float client_height = 768.0f;  // Replace with actual client resolution
+    float scale_x = compositor_width / client_width;
+    float scale_y = compositor_height / client_height;
+    float scaled_x = (float)x * scale_x;
+    float scaled_y = (float)y * scale_y;
+    wlr_log(WLR_DEBUG, "RDP input: raw=(%u,%u), scaled=(%f,%f), scale=(%f,%f)",
+            x, y, scaled_x, scaled_y, scale_x, scale_y);
+    
+    // Send absolute motion position to the compositor (flipped Y for 180-degree transform)
+    struct wlr_pointer_motion_absolute_event abs_event = {
+        .pointer = pointer,
+        .time_msec = get_time_msec(),
+        .x = scaled_x / compositor_width,
+        .y = (scaled_y / compositor_height), // Flip Y to match WL_OUTPUT_TRANSFORM_FLIPPED_180
+    };
+    wl_signal_emit_mutable(&pointer->events.motion_absolute, &abs_event);
+    
+    static UINT16 last_x = 0, last_y = 0;
+    double delta_x = (double)scaled_x - last_x;
+    double delta_y = (double)scaled_y - last_y;
+    last_x = scaled_x;
+    last_y = scaled_y;
+    
+    // Motion event
+    if (delta_x != 0.0 || delta_y != 0.0) {
+        struct wlr_pointer_motion_event motion_event = {
+            .pointer = pointer,
+            .time_msec = get_time_msec(),
+            .delta_x = delta_x,
+            .delta_y = -delta_y, // Flip delta_y for consistency with transform
+            .unaccel_dx = delta_x,
+            .unaccel_dy = -delta_y,
+        };
+        wl_signal_emit_mutable(&pointer->events.motion, &motion_event);
+        wlr_log(WLR_DEBUG, "RDP mouse motion: delta=(%f,%f), scaled_pos=(%f,%f)",
+                delta_x, -delta_y, scaled_x, scaled_y);
+    }
+    
+    // Button events
     if (flags & PTR_FLAGS_BUTTON1) {
         enum wl_pointer_button_state state = (flags & PTR_FLAGS_DOWN) ? 
                                             WL_POINTER_BUTTON_STATE_PRESSED : 
@@ -2344,6 +2508,7 @@ wlr_log(WLR_INFO, "RDP: Emitted new_input for keyboard device '%s' (%p) for peer
     settings->RedirectClipboard = TRUE;
     settings->HasExtendedMouseEvent = TRUE;
     settings->HasHorizontalWheel = TRUE;
+    
 
     // Initialize FreeRDP peer
     if (!client->Initialize(client)) {
@@ -2843,7 +3008,7 @@ static bool rdp_backend_start(struct wlr_backend *wlr_backend) {
         return false;
     }
 
-    struct wlr_RDP_output *out = rdp_output_create(backend, "rdp-0", 1024, 768, 60);
+    struct wlr_RDP_output *out = rdp_output_create(backend, "rdp-0", 1024, 768, 60000);
     if (!out) {
         wlr_log(WLR_ERROR, "Failed to create RDP output");
         backend->started = false; // Reset on failure

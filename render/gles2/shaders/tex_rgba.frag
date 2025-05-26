@@ -9,5 +9,5 @@ uniform sampler2D tex;
 uniform float alpha;
 
 void main() {
-	gl_FragColor = texture2D(tex, v_texcoord) * alpha;
+	gl_FragColor = texture2D(tex, v_texcoord).bgra * alpha;
 }
