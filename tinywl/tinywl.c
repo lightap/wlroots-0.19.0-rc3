@@ -1304,7 +1304,7 @@ static void server_cursor_motion_absolute(struct wl_listener *listener, void *da
 }
 
 ///////////////////////////////////////////////////////////////////////
-static void server_cursor_button(struct wl_listener *listener, void *data) {
+/*static void server_cursor_button(struct wl_listener *listener, void *data) {
     struct tinywl_server *server =
         wl_container_of(listener, server, cursor_button);
     struct wlr_pointer_button_event *event = data;
@@ -1374,6 +1374,138 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
     }
     
     // Schedule frames for regular surfaces too, but after popup handling
+    struct tinywl_output *output;
+    wl_list_for_each(output, &server->outputs, link) {
+        if (output->wlr_output && output->wlr_output->enabled) {
+            wlr_output_schedule_frame(output->wlr_output);
+        }
+    }
+}*/
+
+static void server_cursor_button(struct wl_listener *listener, void *data) {
+    struct tinywl_server *server = wl_container_of(listener, server, cursor_button);
+    struct wlr_pointer_button_event *event = data;
+
+    // Log event for debugging
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    uint64_t now_ms = now.tv_sec * 1000 + now.tv_nsec / 1000000;
+    wlr_log(WLR_DEBUG, "Button: button=%u, state=%s, event_time=%u, now=%lu, cursor_mode=%d",
+            event->button, event->state == WL_POINTER_BUTTON_STATE_PRESSED ? "pressed" : "released",
+            event->time_msec, now_ms, server->cursor_mode);
+
+    // Find surface under cursor
+    double sx, sy;
+    struct wlr_surface *surface = NULL;
+    struct tinywl_toplevel *toplevel = desktop_toplevel_at(server,
+            server->cursor->x, server->cursor->y, &surface, &sx, &sy);
+
+    // Update pointer focus
+    if (surface) {
+        wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
+        wlr_seat_pointer_notify_motion(server->seat, event->time_msec, sx, sy);
+    } else {
+        wlr_seat_pointer_clear_focus(server->seat);
+    }
+
+    // Notify button event to clients
+    wlr_seat_pointer_notify_button(server->seat, event->time_msec, event->button, event->state);
+
+    // Handle button press
+    if (event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
+        if (toplevel && surface && toplevel->xdg_toplevel) {
+            bool is_popup_surface = false;
+            struct wlr_xdg_surface *xdg_surface = wlr_xdg_surface_try_from_wlr_surface(surface);
+            if (xdg_surface && xdg_surface->role == WLR_XDG_SURFACE_ROLE_POPUP) {
+                is_popup_surface = true;
+            }
+            if (!is_popup_surface && server->cursor_mode == TINYWL_CURSOR_PASSTHROUGH) {
+                focus_toplevel(toplevel);
+
+                // Initiate drag or resize based on keyboard modifiers
+                bool alt_pressed = wlr_keyboard_get_modifiers(server->seat->keyboard_state.keyboard) & WLR_MODIFIER_ALT;
+                bool ctrl_pressed = wlr_keyboard_get_modifiers(server->seat->keyboard_state.keyboard) & WLR_MODIFIER_CTRL;
+                if (event->button == BTN_LEFT && alt_pressed) {
+                    server->cursor_mode = TINYWL_CURSOR_MOVE;
+                    server->grabbed_toplevel = toplevel;
+                    server->grab_x = server->cursor->x;
+                    server->grab_y = server->cursor->y;
+                    // Initialize grab_geobox with cursor position and surface dimensions
+                    int width = 800, height = 600; // Default size
+                    if (surface && surface->current.width > 0 && surface->current.height > 0) {
+                        width = surface->current.width;
+                        height = surface->current.height;
+                    }
+                    server->grab_geobox = (struct wlr_box){
+                        .x = (int)server->cursor->x,
+                        .y = (int)server->cursor->y,
+                        .width = width,
+                        .height = height
+                    };
+                    wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "grab");
+                    wlr_log(WLR_DEBUG, "Started window move: toplevel=%p, geobox=[%d,%d,%d,%d]",
+                            toplevel, server->grab_geobox.x, server->grab_geobox.y,
+                            server->grab_geobox.width, server->grab_geobox.height);
+                } else if (event->button == BTN_LEFT && ctrl_pressed) {
+                    server->cursor_mode = TINYWL_CURSOR_RESIZE;
+                    server->grabbed_toplevel = toplevel;
+                    server->grab_x = server->cursor->x;
+                    server->grab_y = server->cursor->y;
+                    // Initialize grab_geobox with cursor position and surface dimensions
+                    int width = 800, height = 600; // Default size
+                    if (surface && surface->current.width > 0 && surface->current.height > 0) {
+                        width = surface->current.width;
+                        height = surface->current.height;
+                    }
+                    server->grab_geobox = (struct wlr_box){
+                        .x = (int)server->cursor->x,
+                        .y = (int)server->cursor->y,
+                        .width = width,
+                        .height = height
+                    };
+                    server->resize_edges = WLR_EDGE_BOTTOM | WLR_EDGE_RIGHT;
+                    wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "resize");
+                    wlr_log(WLR_DEBUG, "Started window resize: toplevel=%p, geobox=[%d,%d,%d,%d], edges=%u",
+                            toplevel, server->grab_geobox.x, server->grab_geobox.y,
+                            server->grab_geobox.width, server->grab_geobox.height, server->resize_edges);
+                }
+            }
+        }
+    }
+    // Handle button release
+    else if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
+        // Reset cursor mode and grab state
+        if (server->cursor_mode == TINYWL_CURSOR_MOVE || server->cursor_mode == TINYWL_CURSOR_RESIZE) {
+            server->cursor_mode = TINYWL_CURSOR_PASSTHROUGH;
+            server->grabbed_toplevel = NULL;
+            server->grab_x = 0;
+            server->grab_y = 0;
+            server->grab_geobox = (struct wlr_box){0};
+            server->resize_edges = 0;
+            wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
+            wlr_log(WLR_DEBUG, "Reset cursor mode to PASSTHROUGH on button release");
+        }
+    }
+
+    // Handle popup surface frame updates
+    if (surface) {
+        struct wlr_xdg_surface *xdg_surface = wlr_xdg_surface_try_from_wlr_surface(surface);
+        if (xdg_surface && xdg_surface->role == WLR_XDG_SURFACE_ROLE_POPUP) {
+            struct tinywl_output *output;
+            wl_list_for_each(output, &server->outputs, link) {
+                if (output->wlr_output && output->wlr_output->enabled) {
+                    wlr_output_schedule_frame(output->wlr_output);
+                }
+            }
+            if (xdg_surface->surface && !xdg_surface->surface->current.buffer) {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                wlr_surface_send_frame_done(xdg_surface->surface, &now);
+            }
+        }
+    }
+
+    // Schedule frame for all outputs
     struct tinywl_output *output;
     wl_list_for_each(output, &server->outputs, link) {
         if (output->wlr_output && output->wlr_output->enabled) {
@@ -1676,33 +1808,30 @@ static void output_frame(struct wl_listener *listener, void *data) {
     static double last_cursor_x = -1, last_cursor_y = -1;
     bool cursor_moved = false;
     if (server->cursor && server->cursor_mgr && server->output_layout) {
-        double cursor_x = fmax(0, fmin(server->cursor->x, output_box.width - 1));
-        double cursor_y = fmax(0, fmin(server->cursor->y, output_box.height - 1));
-        double dx = cursor_x - last_cursor_x;
-        double dy = cursor_y - last_cursor_y;
-        if (fabs(dx) > 1.0 || fabs(dy) > 1.0) {
-            cursor_moved = true;
-            struct wlr_xcursor *xcursor = wlr_xcursor_manager_get_xcursor(server->cursor_mgr, "default", 1.0);
-            if (xcursor && xcursor->images[0]) {
-                struct wlr_xcursor_image *image = xcursor->images[0];
-                // Damage the previous and current cursor regions
-                pixman_region32_t cursor_damage;
-                pixman_region32_init_rect(&cursor_damage,
-                    (int)last_cursor_x - image->hotspot_x,
-                    (int)last_cursor_y - image->hotspot_y,
-                    image->width, image->height);
-                pixman_region32_union_rect(&cursor_damage, &cursor_damage,
-                    (int)cursor_x - image->hotspot_x,
-                    (int)cursor_y - image->hotspot_y,
-                    image->width, image->height);
-                pixman_region32_union(&damage, &damage, &cursor_damage);
-                pixman_region32_fini(&cursor_damage);
-                wlr_log(WLR_DEBUG, "[RENDER_FRAME] Cursor moved: (%.2f,%.2f)", cursor_x, cursor_y);
-                last_cursor_x = cursor_x;
-                last_cursor_y = cursor_y;
-            }
+    double cursor_x = fmax(0, fmin(server->cursor->x, output_box.width - 1));
+    double cursor_y = fmax(0, fmin(server->cursor->y, output_box.height - 1));
+    if (cursor_x != last_cursor_x || cursor_y != last_cursor_y) { // Process any movement
+        cursor_moved = true;
+        struct wlr_xcursor *xcursor = wlr_xcursor_manager_get_xcursor(server->cursor_mgr, "default", 1.0);
+        if (xcursor && xcursor->images[0]) {
+            struct wlr_xcursor_image *image = xcursor->images[0];
+            pixman_region32_t cursor_damage;
+            pixman_region32_init_rect(&cursor_damage,
+                (int)last_cursor_x - image->hotspot_x,
+                (int)last_cursor_y - image->hotspot_y,
+                image->width, image->height);
+            pixman_region32_union_rect(&cursor_damage, &cursor_damage,
+                (int)cursor_x - image->hotspot_x,
+                (int)cursor_y - image->hotspot_y,
+                image->width, image->height);
+            pixman_region32_union(&damage, &damage, &cursor_damage);
+            pixman_region32_fini(&cursor_damage);
+            wlr_log(WLR_DEBUG, "[RENDER_FRAME] Cursor moved: (%.2f,%.2f)", cursor_x, cursor_y);
+            last_cursor_x = cursor_x;
+            last_cursor_y = cursor_y;
         }
     }
+}
 
     // Skip rendering if no damage or cursor movement
     if (!needs_frame && !cursor_moved) {
@@ -2377,7 +2506,7 @@ static void xdg_popup_destroy(struct wl_listener *listener, void *data) {
     free(popup);
 }
 */
-
+/*
 static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
     if (!listener || !data) {
         wlr_log(WLR_ERROR, "Invalid listener=%p or data=%p in server_new_xdg_popup", listener, data);
@@ -2466,55 +2595,115 @@ static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
             wlr_log(WLR_DEBUG, "Scheduled frame for output %s on popup creation", output->wlr_output->name);
         }
     }
+}*/
+
+static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
+    if (!listener || !data) {
+        wlr_log(WLR_ERROR, "Invalid listener=%p or data=%p in server_new_xdg_popup", listener, data);
+        return;
+    }
+
+    struct tinywl_server *server = wl_container_of(listener, server, new_xdg_popup);
+    if (!server || !server->wl_display || !server->xdg_shell || !server->scene) {
+        wlr_log(WLR_ERROR, "Invalid server state: server=%p, display=%p, xdg_shell=%p, scene=%p",
+                server, server ? server->wl_display : NULL, server ? server->xdg_shell : NULL, server ? server->scene : NULL);
+        return;
+    }
+
+    struct wlr_xdg_popup *xdg_popup = data;
+    wlr_log(WLR_INFO, "New XDG popup: %p, parent=%p, surface=%p, initial_commit=%d",
+            xdg_popup, xdg_popup->parent, xdg_popup->base ? xdg_popup->base->surface : NULL,
+            xdg_popup->base ? xdg_popup->base->initial_commit : 0);
+
+    // Validate popup surface and role
+    if (!xdg_popup->base || !xdg_popup->base->surface || xdg_popup->base->role != WLR_XDG_SURFACE_ROLE_POPUP) {
+        wlr_log(WLR_ERROR, "Invalid popup: base=%p, surface=%p, role=%d",
+                xdg_popup->base, xdg_popup->base ? xdg_popup->base->surface : NULL,
+                xdg_popup->base ? xdg_popup->base->role : -1);
+        return;
+    }
+
+    // Validate parent surface
+    struct wlr_xdg_surface *parent = wlr_xdg_surface_try_from_wlr_surface(xdg_popup->parent);
+    if (!parent || !parent->surface) {
+        wlr_log(WLR_ERROR, "No valid parent XDG surface: parent=%p, parent->surface=%p",
+                parent, parent ? parent->surface : NULL);
+        return;
+    }
+
+    // Ensure parent is a toplevel (popups cannot have popup parents)
+    if (parent->role != WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
+        wlr_log(WLR_ERROR, "Parent surface is not a toplevel: role=%d", parent->role);
+        return;
+    }
+
+    // Validate parent scene tree
+    struct wlr_scene_tree *parent_tree = parent->data;
+    if (!parent_tree || parent_tree->node.type != WLR_SCENE_NODE_TREE) {
+        wlr_log(WLR_ERROR, "Invalid parent scene tree: parent_tree=%p, type=%d",
+                parent_tree, parent_tree ? parent_tree->node.type : -1);
+        return;
+    }
+
+    // Check parent surface state
+    if (!parent->surface->mapped || !wlr_surface_has_buffer(parent->surface)) {
+        wlr_log(WLR_ERROR, "Parent surface not ready: mapped=%d, has_buffer=%d",
+                parent->surface->mapped, wlr_surface_has_buffer(parent->surface));
+        return; // Defer until parent is ready
+    }
+
+    // Allocate popup structure
+    struct tinywl_popup *popup = calloc(1, sizeof(struct tinywl_popup));
+    if (!popup) {
+        wlr_log(WLR_ERROR, "Failed to allocate tinywl_popup");
+        return;
+    }
+
+    popup->xdg_popup = xdg_popup;
+    popup->server = server;
+
+    // Create scene tree for popup
+    popup->scene_tree = wlr_scene_xdg_surface_create(parent_tree, xdg_popup->base);
+    if (!popup->scene_tree) {
+        wlr_log(WLR_ERROR, "Failed to create scene tree for popup: xdg_surface=%p", xdg_popup->base);
+        free(popup);
+        return;
+    }
+
+    // Set data pointers
+    popup->scene_tree->node.data = popup;
+    xdg_popup->base->data = popup; // Store popup for consistency with toplevels
+
+    // Set up event listeners
+    popup->map.notify = popup_map;
+    wl_signal_add(&xdg_popup->base->surface->events.map, &popup->map);
+    popup->unmap.notify = popup_unmap;
+    wl_signal_add(&xdg_popup->base->surface->events.unmap, &popup->unmap);
+    popup->destroy.notify = popup_destroy;
+    wl_signal_add(&xdg_popup->events.destroy, &popup->destroy);
+    popup->commit.notify = popup_commit;
+    wl_signal_add(&xdg_popup->base->surface->events.commit, &popup->commit);
+
+    // Add to server's popup list
+    wl_list_insert(&server->popups, &popup->link);
+    wlr_log(WLR_DEBUG, "Popup created: %p, parent=%p, scene_tree=%p, xdg_surface=%p",
+            xdg_popup, parent->surface, popup->scene_tree, xdg_popup->base);
+
+    // Schedule configure if needed
+    if (xdg_popup->base->initial_commit) {
+        wlr_xdg_surface_schedule_configure(xdg_popup->base);
+        wlr_log(WLR_DEBUG, "Scheduled configure for popup %p", xdg_popup);
+    }
+
+    // Schedule frame
+    struct tinywl_output *output;
+    wl_list_for_each(output, &server->outputs, link) {
+        if (output->wlr_output && output->wlr_output->enabled) {
+            wlr_output_schedule_frame(output->wlr_output);
+        }
+    }
 }
 
-/*
-static bool is_zink_renderer(struct wlr_backend *backend, struct wlr_renderer *renderer, struct wlr_allocator *allocator) {
-    if (!renderer) {
-        wlr_log(WLR_ERROR, "No renderer available to check type");
-        return false;
-    }
-
-    struct wlr_egl *egl = wlr_gles2_renderer_get_egl(renderer);
-    if (!egl) {
-        wlr_log(WLR_ERROR, "No EGL context available to check renderer");
-        return false;
-    }
-
-    // Get the EGL display and context from wlr_egl
-    EGLDisplay egl_display = wlr_egl_get_display(egl);
-    EGLContext egl_context = wlr_egl_get_context(egl);
-    if (!egl_display || !egl_context) {
-        wlr_log(WLR_ERROR, "Invalid EGL display or context");
-        return false;
-    }
-
-    // Make the EGL context current
-    if (!eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, egl_context)) {
-        wlr_log(WLR_ERROR, "Failed to make EGL context current: 0x%x", eglGetError());
-        return false;
-    }
-
-    // Query the GL_RENDERER string
-    const char *gl_renderer = (const char *)glGetString(GL_RENDERER);
-    if (!gl_renderer) {
-        wlr_log(WLR_ERROR, "Failed to query GL_RENDERER");
-        eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        return false;
-    }
-
-    // Check if the renderer is Zink
-    bool is_zink = strstr(gl_renderer, "Zink") != NULL;
-    wlr_log(WLR_DEBUG, "Renderer check: is_zink=%d, GL_RENDERER=%s", is_zink, gl_renderer);
-    if (!is_zink) {
-        wlr_log(WLR_DEBUG, "Renderer is not Zink: %s", gl_renderer);
-    }
-
-    // Unset the current EGL context
-    eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-
-    return is_zink;
-}*/
 
 #ifndef EGL_PLATFORM_SURFACELESS_MESA
 #define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
