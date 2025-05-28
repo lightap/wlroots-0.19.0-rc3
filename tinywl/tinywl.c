@@ -276,7 +276,15 @@ struct tinywl_toplevel {
     struct wl_list link;
     struct tinywl_server *server;
     struct wlr_xdg_toplevel *xdg_toplevel;
-    struct wlr_scene_tree *scene_tree;
+
+    // This 'scene_tree' should be the *main frame* for the window,
+    // including decorations AND client content area.
+    struct wlr_scene_tree *scene_tree; // Overall window frame
+
+    // This will point to the scene tree specifically for the client's content
+    // (i.e., the tree returned by wlr_scene_xdg_surface_create for the base xdg_surface)
+    struct wlr_scene_tree *client_xdg_scene_tree; // Tree for xdg_toplevel->base
+
     struct wl_listener map;
     struct wl_listener unmap;
     struct wl_listener commit;
@@ -285,8 +293,8 @@ struct tinywl_toplevel {
     struct wl_listener request_resize;
     struct wl_listener request_maximize;
     struct wl_listener request_fullscreen;
-     struct wlr_texture *cached_texture;
-    uint32_t last_commit_seq;  // Track surface commits
+    struct wlr_texture *cached_texture;
+    uint32_t last_commit_seq;
     bool needs_redraw;
 };
 
@@ -734,35 +742,443 @@ static void seat_request_set_selection(struct wl_listener *listener, void *data)
     wlr_seat_set_selection(server->seat, event->source, event->serial);
 }
 
+// Helper function (ensure this is correctly defined)
+static bool is_descendant(struct wlr_scene_node *node, struct wlr_scene_node *ancestor_candidate) {
+    if (!node || !ancestor_candidate) {
+        return false;
+    }
+    struct wlr_scene_node *current = node;
+    while (current != NULL) {
+        if (current == ancestor_candidate) {
+            return true;
+        }
+        if (current->parent == NULL) {
+            break;
+        }
+        current = &current->parent->node;
+    }
+    return false;
+}
+/*
+static struct tinywl_toplevel *desktop_toplevel_at(
+        struct tinywl_server *server, double lx, double ly,
+        struct wlr_surface **surface_out, double *sx_out, double *sy_out) {
+
+    wlr_log(WLR_DEBUG, "[DTA_ENTRY] Cursor lx=%.2f, ly=%.2f", lx, ly);
+
+    struct wlr_scene_node *hit_node = wlr_scene_node_at(
+        &server->scene->tree.node, lx, ly, sx_out, sy_out); // sx_out, sy_out are local to hit_node
+
+    struct tinywl_toplevel *toplevel = NULL;
+    bool picked_by_geometry_check = false;
+
+    // 1. Attempt to find toplevel via scene graph hit
+    if (hit_node != NULL && hit_node->type == WLR_SCENE_NODE_BUFFER) {
+        wlr_log(WLR_DEBUG, "[DTA] Initial Hit Node: %p. Initial sx=%.2f, sy=%.2f",
+                (void*)hit_node, *sx_out, *sy_out);
+        
+        struct wlr_scene_node *iter_node = hit_node;
+        while (iter_node != NULL) { // Find associated toplevel by traversing up from hit_node
+            if (iter_node->data != NULL) {
+                struct tinywl_toplevel *potential_toplevel = iter_node->data;
+                struct tinywl_toplevel *t_iter_list;
+                wl_list_for_each(t_iter_list, &server->toplevels, link) {
+                    if (t_iter_list == potential_toplevel && t_iter_list->scene_tree && &t_iter_list->scene_tree->node == iter_node) {
+                        toplevel = t_iter_list;
+                        break;
+                    }
+                }
+                if (toplevel) break;
+            }
+            if (iter_node->parent == NULL) { iter_node = NULL; }
+            else { iter_node = &iter_node->parent->node; }
+        }
+
+        if (toplevel == NULL) { // Fallback: check if hit_node is descendant of any toplevel's frame
+            struct tinywl_toplevel *t_iter_list;
+            wl_list_for_each(t_iter_list, &server->toplevels, link) {
+                if (t_iter_list->scene_tree && is_descendant(hit_node, &t_iter_list->scene_tree->node)) {
+                    toplevel = t_iter_list;
+                    break;
+                }
+            }
+        }
+        if (toplevel) {
+             wlr_log(WLR_DEBUG, "[DTA_PICK_SCENE] Toplevel %p found via scene graph.", (void*)toplevel);
+        }
+    } else {
+         wlr_log(WLR_DEBUG, "[DTA] No buffer node hit by wlr_scene_node_at. Initial sx=%.2f, sy=%.2f", *sx_out, *sy_out);
+    }
+
+    // 2. If no toplevel found via scene graph, or if you want to prioritize geometry for edges:
+    //    Iterate toplevels and check if (lx, ly) is within their configured geometry.
+    //    This acts as a broader hitbox.
+    if (toplevel == NULL) { // Only do geometry check if scene hit failed to find our toplevel
+        wlr_log(WLR_DEBUG, "[DTA_PICK_GEOM_TRY] No toplevel from scene hit. Trying geometry check.");
+        struct tinywl_toplevel *iter_toplevel;
+        wl_list_for_each_reverse(iter_toplevel, &server->toplevels, link) { // Reverse for Z-order
+            if (!iter_toplevel->scene_tree || !iter_toplevel->xdg_toplevel || 
+                !iter_toplevel->xdg_toplevel->base || !iter_toplevel->xdg_toplevel->base->surface ||
+                !iter_toplevel->client_xdg_scene_tree) { // Ensure client_xdg_scene_tree exists
+                continue;
+            }
+
+            int frame_abs_x, frame_abs_y;
+            if (!wlr_scene_node_coords(&iter_toplevel->scene_tree->node, &frame_abs_x, &frame_abs_y)) {
+                continue;
+            }
+
+            struct wlr_box geometry = iter_toplevel->xdg_toplevel->base->geometry;
+            if (geometry.width <= 0 || geometry.height <= 0) { // Skip if no valid geometry
+                // Fallback to surface size if geometry isn't good
+                if (wlr_surface_has_buffer(iter_toplevel->xdg_toplevel->base->surface)) {
+                    geometry.width = iter_toplevel->xdg_toplevel->base->surface->current.width;
+                    geometry.height = iter_toplevel->xdg_toplevel->base->surface->current.height;
+                } else {
+                    continue;
+                }
+            }
+
+
+            // Assuming client_xdg_scene_tree is at (0,0) within scene_tree (the frame)
+            // as per server_new_xdg_toplevel modifications (border_size=0, titlebar_height=0)
+            double client_content_origin_abs_x = (double)frame_abs_x + iter_toplevel->client_xdg_scene_tree->node.x;
+            double client_content_origin_abs_y = (double)frame_abs_y + iter_toplevel->client_xdg_scene_tree->node.y;
+            
+            // The interactive area is defined by the client content's origin and its configured geometry size
+            if (lx >= client_content_origin_abs_x && lx < client_content_origin_abs_x + geometry.width &&
+                ly >= client_content_origin_abs_y && ly < client_content_origin_abs_y + geometry.height) {
+                
+                toplevel = iter_toplevel;
+                *surface_out = toplevel->xdg_toplevel->base->surface;
+                
+                // sx, sy should be relative to the client content area's origin
+                *sx_out = lx - client_content_origin_abs_x;
+                *sy_out = ly - client_content_origin_abs_y;
+                
+                wlr_log(WLR_DEBUG, "[DTA_PICK_GEOM_HIT] Toplevel %p picked by geometry. sx=%.2f, sy=%.2f", 
+                        (void*)toplevel, *sx_out, *sy_out);
+                picked_by_geometry_check = true; 
+                break; 
+            }
+        }
+    }
+
+    if (toplevel == NULL) {
+        wlr_log(WLR_DEBUG, "[DTA_PICK_FAIL] No toplevel found by any method.");
+        return NULL;
+    }
+
+    // If picked by geometry, sx_out and sy_out are already calculated and correct.
+    // The rest of the function transforms coordinates if picked by *scene_graph_hit*
+    // and hit_node is different from the main client surface buffer node.
+    if (picked_by_geometry_check) {
+        // Ensure surface_out is correctly set if not already
+        if (*surface_out == NULL && toplevel->xdg_toplevel && toplevel->xdg_toplevel->base) {
+             *surface_out = toplevel->xdg_toplevel->base->surface;
+        }
+        if (!*surface_out) {
+            wlr_log(WLR_ERROR, "[DTA] Toplevel %p (picked by geom) missing base surface.", (void*)toplevel);
+            return NULL;
+        }
+        return toplevel;
+    }
+
+    // --- This part executes if toplevel was found by SCENE GRAPH HIT ---
+    // --- and hit_node was not NULL/irrelevant initially.               ---
+    assert(hit_node != NULL); // Should be true if !picked_by_geometry_check and toplevel != NULL
+
+    *surface_out = toplevel->xdg_toplevel->base->surface;
+    if (!*surface_out) {
+        wlr_log(WLR_ERROR, "[DTA_SCENE_HIT] Toplevel %p has no base xdg surface.", (void*)toplevel);
+        return NULL;
+    }
+    wlr_log(WLR_DEBUG, "[DTA_SCENE_HIT] Target client surface: %p", (void*)*surface_out);
+
+    int hit_node_abs_x, hit_node_abs_y;
+    if (!wlr_scene_node_coords(hit_node, &hit_node_abs_x, &hit_node_abs_y)) {
+        wlr_log(WLR_ERROR, "[DTA_SCENE_HIT_COORD] Could not get abs coords of hit_node %p.", (void*)hit_node);
+        return NULL;
+    }
+    wlr_log(WLR_DEBUG, "[DTA_SCENE_HIT_COORD] Hit Node %p Abs Coords: x=%d, y=%d. Initial local sx=%.2f, sy=%.2f", 
+            (void*)hit_node, hit_node_abs_x, hit_node_abs_y, *sx_out, *sy_out);
+
+    struct wlr_scene_node *main_client_surface_buffer_node = NULL;
+    if (toplevel->client_xdg_scene_tree) { // Find the specific buffer node for the main client surface
+        struct wlr_scene_node *child_iter;
+        wl_list_for_each(child_iter, &toplevel->client_xdg_scene_tree->children, link) {
+            if (child_iter->type == WLR_SCENE_NODE_BUFFER) {
+                struct wlr_scene_buffer *buf = wlr_scene_buffer_from_node(child_iter);
+                struct wlr_scene_surface *scene_surf = wlr_scene_surface_try_from_buffer(buf);
+                if (scene_surf && scene_surf->surface == *surface_out) {
+                    main_client_surface_buffer_node = child_iter;
+                    break;
+                }
+            }
+        }
+    }
+     if (temp_buffer_node) {
+         wlr_log(WLR_DEBUG, "[DTA_SCENE_HIT_CLIENT_NODE] Found main_client_surface_buffer_node: %p", (void*)main_client_surface_buffer_node);
+    } else {
+         wlr_log(WLR_DEBUG, "[DTA_SCENE_HIT_CLIENT_NODE] Main client surface buffer node NOT found for surface %p.", (void*)*surface_out);
+    }
+
+    // If hit_node IS the client's main surface buffer, initial sx_out, sy_out are correct.
+    if (main_client_surface_buffer_node && hit_node == main_client_surface_buffer_node) {
+        wlr_log(WLR_DEBUG, "[DTA_SCENE_HIT_TRANSFORM] Hit node IS main client surface buffer. No transformation. Final sx=%.2f, sy=%.2f", *sx_out, *sy_out);
+        return toplevel;
+    }
+
+    // If hit_node is NOT the main client surface buffer (e.g., a decoration, or if client buffer node wasn't found distinctly),
+    // transform coordinates to be relative to the *expected* client content area origin.
+    wlr_log(WLR_DEBUG, "[DTA_SCENE_HIT_TRANSFORM_EXPECTED] Transforming based on expected client position (hit_node %p, client_surf_node %p).",
+            (void*)hit_node, (void*)main_client_surface_buffer_node);
+    if (!toplevel->scene_tree || !toplevel->client_xdg_scene_tree) {
+        wlr_log(WLR_ERROR, "[DTA_SCENE_HIT_COORD] Toplevel %p missing scene_tree or client_xdg_scene_tree.", (void*)toplevel);
+        return NULL;
+    }
+
+    int frame_abs_x, frame_abs_y;
+    if (!wlr_scene_node_coords(&toplevel->scene_tree->node, &frame_abs_x, &frame_abs_y)) {
+        wlr_log(WLR_ERROR, "[DTA_SCENE_HIT_COORD] Could not get abs coords of frame node %p.", (void*)&toplevel->scene_tree->node);
+        return NULL;
+    }
+    
+    // Position of client_xdg_scene_tree relative to scene_tree (frame) - should be (0,0)
+    double client_rel_x_in_frame = toplevel->client_xdg_scene_tree->node.x;
+    double client_rel_y_in_frame = toplevel->client_xdg_scene_tree->node.y;
+
+    double expected_client_area_abs_x = (double)frame_abs_x + client_rel_x_in_frame;
+    double expected_client_area_abs_y = (double)frame_abs_y + client_rel_y_in_frame;
+     wlr_log(WLR_DEBUG, "[DTA_SCENE_HIT_COORD] Frame abs: (%d,%d). Client_rel: (%.1f,%.1f). Expected client abs: (%.1f,%.1f)",
+            frame_abs_x, frame_abs_y, client_rel_x_in_frame, client_rel_y_in_frame, expected_client_area_abs_x, expected_client_area_abs_y);
+
+
+    double final_sx = (double)hit_node_abs_x + *sx_out - expected_client_area_abs_x;
+    double final_sy = (double)hit_node_abs_y + *sy_out - expected_client_area_abs_y;
+
+    *sx_out = final_sx;
+    *sy_out = final_sy;
+    wlr_log(WLR_DEBUG, "[DTA_SCENE_HIT_TRANSFORM_EXPECTED] Transformed sx=%.2f, sy=%.2f", *sx_out, *sy_out);
+    return toplevel;
+}*/
 
 
 static struct tinywl_toplevel *desktop_toplevel_at(
         struct tinywl_server *server, double lx, double ly,
-        struct wlr_surface **surface, double *sx, double *sy) {
-    /* This returns the topmost node in the scene at the given layout coords.
-     * We only care about surface nodes as we are specifically looking for a
-     * surface in the surface tree of a tinywl_toplevel. */
-    struct wlr_scene_node *node = wlr_scene_node_at(
-        &server->scene->tree.node, lx, ly, sx, sy);
-    if (node == NULL || node->type != WLR_SCENE_NODE_BUFFER) {
-        return NULL;
+        struct wlr_surface **surface_out, double *sx_out, double *sy_out) {
+
+    wlr_log(WLR_DEBUG, "[DTA_ENTRY] Cursor at lx=%.2f, ly=%.2f", lx, ly);
+
+    struct wlr_scene_node *hit_node = wlr_scene_node_at(
+        &server->scene->tree.node, lx, ly, sx_out, sy_out); // sx_out, sy_out are local to hit_node
+    struct tinywl_toplevel *toplevel = NULL;
+    bool picked_by_geometry_check = false;
+
+    // 1. Attempt to find toplevel via scene graph hit
+    if (hit_node != NULL && hit_node->type == WLR_SCENE_NODE_BUFFER) {
+        wlr_log(WLR_DEBUG, "[DTA] Initial Hit Node: %p. Initial sx=%.2f, sy=%.2f",
+                (void*)hit_node, *sx_out, *sy_out);
+        
+        struct wlr_scene_node *iter_node = hit_node;
+        while (iter_node != NULL) {
+            if (iter_node->data != NULL) {
+                struct tinywl_toplevel *potential_toplevel = iter_node->data;
+                struct tinywl_toplevel *t_iter_list;
+                wl_list_for_each(t_iter_list, &server->toplevels, link) {
+                    if (t_iter_list == potential_toplevel && t_iter_list->scene_tree && &t_iter_list->scene_tree->node == iter_node) {
+                        toplevel = t_iter_list;
+                        break;
+                    }
+                }
+                if (toplevel) break;
+            }
+            if (iter_node->parent == NULL) { iter_node = NULL; }
+            else { iter_node = &iter_node->parent->node; }
+        }
+
+        if (toplevel == NULL) {
+            struct tinywl_toplevel *t_iter_list;
+            wl_list_for_each(t_iter_list, &server->toplevels, link) {
+                if (t_iter_list->scene_tree && is_descendant(hit_node, &t_iter_list->scene_tree->node)) {
+                    toplevel = t_iter_list;
+                    break;
+                }
+            }
+        }
+        if (toplevel) {
+            wlr_log(WLR_DEBUG, "[DTA_PICK_SCENE] Toplevel %p found via scene graph.", (void*)toplevel);
+        }
+    } else {
+        wlr_log(WLR_DEBUG, "[DTA] No buffer node hit by wlr_scene_node_at. Initial sx=%.2f, sy=%.2f", *sx_out, *sy_out);
     }
-    struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
-    struct wlr_scene_surface *scene_surface =
-        wlr_scene_surface_try_from_buffer(scene_buffer);
-    if (!scene_surface) {
+
+    // 2. Fallback to geometry-based picking
+    if (toplevel == NULL) {
+        wlr_log(WLR_DEBUG, "[DTA_PICK_GEOM_TRY] No toplevel from scene hit. Trying geometry check.");
+        struct tinywl_toplevel *iter_toplevel;
+        wl_list_for_each_reverse(iter_toplevel, &server->toplevels, link) {
+            if (!iter_toplevel->scene_tree || !iter_toplevel->xdg_toplevel || 
+                !iter_toplevel->xdg_toplevel->base || !iter_toplevel->xdg_toplevel->base->surface ||
+                !iter_toplevel->client_xdg_scene_tree) {
+                continue;
+            }
+
+            int frame_abs_x, frame_abs_y;
+            if (!wlr_scene_node_coords(&iter_toplevel->scene_tree->node, &frame_abs_x, &frame_abs_y)) {
+                continue;
+            }
+
+            // Use geometry, but fall back to surface size if geometry is invalid
+            struct wlr_box geometry;
+          geometry = iter_toplevel->xdg_toplevel->base->geometry; // Direct access if available
+            struct wlr_surface *surface = iter_toplevel->xdg_toplevel->base->surface;
+            if (geometry.width <= 0 || geometry.height <= 0) {
+                if (wlr_surface_has_buffer(surface)) {
+                    geometry.width = surface->current.width;
+                    geometry.height = surface->current.height;
+                    geometry.x = 0;
+                    geometry.y = 0;
+                    wlr_log(WLR_DEBUG, "[DTA_PICK_GEOM] Fallback to surface size: %dx%d",
+                            geometry.width, geometry.height);
+                } else {
+                    continue;
+                }
+            }
+
+            // Include decorations in the hitbox (adjust these values based on your decoration setup)
+            const int border_size = 0; // Adjust if you have server-side borders
+            const int titlebar_height = 0; // Adjust if you have a titlebar
+            geometry.x -= border_size;
+            geometry.y -= titlebar_height;
+            geometry.width += 2 * border_size;
+            geometry.height += titlebar_height + border_size;
+
+            // Calculate the absolute position of the window frame (including decorations)
+            double frame_origin_abs_x = (double)frame_abs_x;
+            double frame_origin_abs_y = (double)frame_abs_y;
+
+            // Check if cursor is within the full window frame
+            if (lx >= frame_origin_abs_x + geometry.x &&
+                lx < frame_origin_abs_x + geometry.x + geometry.width &&
+                ly >= frame_origin_abs_y + geometry.y &&
+                ly < frame_origin_abs_y + geometry.y + geometry.height) {
+                
+                toplevel = iter_toplevel;
+                *surface_out = surface;
+                
+                // Calculate sx, sy relative to the client content area
+                double client_rel_x = iter_toplevel->client_xdg_scene_tree->node.x;
+                double client_rel_y = iter_toplevel->client_xdg_scene_tree->node.y;
+                *sx_out = lx - frame_origin_abs_x - client_rel_x;
+                *sy_out = ly - frame_origin_abs_y - client_rel_y;
+
+                wlr_log(WLR_DEBUG, "[DTA_PICK_GEOM_HIT] Toplevel %p picked by geometry. "
+                        "Frame abs: (%.2f,%.2f), Geometry: (%d,%d,%d,%d), Client rel: (%.2f,%.2f), "
+                        "sx=%.2f, sy=%.2f",
+                        (void*)toplevel, frame_origin_abs_x, frame_origin_abs_y,
+                        geometry.x, geometry.y, geometry.width, geometry.height,
+                        client_rel_x, client_rel_y, *sx_out, *sy_out);
+                picked_by_geometry_check = true;
+                break;
+            }
+        }
+    }
+
+    if (toplevel == NULL) {
+        wlr_log(WLR_DEBUG, "[DTA_PICK_FAIL] No toplevel found by any method.");
+        *surface_out = NULL;
+        *sx_out = 0;
+        *sy_out = 0;
         return NULL;
     }
 
-    *surface = scene_surface->surface;
-    /* Find the node corresponding to the tinywl_toplevel at the root of this
-     * surface tree, it is the only one for which we set the data field. */
-    struct wlr_scene_tree *tree = node->parent;
-    while (tree != NULL && tree->node.data == NULL) {
-        tree = tree->node.parent;
+    // If picked by geometry, coordinates are already correct
+    if (picked_by_geometry_check) {
+        if (*surface_out == NULL && toplevel->xdg_toplevel && toplevel->xdg_toplevel->base) {
+            *surface_out = toplevel->xdg_toplevel->base->surface;
+        }
+        if (!*surface_out) {
+            wlr_log(WLR_ERROR, "[DTA] Toplevel %p (picked by geom) missing base surface.", (void*)toplevel);
+            return NULL;
+        }
+        return toplevel;
     }
-    return tree->node.data;
+
+    // Handle scene graph hit case
+    assert(hit_node != NULL);
+    *surface_out = toplevel->xdg_toplevel->base->surface;
+    if (!*surface_out) {
+        wlr_log(WLR_ERROR, "[DTA_SCENE_HIT] Toplevel %p has no base xdg surface.", (void*)toplevel);
+        return NULL;
+    }
+    wlr_log(WLR_DEBUG, "[DTA_SCENE_HIT] Target client surface: %p", (void*)*surface_out);
+
+    int hit_node_abs_x, hit_node_abs_y;
+    if (!wlr_scene_node_coords(hit_node, &hit_node_abs_x, &hit_node_abs_y)) {
+        wlr_log(WLR_ERROR, "[DTA_SCENE_HIT_COORD] Could not get abs coords of hit_node %p.", (void*)hit_node);
+        return NULL;
+    }
+    wlr_log(WLR_DEBUG, "[DTA_SCENE_HIT_COORD] Hit Node %p Abs Coords: x=%d, y=%d. Initial local sx=%.2f, sy=%.2f",
+            (void*)hit_node, hit_node_abs_x, hit_node_abs_y, *sx_out, *sy_out);
+
+    // Find the main client surface buffer node
+ struct wlr_scene_node *temp_buffer_node = NULL;
+    if (toplevel->client_xdg_scene_tree) {
+        struct wlr_scene_node *child_iter;
+        wl_list_for_each(child_iter, &toplevel->client_xdg_scene_tree->children, link) {
+            if (child_iter->type == WLR_SCENE_NODE_BUFFER) {
+                struct wlr_scene_buffer *buf = wlr_scene_buffer_from_node(child_iter);
+                struct wlr_scene_surface *scene_surf = wlr_scene_surface_try_from_buffer(buf);
+                if (scene_surf && scene_surf->surface == *surface_out) {
+                    temp_buffer_node = child_iter;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (temp_buffer_node) {
+        wlr_log(WLR_DEBUG, "[DTA_SCENE_HIT_CLIENT_NODE] Found main_client_surface_buffer_node: %p", (void*)temp_buffer_node);
+    } else {
+        wlr_log(WLR_DEBUG, "[DTA_SCENE_HIT_CLIENT_NODE] Main client surface buffer node NOT found for surface %p.", (void*)*surface_out);
+    }
+
+    // If hit_node is the client surface buffer, sx_out, sy_out are correct
+    if (temp_buffer_node && hit_node == temp_buffer_node) {
+        wlr_log(WLR_DEBUG, "[DTA_SCENE_HIT_TRANSFORM] Hit node IS main client surface buffer. No transformation. Final sx=%.2f, sy=%.2f", *sx_out, *sy_out);
+        return toplevel;
+    }
+
+    // Transform coordinates to client content area
+    if (!toplevel->scene_tree || !toplevel->client_xdg_scene_tree) {
+        wlr_log(WLR_ERROR, "[DTA_SCENE_HIT_COORD] Toplevel %p missing scene_tree or client_xdg_scene_tree.", (void*)toplevel);
+        return NULL;
+    }
+
+    int frame_abs_x, frame_abs_y;
+    if (!wlr_scene_node_coords(&toplevel->scene_tree->node, &frame_abs_x, &frame_abs_y)) {
+        wlr_log(WLR_ERROR, "[DTA_SCENE_HIT_COORD] Could not get abs coords of frame node %p.", (void*)&toplevel->scene_tree->node);
+        return NULL;
+    }
+
+    double client_rel_x = toplevel->client_xdg_scene_tree->node.x;
+    double client_rel_y = toplevel->client_xdg_scene_tree->node.y;
+    double client_abs_x = (double)frame_abs_x + client_rel_x;
+    double client_abs_y = (double)frame_abs_y + client_rel_y;
+
+    *sx_out = lx - client_abs_x;
+    *sy_out = ly - client_abs_y;
+
+    wlr_log(WLR_DEBUG, "[DTA_SCENE_HIT_TRANSFORM] Transformed sx=%.2f, sy=%.2f. "
+            "Frame abs: (%.2f,%.2f), Client rel: (%.2f,%.2f), Client abs: (%.2f,%.2f)",
+            *sx_out, *sy_out, (double)frame_abs_x, (double)frame_abs_y,
+            client_rel_x, client_rel_y, client_abs_x, client_abs_y);
+
+    return toplevel;
 }
+
+///////////////////////////////////////////////////
 
 static void reset_cursor_mode(struct tinywl_server *server) {
     server->cursor_mode = TINYWL_CURSOR_PASSTHROUGH;
@@ -838,8 +1254,7 @@ static void ensure_popup_responsiveness(struct tinywl_server *server, struct wlr
         wlr_xdg_surface_schedule_configure(xdg_surface);
     }
 }
-
-// Updated process_cursor_motion to handle popups better
+/////////////////////////////////////////////////////////////
 static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
     if (server->cursor_mode == TINYWL_CURSOR_MOVE) {
         process_cursor_move(server);
@@ -848,21 +1263,24 @@ static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
         process_cursor_resize(server);
         return;
     }
-
+    
     double sx, sy;
     struct wlr_seat *seat = server->seat;
     struct wlr_surface *surface = NULL;
+    wlr_log(WLR_DEBUG, "[PROCESS_CURSOR_MOTION] Cursor at: (%.2f, %.2f)", server->cursor->x, server->cursor->y);
+    
     struct tinywl_toplevel *toplevel = desktop_toplevel_at(server,
             server->cursor->x, server->cursor->y, &surface, &sx, &sy);
+    
+    wlr_log(WLR_DEBUG, "[PROCESS_CURSOR_MOTION] Surface: %p, Surface coords: (%.2f, %.2f), Toplevel: %p",
+            surface, sx, sy, toplevel);
     
     if (!toplevel) {
         wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
     }
     
     if (surface) {
-        // Ensure popup responsiveness when hovering
         ensure_popup_responsiveness(server, surface);
-        
         wlr_seat_pointer_notify_enter(seat, surface, sx, sy);
         wlr_seat_pointer_notify_motion(seat, time, sx, sy);
     } else {
@@ -1154,7 +1572,7 @@ static bool surface_needs_update(struct tinywl_toplevel *toplevel_view) {
     return false;
 }
 
-
+//with damage
 static void output_frame(struct wl_listener *listener, void *data) {
     struct tinywl_output *output = wl_container_of(listener, output, frame);
     struct wlr_output *wlr_output = output->wlr_output;
@@ -1173,9 +1591,6 @@ static void output_frame(struct wl_listener *listener, void *data) {
         wlr_output_schedule_frame(wlr_output);
         return;
     }
-
-
-
 
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -1224,6 +1639,39 @@ static void output_frame(struct wl_listener *listener, void *data) {
         needs_frame = true;
     }
 
+    // Add toplevel damage tracking
+    struct pixman_region32 toplevel_damage;
+    pixman_region32_init(&toplevel_damage);
+    struct tinywl_toplevel *toplevel_view;
+    bool toplevel_damaged = false;
+    wl_list_for_each(toplevel_view, &server->toplevels, link) {
+        if (!toplevel_view->xdg_toplevel || !toplevel_view->xdg_toplevel->base ||
+            !toplevel_view->xdg_toplevel->base->surface->mapped) {
+            continue;
+        }
+        struct wlr_surface *surface = toplevel_view->xdg_toplevel->base->surface;
+        if (!wlr_surface_has_buffer(surface)) continue;
+
+        pixman_region32_t surface_damage;
+        pixman_region32_init(&surface_damage);
+        if (surface->current.committed & WLR_SURFACE_STATE_SURFACE_DAMAGE) {
+            wlr_surface_get_effective_damage(surface, &surface_damage);
+            if (pixman_region32_not_empty(&surface_damage)) {
+                double view_x = toplevel_view->scene_tree->node.x;
+                double view_y = toplevel_view->scene_tree->node.y;
+                pixman_region32_translate(&surface_damage, (int)view_x, (int)view_y);
+                pixman_region32_union(&toplevel_damage, &toplevel_damage, &surface_damage);
+                toplevel_damaged = true;
+            }
+        }
+        pixman_region32_fini(&surface_damage);
+    }
+    if (toplevel_damaged) {
+        pixman_region32_union(&damage, &damage, &toplevel_damage);
+        needs_frame = true;
+    }
+    pixman_region32_fini(&toplevel_damage);
+
     // Add cursor damage
     static double last_cursor_x = -1, last_cursor_y = -1;
     bool cursor_moved = false;
@@ -1265,50 +1713,36 @@ static void output_frame(struct wl_listener *listener, void *data) {
     }
 
     // Begin rendering
-       // Begin rendering
     struct wlr_egl_context prev_ctx = {0};
     struct wlr_egl *egl = wlr_gles2_renderer_get_egl(wlr_output->renderer);
     if (!egl || !wlr_egl_make_current(egl, &prev_ctx)) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to make EGL context current"); // Corrected log prefix
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to make EGL context current");
         wlr_scene_output_send_frame_done(scene_output, &now);
         pixman_region32_fini(&damage);
         return;
     }
 
-    struct wlr_output_state state; // This is the state for this commit operation
+    struct wlr_output_state state;
     wlr_output_state_init(&state);
 
-    // --- (A) ADD THIS BLOCK TO PREPARE 'state' ---
+    // Prepare state
     wlr_output_state_set_enabled(&state, true);
-
     struct wlr_output_mode *current_wlr_mode = wlr_output->current_mode;
     if (current_wlr_mode) {
         wlr_output_state_set_mode(&state, current_wlr_mode);
     } else {
-        wlr_log(WLR_ERROR, "[TINYWL_OUTPUT_FRAME] wlr_output->current_mode is NULL! Cannot set mode in output state for commit. This is a critical error.");
-        // You MUST have a mode on the output for it to be valid for commits.
-        // Your rdp_output_create should ensure this.
-        // For now, if this happens, the commit will likely fail, but let's proceed to see the logs.
+        wlr_log(WLR_ERROR, "[TINYWL_OUTPUT_FRAME] wlr_output->current_mode is NULL! Cannot set mode in output state for commit.");
     }
-
-    // 'damage' is the pixman_region32_t you calculated earlier. Set it on 'state'.
     wlr_output_state_set_damage(&state, &damage);
-    // Now 'state.committed' will have ENABLED, MODE (if mode was set), and DAMAGE bits set.
-    // 'state.enabled' will be true.
-    // 'state.mode' will be set (if current_wlr_mode was not NULL).
-    // 'state.damage' will be a copy of your calculated 'damage'.
-    // --- END OF (A) ---
 
     struct wlr_buffer_pass_options pass_options = {
         .color_transform = NULL,
     };
 
-    // Now, wlr_output_begin_render_pass receives the 'state' that has been properly prepared.
-    // This call will additionally set state.buffer (if successful)
-    // and set the WLR_OUTPUT_STATE_BUFFER bit in state.committed.
+    // Begin render pass
     struct wlr_render_pass *pass = wlr_output_begin_render_pass(wlr_output, &state, &pass_options);
     if (!pass) {
-        wlr_log(WLR_ERROR, "[TINYWL_OUTPUT_FRAME] Failed to begin render pass"); // Corrected log prefix
+        wlr_log(WLR_ERROR, "[TINYWL_OUTPUT_FRAME] Failed to begin render pass");
         wlr_egl_restore_context(&prev_ctx);
         wlr_output_state_finish(&state);
         wlr_scene_output_send_frame_done(scene_output, &now);
@@ -1328,7 +1762,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
 
     glViewport(0, 0, wlr_output->width, wlr_output->height);
 
-    // Only render background in damaged regions
+    // Render background in damaged regions
     float background_color[] = {0.1f, 0.1f, 0.15f, 1.0f};
     int nrects;
     pixman_box32_t *rects = pixman_region32_rectangles(&damage, &nrects);
@@ -1349,76 +1783,73 @@ static void output_frame(struct wl_listener *listener, void *data) {
         wlr_render_pass_add_rect(pass, &background_opts);
     }
 
-  
-// Updated render function
-// Render toplevels
-int window_count = 0;
-struct tinywl_toplevel *toplevel_view;
-wl_list_for_each_reverse(toplevel_view, &server->toplevels, link) {
-    if (!toplevel_view->xdg_toplevel || !toplevel_view->xdg_toplevel->base ||
-        !toplevel_view->xdg_toplevel->base->surface->mapped) {
-        continue;
-    }
-    
-    struct wlr_xdg_surface *xdg_surface = toplevel_view->xdg_toplevel->base;
-    struct wlr_surface *surface = xdg_surface->surface;
-    
-    if (!wlr_surface_has_buffer(surface)) {
-        continue;
-    }
-    
-    // Check if we need to update the cached texture
-    bool needs_update = surface_needs_update(toplevel_view);
-    
-    if (needs_update || !toplevel_view->cached_texture) {
-        // Get fresh texture and cache it
-        toplevel_view->cached_texture = wlr_surface_get_texture(surface);
-        toplevel_view->needs_redraw = false;
+    // Render toplevels
+    int window_count = 0;
+    struct tinywl_toplevel *toplevel_view_render; // Renamed to avoid redeclaration
+    wl_list_for_each_reverse(toplevel_view_render, &server->toplevels, link) {
+        if (!toplevel_view_render->xdg_toplevel || !toplevel_view_render->xdg_toplevel->base ||
+            !toplevel_view_render->xdg_toplevel->base->surface->mapped) {
+            continue;
+        }
         
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Updated cached texture for toplevel");
+        struct wlr_xdg_surface *xdg_surface = toplevel_view_render->xdg_toplevel->base;
+        struct wlr_surface *surface = xdg_surface->surface;
+        
+        if (!wlr_surface_has_buffer(surface)) {
+            continue;
+        }
+        
+        // Check if we need to update the cached texture
+        bool needs_update = surface_needs_update(toplevel_view_render);
+        
+        if (needs_update || !toplevel_view_render->cached_texture) {
+            // Get fresh texture and cache it
+            toplevel_view_render->cached_texture = wlr_surface_get_texture(surface);
+            toplevel_view_render->needs_redraw = false;
+            
+            wlr_log(WLR_DEBUG, "[RENDER_FRAME] Updated cached texture for toplevel");
+        }
+        
+        if (!toplevel_view_render->cached_texture) {
+            continue;
+        }
+        
+        // Only render if this window or its region has damage
+        bool has_damage = surface->current.committed & WLR_SURFACE_STATE_BUFFER;
+        
+        // For now, we'll render if there's any damage or if it's the first frame
+        if (!has_damage && toplevel_view_render->last_commit_seq != 0) {
+            // Skip rendering this window - no changes
+            continue;
+        }
+        
+        window_count++;
+        double view_x = toplevel_view_render->scene_tree->node.x;
+        double view_y = toplevel_view_render->scene_tree->node.y;
+        int width = surface->current.width;
+        int height = surface->current.height;
+        
+        struct wlr_fbox src_box = { .x = 0, .y = 0, .width = width, .height = height };
+        struct wlr_box dst_box = {
+            .x = (int)view_x,
+            .y = wlr_output->height - (int)view_y - height,
+            .width = width,
+            .height = height
+        };
+        
+        struct wlr_render_texture_options tex_opts = {
+            .texture = toplevel_view_render->cached_texture,
+            .src_box = src_box,
+            .dst_box = dst_box,
+            .blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
+            .transform = WL_OUTPUT_TRANSFORM_FLIPPED_180,
+        };
+        
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Rendering toplevel %d at (%d,%d) size=(%dx%d)",
+                window_count, dst_box.x, dst_box.y, dst_box.width, dst_box.height);
+        
+        wlr_render_pass_add_texture(pass, &tex_opts);
     }
-    
-    if (!toplevel_view->cached_texture) {
-        continue;
-    }
-    
-    // Only render if this window or its region has damage
-    // You might want to add more sophisticated damage region checking here
-    bool has_damage = surface->current.committed & WLR_SURFACE_STATE_BUFFER;
-    
-    // For now, we'll render if there's any damage or if it's the first frame
-    if (!has_damage && toplevel_view->last_commit_seq != 0) {
-        // Skip rendering this window - no changes
-        continue;
-    }
-    
-    window_count++;
-    double view_x = toplevel_view->scene_tree->node.x;
-    double view_y = toplevel_view->scene_tree->node.y;
-    int width = surface->current.width;
-    int height = surface->current.height;
-    
-    struct wlr_fbox src_box = { .x = 0, .y = 0, .width = width, .height = height };
-    struct wlr_box dst_box = {
-        .x = (int)view_x,
-        .y = wlr_output->height - (int)view_y - height,
-        .width = width,
-        .height = height
-    };
-    
-    struct wlr_render_texture_options tex_opts = {
-        .texture = toplevel_view->cached_texture,  // Use cached texture
-        .src_box = src_box,
-        .dst_box = dst_box,
-        .blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
-        .transform = WL_OUTPUT_TRANSFORM_FLIPPED_180,
-    };
-    
-    wlr_log(WLR_DEBUG, "[RENDER_FRAME] Rendering toplevel %d at (%d,%d) size=(%dx%d)",
-            window_count, dst_box.x, dst_box.y, dst_box.width, dst_box.height);
-    
-    wlr_render_pass_add_texture(pass, &tex_opts);
-}
 
 
     // Render popups
@@ -1615,517 +2046,6 @@ wl_list_for_each_reverse(toplevel_view, &server->toplevels, link) {
 }
 
 
-
-/*
-static void output_frame(struct wl_listener *listener, void *data) {
-    struct tinywl_output *output = wl_container_of(listener, output, frame);
-    struct wlr_output *wlr_output = output->wlr_output;
-    struct tinywl_server *server = output->server;
-    struct wlr_scene *scene = server->scene;
-
-    // Check if a frame is already pending
-    if (wlr_output->frame_pending) {
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Frame pending for %s, skipping", wlr_output->name);
-        return;
-    }
-
-    struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(scene, wlr_output);
-    if (!scene_output) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] No scene output for %s", wlr_output->name);
-        wlr_output_schedule_frame(wlr_output);
-        return;
-    }
-
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-
-    // Validate output state
-    if (!wlr_output || !wlr_output->enabled || !wlr_output->renderer || !wlr_output->allocator) {
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Output '%s' not ready", wlr_output->name);
-        wlr_scene_output_send_frame_done(scene_output, &now);
-        return;
-    }
-
-    if (!wlr_renderer_is_gles2(wlr_output->renderer)) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Renderer is not GLES2");
-        wlr_scene_output_send_frame_done(scene_output, &now);
-        return;
-    }
-
-    if (!server->output_layout) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] No output layout available");
-        wlr_scene_output_send_frame_done(scene_output, &now);
-        return;
-    }
-
-    struct wlr_box output_box;
-    wlr_output_layout_get_box(server->output_layout, wlr_output, &output_box);
-    if (output_box.width == 0 || output_box.height == 0) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Invalid output box for %s", wlr_output->name);
-        wlr_scene_output_send_frame_done(scene_output, &now);
-        return;
-    }
-
-    // Initialize damage tracking
-    struct pixman_region32 damage;
-    pixman_region32_init(&damage);
-    
-    // Get damage from scene output
-    bool needs_frame = false;
-    if (scene_output && scene_output->damage_ring.current.data) {
-        pixman_region32_copy(&damage, &scene_output->damage_ring.current);
-        needs_frame = pixman_region32_not_empty(&damage);
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Damage ring copied, needs_frame=%d, damage empty=%d",
-                needs_frame, !pixman_region32_not_empty(&damage));
-    } else {
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Damage ring null or invalid: scene_output=%p, damage_ring.current.data=%p",
-                scene_output, scene_output ? scene_output->damage_ring.current.data : NULL);
-        needs_frame = false;
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Skipping full damage fallback, checking manual sources");
-    }
-
- // Manually collect damage from toplevels
-struct pixman_region32 toplevel_damage;
-pixman_region32_init(&toplevel_damage);
-struct tinywl_toplevel *toplevel_view;
-bool toplevel_damaged = false;
-wl_list_for_each(toplevel_view, &server->toplevels, link) {
-    if (!toplevel_view->xdg_toplevel || !toplevel_view->xdg_toplevel->base ||
-        !toplevel_view->xdg_toplevel->base->surface->mapped) {
-        continue;
-    }
-    struct wlr_xdg_surface *xdg_surface = toplevel_view->xdg_toplevel->base;
-    struct wlr_surface *surface = xdg_surface->surface;
-    if (!wlr_surface_has_buffer(surface)) {
-        continue;
-    }
-
-    // Check if surface has damage
-    pixman_region32_t surface_damage;
-    pixman_region32_init(&surface_damage);
-    bool has_damage = false;
-    if (surface->current.committed & WLR_SURFACE_STATE_SURFACE_DAMAGE) {
-        wlr_surface_get_effective_damage(surface, &surface_damage);
-        has_damage = pixman_region32_not_empty(&surface_damage);
-    }
-
-    if (has_damage) {
-        // Transform surface damage to output coordinates
-        double view_x = toplevel_view->scene_tree->node.x;
-        double view_y = toplevel_view->scene_tree->node.y;
-        pixman_region32_t transformed_damage;
-        pixman_region32_init(&transformed_damage);
-        pixman_region32_copy(&transformed_damage, &surface_damage);
-        pixman_region32_translate(&transformed_damage, (int)view_x, (int)view_y);
-        pixman_region32_union(&toplevel_damage, &toplevel_damage, &transformed_damage);
-        pixman_region32_fini(&transformed_damage);
-        toplevel_damaged = true;
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Toplevel damage added for surface %p at (%d,%d)", 
-                surface, (int)view_x, (int)view_y);
-    }
-    pixman_region32_fini(&surface_damage);
-}
-if (toplevel_damaged) {
-    pixman_region32_union(&damage, &damage, &toplevel_damage);
-    needs_frame = true;
-}
-pixman_region32_fini(&toplevel_damage);
-
-    // Add cursor damage
-    static double last_cursor_x = -1, last_cursor_y = -1;
-    bool cursor_moved = false;
-    if (server->cursor && server->cursor_mgr && server->output_layout) {
-        double cursor_x = fmax(0, fmin(server->cursor->x, output_box.width - 1));
-        double cursor_y = fmax(0, fmin(server->cursor->y, output_box.height - 1));
-        double dx = cursor_x - last_cursor_x;
-        double dy = cursor_y - last_cursor_y;
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Cursor delta: dx=%.2f, dy=%.2f", dx, dy);
-        if (fabs(dx) > 0.5 || fabs(dy) > 0.5) {
-            cursor_moved = true;
-            struct wlr_xcursor *xcursor = wlr_xcursor_manager_get_xcursor(server->cursor_mgr, "default", 1.0);
-            if (xcursor && xcursor->images[0]) {
-                struct wlr_xcursor_image *image = xcursor->images[0];
-                pixman_region32_t cursor_damage;
-                pixman_region32_init_rect(&cursor_damage,
-                    (int)last_cursor_x - image->hotspot_x,
-                    (int)last_cursor_y - image->hotspot_y,
-                    image->width, image->height);
-                pixman_region32_union_rect(&cursor_damage, &cursor_damage,
-                    (int)cursor_x - image->hotspot_x,
-                    (int)cursor_y - image->hotspot_y,
-                    image->width, image->height);
-                pixman_region32_union(&damage, &damage, &cursor_damage);
-                pixman_region32_fini(&cursor_damage);
-                wlr_log(WLR_DEBUG, "[RENDER_FRAME] Cursor moved: (%d,%d)", (int)cursor_x, (int)cursor_y);
-                needs_frame = true;
-                last_cursor_x = cursor_x;
-                last_cursor_y = cursor_y;
-            }
-        }
-    } else {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Cursor or output layout null: cursor=%p, cursor_mgr=%p, output_layout=%p",
-                server->cursor, server->cursor_mgr, server->output_layout);
-    }
-
-    // Log damage rectangles
-    int nrects;
-    pixman_box32_t *rects = pixman_region32_rectangles(&damage, &nrects);
-    wlr_log(WLR_DEBUG, "[RENDER_FRAME] Damage regions: nrects=%d", nrects);
-    for (int i = 0; i < nrects; i++) {
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Damage rect %d: (%d,%d) size=(%dx%d)",
-                i, rects[i].x1, rects[i].y1, rects[i].x2 - rects[i].x1, rects[i].y2 - rects[i].y1);
-    }
-
-    // Skip rendering if no damage or cursor movement
-    if (!needs_frame && !cursor_moved) {
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] No damage or cursor movement, skipping render");
-        wlr_scene_output_send_frame_done(scene_output, &now);
-        pixman_region32_fini(&damage);
-        return;
-    }
-
-    // Begin rendering
-    struct wlr_egl_context prev_ctx = {0};
-    struct wlr_egl *egl = wlr_gles2_renderer_get_egl(wlr_output->renderer);
-    if (!egl || !wlr_egl_make_current(egl, &prev_ctx)) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to make EGL context current");
-        wlr_scene_output_send_frame_done(scene_output, &now);
-        pixman_region32_fini(&damage);
-        return;
-    }
-
-    struct wlr_output_state state;
-    wlr_output_state_init(&state);
-
-    wlr_output_state_set_enabled(&state, true);
-
-    struct wlr_output_mode *current_wlr_mode = wlr_output->current_mode;
-    if (current_wlr_mode) {
-        wlr_output_state_set_mode(&state, current_wlr_mode);
-    } else {
-        wlr_log(WLR_ERROR, "[TINYWL_OUTPUT_FRAME] wlr_output->current_mode is NULL! Cannot set mode in output state for commit. This is a critical error.");
-    }
-
-    wlr_output_state_set_damage(&state, &damage);
-
-    struct wlr_buffer_pass_options pass_options = {
-        .color_transform = NULL,
-    };
-
-    struct wlr_render_pass *pass = wlr_output_begin_render_pass(wlr_output, &state, &pass_options);
-    if (!pass) {
-        wlr_log(WLR_ERROR, "[TINYWL_OUTPUT_FRAME] Failed to begin render pass");
-        wlr_egl_restore_context(&prev_ctx);
-        wlr_output_state_finish(&state);
-        wlr_scene_output_send_frame_done(scene_output, &now);
-        pixman_region32_fini(&damage);
-        return;
-    }
-
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] FBO incomplete");
-        wlr_render_pass_submit(pass);
-        wlr_egl_restore_context(&prev_ctx);
-        wlr_output_state_finish(&state);
-        wlr_scene_output_send_frame_done(scene_output, &now);
-        pixman_region32_fini(&damage);
-        return;
-    }
-
-    glViewport(0, 0, wlr_output->width, wlr_output->height);
-
-    // Render background in damaged regions
-    float background_color[] = {0.1f, 0.1f, 0.15f, 1.0f};
-    for (int i = 0; i < nrects; i++) {
-        int height = rects[i].y2 - rects[i].y1;
-        int flipped_y = wlr_output->height - rects[i].y1 - height;
-        struct wlr_render_rect_options background_opts = {
-            .box = {
-                .x = rects[i].x1,
-                .y = flipped_y,
-                .width = rects[i].x2 - rects[i].x1,
-                .height = height,
-            },
-            .color = {background_color[0], background_color[1], background_color[2], background_color[3]},
-            .blend_mode = WLR_RENDER_BLEND_MODE_NONE,
-        };
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Rendering background rect at (%d,%d) size=(%dx%d)",
-                background_opts.box.x, background_opts.box.y,
-                background_opts.box.width, background_opts.box.height);
-        wlr_render_pass_add_rect(pass, &background_opts);
-    }
-
-    // Render toplevels
-// Render toplevels
-int window_count = 0;
-wl_list_for_each_reverse(toplevel_view, &server->toplevels, link) {
-    if (!toplevel_view->xdg_toplevel || !toplevel_view->xdg_toplevel->base ||
-        !toplevel_view->xdg_toplevel->base->surface->mapped) {
-        continue;
-    }
-    
-    struct wlr_xdg_surface *xdg_surface = toplevel_view->xdg_toplevel->base;
-    struct wlr_surface *surface = xdg_surface->surface;
-    
-    if (!wlr_surface_has_buffer(surface)) {
-        continue;
-    }
-    
-    bool needs_update = surface_needs_update(toplevel_view);
-    
-    if (needs_update || !toplevel_view->cached_texture) {
-        toplevel_view->cached_texture = wlr_surface_get_texture(surface);
-        toplevel_view->needs_redraw = false;
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Updated cached texture for toplevel, needs_update=%d", needs_update);
-    }
-    
-    if (!toplevel_view->cached_texture) {
-        continue;
-    }
-    
-    // Get surface damage
-    pixman_region32_t surface_damage;
-    pixman_region32_init(&surface_damage);
-    bool has_damage = false;
-    if (surface->current.committed & WLR_SURFACE_STATE_SURFACE_DAMAGE) {
-        wlr_surface_get_effective_damage(surface, &surface_damage);
-        has_damage = pixman_region32_not_empty(&surface_damage);
-    }
-    
-    if (!has_damage && toplevel_view->last_commit_seq != 0) {
-        pixman_region32_fini(&surface_damage);
-        continue;
-    }
-    
-    window_count++;
-    double view_x = toplevel_view->scene_tree->node.x;
-    double view_y = toplevel_view->scene_tree->node.y;
-    int width = surface->current.width;
-    int height = surface->current.height;
-    
-    // Render only the damaged regions
-    int nrects;
-    pixman_box32_t *rects = pixman_region32_rectangles(&surface_damage, &nrects);
-    for (int i = 0; i < nrects; i++) {
-        struct wlr_fbox src_box = {
-            .x = rects[i].x1,
-            .y = rects[i].y1,
-            .width = rects[i].x2 - rects[i].x1,
-            .height = rects[i].y2 - rects[i].y1
-        };
-        struct wlr_box dst_box = {
-            .x = (int)view_x + rects[i].x1,
-            .y = wlr_output->height - ((int)view_y + rects[i].y1) - (rects[i].y2 - rects[i].y1),
-            .width = rects[i].x2 - rects[i].x1,
-            .height = rects[i].y2 - rects[i].y1
-        };
-        
-        struct wlr_render_texture_options tex_opts = {
-            .texture = toplevel_view->cached_texture,
-            .src_box = src_box,
-            .dst_box = dst_box,
-            .blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
-            .transform = WL_OUTPUT_TRANSFORM_FLIPPED_180,
-        };
-        
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Rendering toplevel %d rect %d at (%d,%d) size=(%dx%d)",
-                window_count, i, dst_box.x, dst_box.y, dst_box.width, dst_box.height);
-        wlr_render_pass_add_texture(pass, &tex_opts);
-    }
-    
-    pixman_region32_fini(&surface_damage);
-}
-
-    // Render popups
-// Render popups
-int popup_count = 0;
-struct tinywl_popup *popup_view;
-wl_list_for_each(popup_view, &server->popups, link) {
-    if (!popup_view->xdg_popup || !popup_view->xdg_popup->base ||
-        !popup_view->xdg_popup->base->surface->mapped || !popup_view->scene_tree ||
-        !popup_view->scene_tree->node.enabled) {
-        continue;
-    }
-
-    struct wlr_surface *surface = popup_view->xdg_popup->base->surface;
-    if (!wlr_surface_has_buffer(surface)) {
-        continue;
-    }
-
-    struct wlr_texture *texture = wlr_surface_get_texture(surface);
-    if (!texture) {
-        continue;
-    }
-
-    // Get popup damage
-    pixman_region32_t surface_damage;
-    pixman_region32_init(&surface_damage);
-    bool has_damage = false;
-    if (surface->current.committed & WLR_SURFACE_STATE_SURFACE_DAMAGE) {
-        wlr_surface_get_effective_damage(surface, &surface_damage);
-        has_damage = pixman_region32_not_empty(&surface_damage);
-    }
-
-    if (!has_damage) {
-        pixman_region32_fini(&surface_damage);
-        continue;
-    }
-
-    popup_count++;
-
-    int popup_abs_lx, popup_abs_ly;
-    wlr_scene_node_coords(&popup_view->scene_tree->node, &popup_abs_lx, &popup_abs_ly);
-
-    int width = surface->current.width;
-    int height = surface->current.height;
-
-    // Render each damaged rectangle
-    int nrects;
-    pixman_box32_t *rects = pixman_region32_rectangles(&surface_damage, &nrects);
-    for (int i = 0; i < nrects; i++) {
-        struct wlr_fbox src_box = {
-            .x = rects[i].x1,
-            .y = rects[i].y1,
-            .width = rects[i].x2 - rects[i].x1,
-            .height = rects[i].y2 - rects[i].y1
-        };
-        struct wlr_box dst_box = {
-            .x = popup_abs_lx - output_box.x + rects[i].x1,
-            .y = wlr_output->height - (popup_abs_ly - output_box.y + rects[i].y1) - (rects[i].y2 - rects[i].y1),
-            .width = rects[i].x2 - rects[i].x1,
-            .height = rects[i].y2 - rects[i].y1
-        };
-
-        struct wlr_render_texture_options tex_opts = {
-            .texture = texture,
-            .src_box = src_box,
-            .dst_box = dst_box,
-            .blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
-            .transform = WL_OUTPUT_TRANSFORM_FLIPPED_180,
-        };
-        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Rendering popup %d rect %d at (%d,%d) size=(%dx%d)",
-                popup_count, i, dst_box.x, dst_box.y, dst_box.width, dst_box.height);
-        wlr_render_pass_add_texture(pass, &tex_opts);
-    }
-    pixman_region32_fini(&surface_damage);
-}
-
-
- cursor_moved = false;
-if (server->cursor && server->cursor_mgr && server->output_layout) {
-    double cursor_x = fmax(0, fmin(server->cursor->x, output_box.width - 1));
-    double cursor_y = fmax(0, fmin(server->cursor->y, output_box.height - 1));
-    double dx = cursor_x - last_cursor_x;
-    double dy = cursor_y - last_cursor_y;
-    wlr_log(WLR_DEBUG, "[RENDER_FRAME] Cursor delta: dx=%.2f, dy=%.2f", dx, dy);
-    if (fabs(dx) > 0.5 || fabs(dy) > 0.5) {
-        cursor_moved = true;
-        struct wlr_xcursor *xcursor = wlr_xcursor_manager_get_xcursor(server->cursor_mgr, "default", 1.0);
-        if (xcursor && xcursor->images[0]) {
-            struct wlr_xcursor_image *image = xcursor->images[0];
-            pixman_region32_t cursor_damage;
-            pixman_region32_init_rect(&cursor_damage,
-                (int)last_cursor_x - image->hotspot_x,
-                (int)last_cursor_y - image->hotspot_y,
-                image->width, image->height);
-            pixman_region32_union_rect(&cursor_damage, &cursor_damage,
-                (int)cursor_x - image->hotspot_x,
-                (int)cursor_y - image->hotspot_y,
-                image->width, image->height);
-            // Intersect cursor damage with output damage
-            pixman_region32_intersect(&cursor_damage, &cursor_damage, &damage);
-            if (pixman_region32_not_empty(&cursor_damage)) {
-                pixman_region32_union(&damage, &damage, &cursor_damage);
-                wlr_log(WLR_DEBUG, "[RENDER_FRAME] Cursor moved: (%d,%d)", (int)cursor_x, (int)cursor_y);
-                needs_frame = true;
-                last_cursor_x = cursor_x;
-                last_cursor_y = cursor_y;
-            }
-            pixman_region32_fini(&cursor_damage);
-        }
-    }
-} else {
-    wlr_log(WLR_ERROR, "[RENDER_FRAME] Cursor or output layout null: cursor=%p, cursor_mgr=%p, output_layout=%p",
-            server->cursor, server->cursor_mgr, server->output_layout);
-}
-
-    // Submit render pass
-    if (!wlr_render_pass_submit(pass)) {
-        wlr_log(WLR_ERROR, "[RENDER_FRAME] Failed to submit render pass");
-        wlr_egl_restore_context(&prev_ctx);
-        wlr_output_state_finish(&state);
-        wlr_scene_output_send_frame_done(scene_output, &now);
-        pixman_region32_fini(&damage);
-        return;
-    }
-
-    wlr_output_state_set_enabled(&state, true);
-    if (current_wlr_mode) {
-        wlr_output_state_set_mode(&state, current_wlr_mode);
-    } else {
-        wlr_log(WLR_ERROR, "[TINYWL_OUTPUT_FRAME] CRITICAL: wlr_output->current_mode is NULL before commit for %s.", wlr_output->name);
-    }
-    wlr_output_state_set_damage(&state, &damage);
-
-    // Logging before commit
-    struct timespec _pre_commit_ts, _post_commit_ts;
-    wlr_log(WLR_ERROR, "--- TINYWL_OUTPUT_FRAME: Inspecting 'state' (from begin_render_pass) BEFORE commit for %s ---",
-            wlr_output->name ? wlr_output->name : "(null)");
-    wlr_log(WLR_ERROR, "  state.committed: 0x%X", state.committed);
-    wlr_log(WLR_ERROR, "  state.enabled: %d", state.enabled);
-    if (state.committed & WLR_OUTPUT_STATE_MODE) {
-        if (state.mode) {
-            wlr_log(WLR_ERROR, "  state.mode: %p (%dx%d @ %dHz)",
-                    (void*)state.mode, state.mode->width, state.mode->height, state.mode->refresh);
-        } else { wlr_log(WLR_ERROR, "  state.mode: NULL (but MODE bit is set!)"); }
-    } else { wlr_log(WLR_ERROR, "  WLR_OUTPUT_STATE_MODE is NOT SET in committed flags."); }
-
-    if (state.committed & WLR_OUTPUT_STATE_BUFFER) {
-        if (state.buffer) {
-            wlr_log(WLR_ERROR, "  state.buffer: %p (w:%d, h:%d)",
-                    (void*)state.buffer, state.buffer->width, state.buffer->height);
-        } else { wlr_log(WLR_ERROR, "  state.buffer: NULL (but BUFFER bit is set!)"); }
-    } else { wlr_log(WLR_ERROR, "  WLR_OUTPUT_STATE_BUFFER is NOT SET in committed flags."); }
-
-    if (state.committed & WLR_OUTPUT_STATE_DAMAGE) {
-        wlr_log(WLR_ERROR, "  WLR_OUTPUT_STATE_DAMAGE is SET in committed flags. Damage empty: %d",
-                !pixman_region32_not_empty(&state.damage));
-    } else { wlr_log(WLR_ERROR, "  WLR_OUTPUT_STATE_DAMAGE is NOT SET in committed flags."); }
-
-    clock_gettime(CLOCK_MONOTONIC, &_pre_commit_ts);
-    wlr_log(WLR_ERROR, "TINYWL_OUTPUT_FRAME: PRE wlr_output_commit_state() for %s. Timestamp: %ld.%09ld",
-            wlr_output->name ? wlr_output->name : "(null)", _pre_commit_ts.tv_sec, _pre_commit_ts.tv_nsec);
-
-    // Note: The commit section is commented out in the original code, so we'll keep it commented
-    // bool committed = wlr_output_commit_state(wlr_output, &state);
-
-    clock_gettime(CLOCK_MONOTONIC, &_post_commit_ts);
-
-    // RDP transmission only for damaged regions
-    struct wlr_buffer *rendered_buffer = state.buffer;
-    if (rendered_buffer && (needs_frame || cursor_moved)) {
-        struct wlr_buffer *locked_buffer = wlr_buffer_lock(rendered_buffer);
-        if (locked_buffer) {
-            void *bdata;
-            uint32_t bfmt;
-            size_t bstride;
-            if (wlr_buffer_begin_data_ptr_access(locked_buffer,
-                WLR_BUFFER_DATA_PTR_ACCESS_READ, &bdata, &bfmt, &bstride)) {
-                wlr_buffer_end_data_ptr_access(locked_buffer);
-                rdp_transmit_surface(locked_buffer);
-            } else {
-                rdp_transmit_surface(locked_buffer);
-            }
-            wlr_buffer_unlock(locked_buffer);
-        }
-    }
-
-    // Cleanup
-    wlr_egl_restore_context(&prev_ctx);
-    wlr_output_state_finish(&state);
-    wlr_scene_output_send_frame_done(scene_output, &now);
-    pixman_region32_fini(&damage);
-}*/
 
 
 
@@ -2365,10 +2285,7 @@ static void xdg_toplevel_request_fullscreen(struct wl_listener *listener, void *
 static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
     struct tinywl_server *server = wl_container_of(listener, server, new_xdg_toplevel);
     struct wlr_xdg_toplevel *xdg_toplevel = data;
-    wlr_log(WLR_INFO, "New XDG toplevel detected: %p, title='%s', app_id='%s'",
-            xdg_toplevel,
-            xdg_toplevel->title ? xdg_toplevel->title : "(null)",
-            xdg_toplevel->app_id ? xdg_toplevel->app_id : "(null)");
+    wlr_log(WLR_INFO, "New XDG toplevel: %p, title='%s'", (void*)xdg_toplevel, xdg_toplevel->title);
 
     struct tinywl_toplevel *toplevel = calloc(1, sizeof(*toplevel));
     if (!toplevel) {
@@ -2377,14 +2294,52 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
     }
     toplevel->server = server;
     toplevel->xdg_toplevel = xdg_toplevel;
-    toplevel->scene_tree = wlr_scene_xdg_surface_create(&server->scene->tree, xdg_toplevel->base);
+
+    // 1. Create the main frame scene tree for this toplevel.
+    // This tree's node.data will point to our 'toplevel' (view) struct.
+    toplevel->scene_tree = wlr_scene_tree_create(&server->scene->tree);
     if (!toplevel->scene_tree) {
-        wlr_log(WLR_ERROR, "Failed to create scene tree for toplevel");
+        wlr_log(WLR_ERROR, "Failed to create scene_tree (frame) for toplevel");
         free(toplevel);
         return;
     }
-    toplevel->scene_tree->node.data = toplevel;
-    xdg_toplevel->base->data = toplevel->scene_tree;
+    toplevel->scene_tree->node.data = toplevel; // Associate frame with our struct
+    xdg_toplevel->base->data = toplevel; // Also associate xdg_surface with our struct for easier lookup
+
+    // 2. Create the scene tree for the client's actual XDG surface (content area).
+    // This will be a child of the main frame tree.
+    toplevel->client_xdg_scene_tree = wlr_scene_xdg_surface_create(toplevel->scene_tree, xdg_toplevel->base);
+    if (!toplevel->client_xdg_scene_tree) {
+        wlr_log(WLR_ERROR, "Failed to create client_xdg_scene_tree for toplevel");
+        wlr_scene_node_destroy(&toplevel->scene_tree->node); // Clean up frame tree
+        free(toplevel);
+        return;
+    }
+    // xdg_toplevel->base->data already points to 'toplevel'.
+    // The wlr_scene_xdg_surface_create function handles subsurfaces within this client_xdg_scene_tree.
+
+    // --- POSITION THE CLIENT CONTENT AREA AND ADD DECORATIONS ---
+    // This is a crucial part. For simplicity, let's assume a fixed title bar height
+    // and border size. In a real compositor, this would be configurable and dynamic.
+//    const int titlebar_height = 0; // Example
+  //  const int border_size = 0;      // Example
+
+    // Position the client content tree within the frame tree
+    wlr_scene_node_set_position(&toplevel->client_xdg_scene_tree->node, 0, 0);
+
+    // TODO: If you are drawing server-side decorations:
+    // Create wlr_scene_buffer nodes for your title bar and borders here.
+    // Add them as children of `toplevel->scene_tree`.
+    // Position them appropriately.
+    // For example:
+    // struct wlr_buffer *titlebar_buf = create_my_titlebar_buffer(width, titlebar_height);
+    // struct wlr_scene_buffer *titlebar_node = wlr_scene_buffer_create(toplevel->scene_tree, titlebar_buf);
+    // wlr_scene_node_set_position(&titlebar_node->node, border_size, border_size); // Or 0,0 if borders are outside
+    // wlr_buffer_unlock(titlebar_buf); // if locked after creation
+    // ... and so on for other decoration parts.
+
+    // For now, without actual decoration rendering, the client content will just be offset.
+    // The picking logic needs to account for this structure.
 
     // Register listeners
     toplevel->map.notify = xdg_toplevel_map;
@@ -2394,7 +2349,7 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
     toplevel->commit.notify = xdg_toplevel_commit;
     wl_signal_add(&xdg_toplevel->base->surface->events.commit, &toplevel->commit);
     toplevel->destroy.notify = xdg_toplevel_destroy;
-    wl_signal_add(&xdg_toplevel->events.destroy, &toplevel->destroy);
+    wl_signal_add(&xdg_toplevel->events.destroy, &toplevel->destroy); // Listen on xdg_toplevel, not base surface for this
     toplevel->request_move.notify = xdg_toplevel_request_move;
     wl_signal_add(&xdg_toplevel->events.request_move, &toplevel->request_move);
     toplevel->request_resize.notify = xdg_toplevel_request_resize;
@@ -2404,7 +2359,8 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
     toplevel->request_fullscreen.notify = xdg_toplevel_request_fullscreen;
     wl_signal_add(&xdg_toplevel->events.request_fullscreen, &toplevel->request_fullscreen);
 
-    wlr_log(WLR_INFO, "Toplevel %p initialized and added to scene tree", toplevel);
+    wlr_log(WLR_INFO, "Toplevel %p initialized (frame tree %p, client content tree %p)",
+            (void*)toplevel, (void*)toplevel->scene_tree, (void*)toplevel->client_xdg_scene_tree);
 }
 /*
 static void xdg_popup_commit(struct wl_listener *listener, void *data) {
@@ -2571,175 +2527,7 @@ static bool is_zink_renderer(struct wlr_backend *backend, struct wlr_renderer *r
 #define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
 #endif
 
-struct wlr_egl *setup_surfaceless_egl(struct tinywl_server *server) {
-wlr_log(WLR_INFO, "Starting surfaceless EGL setup");
 
-    // 1. Check for client extensions (can use EGL_NO_DISPLAY)
-    const char *client_extensions = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
-    if (!client_extensions) {
-        wlr_log(WLR_ERROR, "Could not query EGL client extensions");
-        return NULL;
-    }
-    wlr_log(WLR_INFO, "EGL client extensions: %s", client_extensions);
-
-    bool has_surfaceless = strstr(client_extensions, "EGL_MESA_platform_surfaceless") != NULL;
-    bool has_platform_base = strstr(client_extensions, "EGL_EXT_platform_base") != NULL;
-    wlr_log(WLR_INFO, "Surfaceless platform support: %s", has_surfaceless ? "YES" : "NO");
-    wlr_log(WLR_INFO, "Platform base extension: %s", has_platform_base ? "YES" : "NO");
-
-    if (!has_surfaceless || !has_platform_base) {
-        wlr_log(WLR_ERROR, "Required EGL client extensions not available");
-        return NULL;
-    }
-
-    // 2. Get platform display function
-    PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display =
-        (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
-    if (!get_platform_display) {
-        wlr_log(WLR_ERROR, "Platform display function not available");
-        return NULL;
-    }
-    wlr_log(WLR_INFO, "Retrieved eglGetPlatformDisplayEXT");
-
-    // 3. Create surfaceless display
-    EGLDisplay display = get_platform_display(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
-    if (display == EGL_NO_DISPLAY) {
-        wlr_log(WLR_ERROR, "Failed to create surfaceless display. Error: 0x%x", eglGetError());
-        return NULL;
-    }
-    wlr_log(WLR_INFO, "Created EGL display: %p", (void*)display);
-
-    // 4. Initialize EGL
-    EGLint major, minor;
-    if (!eglInitialize(display, &major, &minor)) {
-        wlr_log(WLR_ERROR, "EGL initialization failed. Error: 0x%x", eglGetError());
-        eglTerminate(display);
-        return NULL;
-    }
-    wlr_log(WLR_INFO, "EGL initialized, version: %d.%d", major, minor);
-
-    // 5. Query display extensions (must use initialized display)
-    const char *display_extensions = eglQueryString(display, EGL_EXTENSIONS);
-    if (!display_extensions) {
-        wlr_log(WLR_ERROR, "Failed to query EGL display extensions. Error: 0x%x", eglGetError());
-        eglTerminate(display);
-        return NULL;
-    }
-    wlr_log(WLR_INFO, "EGL display extensions: %s", display_extensions);
-
-    // 6. Set bind API first (before choosing config)
-    if (!eglBindAPI(EGL_OPENGL_ES_API)) {
-        wlr_log(WLR_ERROR, "Failed to bind OpenGL ES API. Error: 0x%x", eglGetError());
-        eglTerminate(display);
-        return NULL;
-    }
-    wlr_log(WLR_INFO, "Successfully bound OpenGL ES API");
-
-    // 7. Choose a config with explicit GLES2
-    const EGLint config_attribs[] = {
-        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
-        EGL_RED_SIZE, 8,
-        EGL_GREEN_SIZE, 8,
-        EGL_BLUE_SIZE, 8,
-        EGL_ALPHA_SIZE, 8,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-        EGL_NONE
-    };
-
-    EGLConfig config;
-    EGLint num_config;
-    if (!eglChooseConfig(display, config_attribs, &config, 1, &num_config) || num_config < 1) {
-        wlr_log(WLR_ERROR, "Failed to choose EGL config. Error: 0x%x", eglGetError());
-        eglTerminate(display);
-        return NULL;
-    }
-    wlr_log(WLR_INFO, "Found suitable EGL configuration");
-
-    // 8. Create context with explicit version
-    const EGLint ctx_attribs[] = {
-        EGL_CONTEXT_CLIENT_VERSION, 2,
-        EGL_NONE // Remove profile mask to avoid compatibility issues
-    };
-
-    EGLContext context = eglCreateContext(display, config, EGL_NO_CONTEXT, ctx_attribs);
-    if (context == EGL_NO_CONTEXT) {
-        wlr_log(WLR_ERROR, "Failed to create EGL context. Error: 0x%x", eglGetError());
-        eglTerminate(display);
-        return NULL;
-    }
-    wlr_log(WLR_INFO, "Created EGL context");
-
-    // 9. Query EGL_CONTEXT_CLIENT_TYPE
-    EGLint client_type;
-    if (!eglQueryContext(display, context, EGL_CONTEXT_CLIENT_TYPE, &client_type)) {
-        wlr_log(WLR_ERROR, "Failed to query EGL_CONTEXT_CLIENT_TYPE. Error: 0x%x", eglGetError());
-    } else {
-        wlr_log(WLR_INFO, "EGL_CONTEXT_CLIENT_TYPE: 0x%x", client_type);
-        if (client_type == EGL_OPENGL_ES_API) {
-            wlr_log(WLR_INFO, "Context client type is EGL_OPENGL_ES_API");
-        } else {
-            wlr_log(WLR_ERROR, "Unexpected context client type: 0x%x", client_type);
-            eglDestroyContext(display, context);
-            eglTerminate(display);
-            return NULL;
-        }
-    }
-
-    // 10. Create pbuffer surface
-    const EGLint pbuffer_attribs[] = {
-        EGL_WIDTH, 16,
-        EGL_HEIGHT, 16,
-        EGL_NONE
-    };
-
-    EGLSurface surface = eglCreatePbufferSurface(display, config, pbuffer_attribs);
-    if (surface == EGL_NO_SURFACE) {
-        wlr_log(WLR_ERROR, "Failed to create pbuffer surface. Error: 0x%x", eglGetError());
-        eglDestroyContext(display, context);
-        eglTerminate(display);
-        return NULL;
-    }
-    wlr_log(WLR_INFO, "Created EGL pbuffer surface");
-
-    // 11. Make context current to verify it works
-    if (!eglMakeCurrent(display, surface, surface, context)) {
-        wlr_log(WLR_ERROR, "Failed to make context current. Error: 0x%x", eglGetError());
-        eglDestroySurface(display, surface);
-        eglDestroyContext(display, context);
-        eglTerminate(display);
-        return NULL;
-    }
-    wlr_log(WLR_INFO, "Made EGL context current");
-
-    // 12. Verify the context is GLES2 as expected
-    const char *gl_vendor = (const char *)glGetString(GL_VENDOR);
-    const char *gl_renderer = (const char *)glGetString(GL_RENDERER);
-    const char *gl_version = (const char *)glGetString(GL_VERSION);
-    wlr_log(WLR_INFO, "OpenGL ES Vendor: %s", gl_vendor ? gl_vendor : "Unknown");
-    wlr_log(WLR_INFO, "OpenGL ES Renderer: %s", gl_renderer ? gl_renderer : "Unknown");
-    wlr_log(WLR_INFO, "OpenGL ES Version: %s", gl_version ? gl_version : "Unknown");
-
-    // 13. Store EGL resources in server structure
-    server->egl_display = display;
-    server->egl_config = config;
-    server->egl_context = context;
-    server->egl_surface = surface;
-
-    // 14. Create wlr_egl with the valid context
-    wlr_log(WLR_INFO, "Creating wlr_egl with context");
-    struct wlr_egl *wlr_egl = wlr_egl_create_with_context(display, context);
-    if (!wlr_egl) {
-        wlr_log(WLR_ERROR, "Failed to create wlr_egl with context");
-        eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        eglDestroySurface(display, surface);
-        eglDestroyContext(display, context);
-        eglTerminate(display);
-        return NULL;
-    }
-
-    wlr_log(WLR_INFO, "Successfully created wlr_egl");
-    return wlr_egl;
-}
 void cleanup_egl(struct tinywl_server *server) {
     printf("Cleaning up EGL resources\n");
     if (server->egl_display != EGL_NO_DISPLAY) {
@@ -2797,16 +2585,7 @@ int main(int argc, char *argv[]) {
     }
 
     struct tinywl_server server = {0};
- //struct wlr_egl *wlr_egl = NULL;
-/*
-    // Setup EGL surfaceless display
-    wlr_egl = setup_surfaceless_egl(&server);
-    if (!wlr_egl) {
-        fprintf(stderr, "Failed to setup surfaceless EGL display\n");
-        cleanup_egl(&server);
-        return 1;
-    }
-*/
+
 
     server.wl_display = wl_display_create();
     if (!server.wl_display) {
