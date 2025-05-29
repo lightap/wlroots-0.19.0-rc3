@@ -966,216 +966,30 @@ static struct tinywl_toplevel *desktop_toplevel_at(
 
 static struct tinywl_toplevel *desktop_toplevel_at(
         struct tinywl_server *server, double lx, double ly,
-        struct wlr_surface **surface_out, double *sx_out, double *sy_out) {
-
-    wlr_log(WLR_DEBUG, "[DTA_ENTRY] Cursor at lx=%.2f, ly=%.2f", lx, ly);
-
-    struct wlr_scene_node *hit_node = wlr_scene_node_at(
-        &server->scene->tree.node, lx, ly, sx_out, sy_out); // sx_out, sy_out are local to hit_node
-    struct tinywl_toplevel *toplevel = NULL;
-    bool picked_by_geometry_check = false;
-
-    // 1. Attempt to find toplevel via scene graph hit
-    if (hit_node != NULL && hit_node->type == WLR_SCENE_NODE_BUFFER) {
-        wlr_log(WLR_DEBUG, "[DTA] Initial Hit Node: %p. Initial sx=%.2f, sy=%.2f",
-                (void*)hit_node, *sx_out, *sy_out);
-        
-        struct wlr_scene_node *iter_node = hit_node;
-        while (iter_node != NULL) {
-            if (iter_node->data != NULL) {
-                struct tinywl_toplevel *potential_toplevel = iter_node->data;
-                struct tinywl_toplevel *t_iter_list;
-                wl_list_for_each(t_iter_list, &server->toplevels, link) {
-                    if (t_iter_list == potential_toplevel && t_iter_list->scene_tree && &t_iter_list->scene_tree->node == iter_node) {
-                        toplevel = t_iter_list;
-                        break;
-                    }
-                }
-                if (toplevel) break;
-            }
-            if (iter_node->parent == NULL) { iter_node = NULL; }
-            else { iter_node = &iter_node->parent->node; }
-        }
-
-        if (toplevel == NULL) {
-            struct tinywl_toplevel *t_iter_list;
-            wl_list_for_each(t_iter_list, &server->toplevels, link) {
-                if (t_iter_list->scene_tree && is_descendant(hit_node, &t_iter_list->scene_tree->node)) {
-                    toplevel = t_iter_list;
-                    break;
-                }
-            }
-        }
-        if (toplevel) {
-            wlr_log(WLR_DEBUG, "[DTA_PICK_SCENE] Toplevel %p found via scene graph.", (void*)toplevel);
-        }
-    } else {
-        wlr_log(WLR_DEBUG, "[DTA] No buffer node hit by wlr_scene_node_at. Initial sx=%.2f, sy=%.2f", *sx_out, *sy_out);
+        struct wlr_surface **surface, double *sx, double *sy) {
+    /* This returns the topmost node in the scene at the given layout coords.
+     * We only care about surface nodes as we are specifically looking for a
+     * surface in the surface tree of a tinywl_toplevel. */
+    struct wlr_scene_node *node = wlr_scene_node_at(
+        &server->scene->tree.node, lx, ly, sx, sy);
+    if (node == NULL || node->type != WLR_SCENE_NODE_BUFFER) {
+        return NULL;
     }
-
-    // 2. Fallback to geometry-based picking
-    if (toplevel == NULL) {
-        wlr_log(WLR_DEBUG, "[DTA_PICK_GEOM_TRY] No toplevel from scene hit. Trying geometry check.");
-        struct tinywl_toplevel *iter_toplevel;
-        wl_list_for_each_reverse(iter_toplevel, &server->toplevels, link) {
-            if (!iter_toplevel->scene_tree || !iter_toplevel->xdg_toplevel || 
-                !iter_toplevel->xdg_toplevel->base || !iter_toplevel->xdg_toplevel->base->surface ||
-                !iter_toplevel->client_xdg_scene_tree) {
-                continue;
-            }
-
-            int frame_abs_x, frame_abs_y;
-            if (!wlr_scene_node_coords(&iter_toplevel->scene_tree->node, &frame_abs_x, &frame_abs_y)) {
-                continue;
-            }
-
-            // Use geometry, but fall back to surface size if geometry is invalid
-            struct wlr_box geometry;
-          geometry = iter_toplevel->xdg_toplevel->base->geometry; // Direct access if available
-            struct wlr_surface *surface = iter_toplevel->xdg_toplevel->base->surface;
-            if (geometry.width <= 0 || geometry.height <= 0) {
-                if (wlr_surface_has_buffer(surface)) {
-                    geometry.width = surface->current.width;
-                    geometry.height = surface->current.height;
-                    geometry.x = 0;
-                    geometry.y = 0;
-                    wlr_log(WLR_DEBUG, "[DTA_PICK_GEOM] Fallback to surface size: %dx%d",
-                            geometry.width, geometry.height);
-                } else {
-                    continue;
-                }
-            }
-
-            // Include decorations in the hitbox (adjust these values based on your decoration setup)
-            const int border_size = 0; // Adjust if you have server-side borders
-            const int titlebar_height = 0; // Adjust if you have a titlebar
-            geometry.x -= border_size;
-            geometry.y -= titlebar_height;
-            geometry.width += 2 * border_size;
-            geometry.height += titlebar_height + border_size;
-
-            // Calculate the absolute position of the window frame (including decorations)
-            double frame_origin_abs_x = (double)frame_abs_x;
-            double frame_origin_abs_y = (double)frame_abs_y;
-
-            // Check if cursor is within the full window frame
-            if (lx >= frame_origin_abs_x + geometry.x &&
-                lx < frame_origin_abs_x + geometry.x + geometry.width &&
-                ly >= frame_origin_abs_y + geometry.y &&
-                ly < frame_origin_abs_y + geometry.y + geometry.height) {
-                
-                toplevel = iter_toplevel;
-                *surface_out = surface;
-                
-                // Calculate sx, sy relative to the client content area
-                double client_rel_x = iter_toplevel->client_xdg_scene_tree->node.x;
-                double client_rel_y = iter_toplevel->client_xdg_scene_tree->node.y;
-                *sx_out = lx - frame_origin_abs_x - client_rel_x;
-                *sy_out = ly - frame_origin_abs_y - client_rel_y;
-
-                wlr_log(WLR_DEBUG, "[DTA_PICK_GEOM_HIT] Toplevel %p picked by geometry. "
-                        "Frame abs: (%.2f,%.2f), Geometry: (%d,%d,%d,%d), Client rel: (%.2f,%.2f), "
-                        "sx=%.2f, sy=%.2f",
-                        (void*)toplevel, frame_origin_abs_x, frame_origin_abs_y,
-                        geometry.x, geometry.y, geometry.width, geometry.height,
-                        client_rel_x, client_rel_y, *sx_out, *sy_out);
-                picked_by_geometry_check = true;
-                break;
-            }
-        }
-    }
-
-    if (toplevel == NULL) {
-        wlr_log(WLR_DEBUG, "[DTA_PICK_FAIL] No toplevel found by any method.");
-        *surface_out = NULL;
-        *sx_out = 0;
-        *sy_out = 0;
+    struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
+    struct wlr_scene_surface *scene_surface =
+        wlr_scene_surface_try_from_buffer(scene_buffer);
+    if (!scene_surface) {
         return NULL;
     }
 
-    // If picked by geometry, coordinates are already correct
-    if (picked_by_geometry_check) {
-        if (*surface_out == NULL && toplevel->xdg_toplevel && toplevel->xdg_toplevel->base) {
-            *surface_out = toplevel->xdg_toplevel->base->surface;
-        }
-        if (!*surface_out) {
-            wlr_log(WLR_ERROR, "[DTA] Toplevel %p (picked by geom) missing base surface.", (void*)toplevel);
-            return NULL;
-        }
-        return toplevel;
+    *surface = scene_surface->surface;
+    /* Find the node corresponding to the tinywl_toplevel at the root of this
+     * surface tree, it is the only one for which we set the data field. */
+    struct wlr_scene_tree *tree = node->parent;
+    while (tree != NULL && tree->node.data == NULL) {
+        tree = tree->node.parent;
     }
-
-    // Handle scene graph hit case
-    assert(hit_node != NULL);
-    *surface_out = toplevel->xdg_toplevel->base->surface;
-    if (!*surface_out) {
-        wlr_log(WLR_ERROR, "[DTA_SCENE_HIT] Toplevel %p has no base xdg surface.", (void*)toplevel);
-        return NULL;
-    }
-    wlr_log(WLR_DEBUG, "[DTA_SCENE_HIT] Target client surface: %p", (void*)*surface_out);
-
-    int hit_node_abs_x, hit_node_abs_y;
-    if (!wlr_scene_node_coords(hit_node, &hit_node_abs_x, &hit_node_abs_y)) {
-        wlr_log(WLR_ERROR, "[DTA_SCENE_HIT_COORD] Could not get abs coords of hit_node %p.", (void*)hit_node);
-        return NULL;
-    }
-    wlr_log(WLR_DEBUG, "[DTA_SCENE_HIT_COORD] Hit Node %p Abs Coords: x=%d, y=%d. Initial local sx=%.2f, sy=%.2f",
-            (void*)hit_node, hit_node_abs_x, hit_node_abs_y, *sx_out, *sy_out);
-
-    // Find the main client surface buffer node
- struct wlr_scene_node *temp_buffer_node = NULL;
-    if (toplevel->client_xdg_scene_tree) {
-        struct wlr_scene_node *child_iter;
-        wl_list_for_each(child_iter, &toplevel->client_xdg_scene_tree->children, link) {
-            if (child_iter->type == WLR_SCENE_NODE_BUFFER) {
-                struct wlr_scene_buffer *buf = wlr_scene_buffer_from_node(child_iter);
-                struct wlr_scene_surface *scene_surf = wlr_scene_surface_try_from_buffer(buf);
-                if (scene_surf && scene_surf->surface == *surface_out) {
-                    temp_buffer_node = child_iter;
-                    break;
-                }
-            }
-        }
-    }
-
-    if (temp_buffer_node) {
-        wlr_log(WLR_DEBUG, "[DTA_SCENE_HIT_CLIENT_NODE] Found main_client_surface_buffer_node: %p", (void*)temp_buffer_node);
-    } else {
-        wlr_log(WLR_DEBUG, "[DTA_SCENE_HIT_CLIENT_NODE] Main client surface buffer node NOT found for surface %p.", (void*)*surface_out);
-    }
-
-    // If hit_node is the client surface buffer, sx_out, sy_out are correct
-    if (temp_buffer_node && hit_node == temp_buffer_node) {
-        wlr_log(WLR_DEBUG, "[DTA_SCENE_HIT_TRANSFORM] Hit node IS main client surface buffer. No transformation. Final sx=%.2f, sy=%.2f", *sx_out, *sy_out);
-        return toplevel;
-    }
-
-    // Transform coordinates to client content area
-    if (!toplevel->scene_tree || !toplevel->client_xdg_scene_tree) {
-        wlr_log(WLR_ERROR, "[DTA_SCENE_HIT_COORD] Toplevel %p missing scene_tree or client_xdg_scene_tree.", (void*)toplevel);
-        return NULL;
-    }
-
-    int frame_abs_x, frame_abs_y;
-    if (!wlr_scene_node_coords(&toplevel->scene_tree->node, &frame_abs_x, &frame_abs_y)) {
-        wlr_log(WLR_ERROR, "[DTA_SCENE_HIT_COORD] Could not get abs coords of frame node %p.", (void*)&toplevel->scene_tree->node);
-        return NULL;
-    }
-
-    double client_rel_x = toplevel->client_xdg_scene_tree->node.x;
-    double client_rel_y = toplevel->client_xdg_scene_tree->node.y;
-    double client_abs_x = (double)frame_abs_x + client_rel_x;
-    double client_abs_y = (double)frame_abs_y + client_rel_y;
-
-    *sx_out = lx - client_abs_x;
-    *sy_out = ly - client_abs_y;
-
-    wlr_log(WLR_DEBUG, "[DTA_SCENE_HIT_TRANSFORM] Transformed sx=%.2f, sy=%.2f. "
-            "Frame abs: (%.2f,%.2f), Client rel: (%.2f,%.2f), Client abs: (%.2f,%.2f)",
-            *sx_out, *sy_out, (double)frame_abs_x, (double)frame_abs_y,
-            client_rel_x, client_rel_y, client_abs_x, client_abs_y);
-
-    return toplevel;
+    return tree->node.data;
 }
 
 ///////////////////////////////////////////////////
@@ -1672,7 +1486,7 @@ static void popup_commit(struct wl_listener *listener, void *data) {
 #include <wlr/render/wlr_renderer.h>
 
 
-
+/*
 // Helper function to check if surface has been damaged/changed
 static bool surface_needs_update(struct tinywl_toplevel *toplevel_view) {
     struct wlr_surface *surface = toplevel_view->xdg_toplevel->base->surface;
@@ -1702,9 +1516,10 @@ static bool surface_needs_update(struct tinywl_toplevel *toplevel_view) {
     }
     
     return false;
-}
+}*/
 
 //with damage
+/*
 static void output_frame(struct wl_listener *listener, void *data) {
     struct tinywl_output *output = wl_container_of(listener, output, frame);
     struct wlr_output *wlr_output = output->wlr_output;
@@ -2172,6 +1987,364 @@ static void output_frame(struct wl_listener *listener, void *data) {
     wlr_output_state_finish(&state);
     wlr_scene_output_send_frame_done(scene_output, &now);
     pixman_region32_fini(&damage);
+}*/
+/*
+static void output_frame(struct wl_listener *listener, void *data) {
+    struct tinywl_output *output = wl_container_of(listener, output, frame);
+    struct wlr_output *wlr_output = output->wlr_output;
+    struct tinywl_server *server = output->server;
+    struct wlr_scene *scene = server->scene;
+
+    // Check if a frame is already pending
+    if (wlr_output->frame_pending) {
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Frame pending for %s, skipping", wlr_output->name);
+        return;
+    }
+
+    struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(scene, wlr_output);
+    if (!scene_output) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] No scene output for %s", wlr_output->name);
+        wlr_output_schedule_frame(wlr_output);
+        return;
+    }
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    // Validate output state
+    if (!wlr_output || !wlr_output->enabled || !wlr_output->renderer || !wlr_output->allocator) {
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Output '%s' not ready", wlr_output->name);
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        return;
+    }
+
+    if (!server->output_layout) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] No output layout available");
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        return;
+    }
+
+ 
+    // Method 2: Use scene output with buffer interception
+    // Create our own output state to capture the buffer
+    struct wlr_output_state state;
+    wlr_output_state_init(&state);
+    
+    // Use scene output to build the state (including buffer)
+    bool has_damage = wlr_scene_output_build_state(scene_output, &state, NULL);
+    
+    if (!has_damage) {
+        wlr_log(WLR_DEBUG, "[SCENE_OUTPUT] No damage, skipping render");
+        wlr_output_state_finish(&state);
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        return;
+    }
+       
+
+    // Now we have access to the buffer for RDP transmission
+    if (state.committed & WLR_OUTPUT_STATE_BUFFER && state.buffer) {
+        struct wlr_buffer *locked_buffer = wlr_buffer_lock(state.buffer);
+        if (locked_buffer) {
+            wlr_log(WLR_DEBUG, "[SCENE_OUTPUT] Transmitting buffer via RDP (size: %dx%d)", 
+                    locked_buffer->width, locked_buffer->height);
+            
+            // Your RDP transmission
+            rdp_transmit_surface(locked_buffer);
+            
+            wlr_buffer_unlock(locked_buffer);
+        } else {
+            wlr_log(WLR_ERROR, "[SCENE_OUTPUT] Failed to lock buffer for RDP transmission");
+        }
+    } else {
+        wlr_log(WLR_DEBUG, "[SCENE_OUTPUT] No buffer in state for RDP transmission");
+    }
+
+    wlr_log(WLR_DEBUG, "[SCENE_OUTPUT] Successfully committed scene output for %s", wlr_output->name);
+
+    // Cleanup
+    wlr_output_state_finish(&state);
+    wlr_scene_output_send_frame_done(scene_output, &now);
+}*/
+
+
+
+/*
+
+extern pthread_mutex_t transmit_mutex;
+extern bool transmission_in_progress;
+
+static void output_frame(struct wl_listener *listener, void *data) {
+    struct tinywl_output *output = wl_container_of(listener, output, frame);
+    struct wlr_output *wlr_output = output->wlr_output;
+    struct tinywl_server *server = output->server;
+    struct wlr_scene *scene = server->scene;
+
+    // Check if a frame is already pending
+    if (wlr_output->frame_pending) {
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Frame pending for %s, skipping", wlr_output->name);
+        return;
+    }
+
+    struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(scene, wlr_output);
+    if (!scene_output) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] No scene output for %s", wlr_output->name);
+        wlr_output_schedule_frame(wlr_output);
+        return;
+    }
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    // Validate output state
+    if (!wlr_output || !wlr_output->enabled || !wlr_output->renderer || !wlr_output->allocator) {
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Output '%s' not ready", wlr_output->name);
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        return;
+    }
+
+    if (!wlr_renderer_is_gles2(wlr_output->renderer)) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Renderer is not GLES2");
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        return;
+    }
+
+    if (!server->output_layout) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] No output layout available");
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        return;
+    }
+
+    struct wlr_box output_box;
+    wlr_output_layout_get_box(server->output_layout, wlr_output, &output_box);
+    if (output_box.width == 0 || output_box.height == 0) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Invalid output box for %s: width=%d, height=%d",
+                wlr_output->name ? wlr_output->name : "(null)", output_box.width, output_box.height);
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        return;
+    }
+
+    // Create output state for buffer interception
+    struct wlr_output_state state;
+    wlr_output_state_init(&state);
+
+    // Build scene output state
+    bool has_damage = wlr_scene_output_build_state(scene_output, &state, NULL);
+    if (!has_damage) {
+        wlr_log(WLR_DEBUG, "[SCENE_OUTPUT] No damage for %s, skipping render", wlr_output->name ? wlr_output->name : "(null)");
+        wlr_output_state_finish(&state);
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        return;
+    }
+
+    
+    // Perform RDP transmission
+    if (state.committed & WLR_OUTPUT_STATE_BUFFER && state.buffer) {
+        struct wlr_buffer *locked_buffer = wlr_buffer_lock(state.buffer);
+        if (locked_buffer) {
+            wlr_log(WLR_DEBUG, "[SCENE_OUTPUT] Transmitting buffer via RDP for %s (size: %dx%d)",
+                    wlr_output->name ? wlr_output->name : "(null)", locked_buffer->width, locked_buffer->height);
+            rdp_transmit_surface(locked_buffer);
+            wlr_buffer_unlock(locked_buffer);
+        } else {
+            wlr_log(WLR_ERROR, "[SCENE_OUTPUT] Failed to lock buffer for RDP transmission for %s",
+                    wlr_output->name ? wlr_output->name : "(null)");
+        }
+    } else {
+        wlr_log(WLR_DEBUG, "[SCENE_OUTPUT] No buffer in state for RDP transmission for %s",
+                wlr_output->name ? wlr_output->name : "(null)");
+    }
+
+    wlr_log(WLR_DEBUG, "[SCENE_OUTPUT] Successfully committed scene output for %s",
+            wlr_output->name ? wlr_output->name : "(null)");
+
+    // Cleanup
+    
+    wlr_output_state_finish(&state);
+    wlr_scene_output_send_frame_done(scene_output, &now);
+}*/
+/*
+static void output_frame(struct wl_listener *listener, void *data) {
+    struct tinywl_output *output = wl_container_of(listener, output, frame);
+    struct wlr_output *wlr_output = output->wlr_output;
+    struct tinywl_server *server = output->server;
+    struct wlr_scene *scene = server->scene;
+    
+    
+
+    // Check if a frame is already pending
+    if (wlr_output->frame_pending) {
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Frame pending for %s, skipping", wlr_output->name);
+        return;
+    }
+
+    struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(scene, wlr_output);
+    if (!scene_output) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] No scene output for %s", wlr_output->name);
+        wlr_output_schedule_frame(wlr_output);
+        return;
+    }
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    // Validate output state
+    if (!wlr_output || !wlr_output->enabled || !wlr_output->renderer || !wlr_output->allocator) {
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Output '%s' not ready", wlr_output->name);
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        return;
+    }
+
+    if (!wlr_renderer_is_gles2(wlr_output->renderer)) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Renderer is not GLES2");
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        return;
+    }
+
+    if (!server->output_layout) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] No output layout available");
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        return;
+    }
+    
+
+    
+    // Create output state for buffer interception
+    struct wlr_output_state state;
+    wlr_output_state_init(&state);
+    
+    // Build scene output state
+    bool has_damage = wlr_scene_output_build_state(scene_output, &state, NULL);
+    if (!has_damage) {
+        wlr_log(WLR_DEBUG, "[SCENE_OUTPUT] No damage for %s, skipping render", wlr_output->name ? wlr_output->name : "(null)");
+        wlr_output_state_finish(&state);
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        return;
+    }
+    
+    // Perform RDP transmission
+    if (state.committed & WLR_OUTPUT_STATE_BUFFER && state.buffer) {
+        struct wlr_buffer *locked_buffer = wlr_buffer_lock(state.buffer);
+        if (locked_buffer) {
+            wlr_log(WLR_DEBUG, "[SCENE_OUTPUT] Transmitting buffer via RDP for %s (size: %dx%d)",
+                    wlr_output->name ? wlr_output->name : "(null)", locked_buffer->width, locked_buffer->height);
+            rdp_transmit_surface(locked_buffer);
+            wlr_buffer_unlock(locked_buffer);
+        }
+    }
+    
+    // CRITICAL: Send frame done immediately to maintain proper event timing
+    // This prevents FreeRDP connection drops by not blocking the event loop
+    wlr_scene_output_send_frame_done(scene_output, &now);
+    
+    // Cleanup
+    wlr_output_state_finish(&state);
+}*/
+
+#include <pixman.h>
+#include <time.h>
+#include <pthread.h>
+#include <wlr/types/wlr_scene.h>
+#include <wlr/types/wlr_output.h>
+
+static void output_frame(struct wl_listener *listener, void *data) {
+    struct tinywl_output *output = wl_container_of(listener, output, frame);
+    struct wlr_output *wlr_output = output->wlr_output;
+    struct tinywl_server *server = output->server;
+    struct wlr_scene *scene = server->scene;
+
+   
+    static struct timespec last_frame_time = {0};
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+   
+
+    // Check if a frame is already pending
+    if (wlr_output->frame_pending) {
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Frame pending for %s, skipping", wlr_output->name);
+        return;
+    }
+
+    struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(scene, wlr_output);
+    if (!scene_output) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] No scene output for %s", wlr_output->name);
+        wlr_output_schedule_frame(wlr_output);
+        return;
+    }
+
+    // Validate output state
+    if (!wlr_output || !wlr_output->enabled || !wlr_output->renderer || !wlr_output->allocator) {
+        wlr_log(WLR_DEBUG, "[RENDER_FRAME] Output '%s' not ready", wlr_output->name);
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        return;
+    }
+
+    if (!wlr_renderer_is_gles2(wlr_output->renderer)) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] Renderer is not GLES2");
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        return;
+    }
+
+    if (!server->output_layout) {
+        wlr_log(WLR_ERROR, "[RENDER_FRAME] No output layout available");
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        return;
+    }
+
+    // Initialize damage region
+    pixman_region32_t damage;
+    pixman_region32_init(&damage);
+
+    // Create output state
+    struct wlr_output_state state;
+    wlr_output_state_init(&state);
+
+    // Build scene output state with options
+    struct wlr_scene_output_state_options options = {0};
+//    options.damage = &damage;
+    bool has_damage = wlr_scene_output_build_state(scene_output, &state, &options);
+    if (!has_damage) {
+        wlr_log(WLR_DEBUG, "[SCENE_OUTPUT] No damage for %s, skipping render",
+                wlr_output->name ? wlr_output->name : "(null)");
+        pixman_region32_fini(&damage);
+        wlr_output_state_finish(&state);
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        return;
+    }
+
+    // Synchronize buffer access
+    static pthread_mutex_t buffer_access_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+    // Perform RDP transmission
+    if (state.committed & WLR_OUTPUT_STATE_BUFFER && state.buffer) {
+        // Validate buffer dimensions
+        if (state.buffer->width <= 0 || state.buffer->height <= 0) {
+            wlr_log(WLR_ERROR, "[SCENE_OUTPUT] Invalid buffer dimensions for %s", wlr_output->name);
+            pixman_region32_fini(&damage);
+            wlr_output_state_finish(&state);
+            wlr_scene_output_send_frame_done(scene_output, &now);
+            return;
+        }
+
+        pthread_mutex_lock(&buffer_access_mutex);
+        struct wlr_buffer *locked_buffer = wlr_buffer_lock(state.buffer);
+        if (!locked_buffer) {
+            wlr_log(WLR_ERROR, "[SCENE_OUTPUT] Failed to lock buffer for %s", wlr_output->name);
+            pthread_mutex_unlock(&buffer_access_mutex);
+        } else {
+            wlr_log(WLR_DEBUG, "[SCENE_OUTPUT] Transmitting surface via RDP for %s (size: %dx%d)",
+                    wlr_output->name ? wlr_output->name : "(null)", locked_buffer->width, locked_buffer->height);
+            rdp_transmit_surface(locked_buffer);
+            wlr_buffer_unlock(locked_buffer);
+            pthread_mutex_unlock(&buffer_access_mutex);
+        }
+    }
+
+    // CRITICAL: Send frame done immediately to maintain proper event timing
+    wlr_scene_output_send_frame_done(scene_output, &now);
+
+    // Cleanup
+    pixman_region32_fini(&damage);
+    wlr_output_state_finish(&state);
 }
 
 
@@ -2200,44 +2373,57 @@ static void output_destroy(struct wl_listener *listener, void *data) {
 static void server_new_output(struct wl_listener *listener, void *data) {
     /* This event is raised by the backend when a new output (aka a display or
      * monitor) becomes available. */
-struct tinywl_server *server =
+    struct tinywl_server *server =
         wl_container_of(listener, server, new_output);
     struct wlr_output *wlr_output = data;
-     struct tinywl_output *output_wrapper_iter;
+
+    // Check if this wlr_output instance has already been processed.
+    struct tinywl_output *output_wrapper_iter;
     wl_list_for_each(output_wrapper_iter, &server->outputs, link) {
         if (output_wrapper_iter->wlr_output == wlr_output) {
             wlr_log(WLR_INFO, "server_new_output: Output %s (ptr %p) already processed, skipping.",
                     wlr_output->name ? wlr_output->name : "(null)", (void*)wlr_output);
-            return; // Already handled this specific wlr_output instance
+            return;
         }
     }
-    
 
     /* Configures the output created by the backend to use our allocator
      * and our renderer. Must be done once, before commiting the output */
     wlr_output_init_render(wlr_output, server->allocator, server->renderer);
 
-    /* The output may be disabled, switch it on. */
+    /* Create an output state to configure the output */
     struct wlr_output_state state;
     wlr_output_state_init(&state);
     wlr_output_state_set_enabled(&state, true);
 
-    /* Some backends don't have modes. DRM+KMS does, and we need to set a mode
-     * before we can use the output. The mode is a tuple of (width, height,
-     * refresh rate), and each monitor supports only a specific set of modes. We
-     * just pick the monitor's preferred mode, a more sophisticated compositor
-     * would let the user configure it. */
+    /* Set the preferred mode */
     struct wlr_output_mode *mode = wlr_output_preferred_mode(wlr_output);
     if (mode != NULL) {
         wlr_output_state_set_mode(&state, mode);
     }
 
-    /* Atomically applies the new output state. */
-    wlr_output_commit_state(wlr_output, &state);
-    wlr_output_state_finish(&state);
+    /*
+     * Apply a 180-degree flip (WL_OUTPUT_TRANSFORM_FLIPPED_180)
+     */
+    wlr_output_state_set_transform(&state, WL_OUTPUT_TRANSFORM_FLIPPED_180);
+    // The line below was incorrect and is removed:
+    // wlr_output_set_transform(wlr_output, WL_OUTPUT_TRANSFORM_FLIPPED_180);
+
+
+    /* Atomically applies the new output state. This will update wlr_output->transform */
+    if (!wlr_output_commit_state(wlr_output, &state)) {
+        wlr_log(WLR_ERROR, "Failed to commit output state for %s", wlr_output->name);
+        wlr_output_state_finish(&state);
+        return;
+    }
+    wlr_output_state_finish(&state); // Clean up the state object
 
     /* Allocates and configures our state for this output */
     struct tinywl_output *output = calloc(1, sizeof(*output));
+    if (!output) {
+        wlr_log(WLR_ERROR, "Failed to allocate tinywl_output for %s", wlr_output->name);
+        return;
+    }
     output->wlr_output = wlr_output;
     output->server = server;
 
@@ -2255,21 +2441,38 @@ struct tinywl_server *server =
 
     wl_list_insert(&server->outputs, &output->link);
 
-    /* Adds this to the output layout. The add_auto function arranges outputs
-     * from left-to-right in the order they appear. A more sophisticated
-     * compositor would let the user configure the arrangement of outputs in the
-     * layout.
-     *
-     * The output layout utility automatically adds a wl_output global to the
-     * display, which Wayland clients can see to find out information about the
-     * output (such as DPI, scale factor, manufacturer, etc).
-     */
+    /* Adds this to the output layout. */
     struct wlr_output_layout_output *l_output = wlr_output_layout_add_auto(server->output_layout,
         wlr_output);
-    struct wlr_scene_output *scene_output = wlr_scene_output_create(server->scene, wlr_output);
-    wlr_scene_output_layout_add_output(server->scene_layout, l_output, scene_output);
-    wlr_output_schedule_frame(output->wlr_output);
+    if (!l_output) {
+         wlr_log(WLR_ERROR, "Failed to add output %s to layout", wlr_output->name);
+         wl_list_remove(&output->frame.link);
+         wl_list_remove(&output->request_state.link);
+         wl_list_remove(&output->destroy.link);
+         wl_list_remove(&output->link);
+         free(output);
+         return;
+    }
 
+    struct wlr_scene_output *scene_output = wlr_scene_output_create(server->scene, wlr_output);
+    if (!scene_output) {
+        wlr_log(WLR_ERROR, "Failed to create scene output for %s", wlr_output->name);
+        // Corrected line: Pass wlr_output to wlr_output_layout_remove
+        wlr_output_layout_remove(server->output_layout, wlr_output);
+        wl_list_remove(&output->frame.link);
+        wl_list_remove(&output->request_state.link);
+        wl_list_remove(&output->destroy.link);
+        wl_list_remove(&output->link);
+        free(output);
+        return;
+    }
+
+    wlr_scene_output_layout_add_output(server->scene_layout, l_output, scene_output);
+    
+    wlr_log(WLR_INFO, "Output %s configured with transform FLIPPED_180 (current transform: %d)",
+            wlr_output->name, wlr_output->transform); // Log current transform for verification
+
+    wlr_output_schedule_frame(output->wlr_output);
 }
 
 static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
@@ -2596,7 +2799,7 @@ static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
         }
     }
 }*/
-
+/*
 static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
     if (!listener || !data) {
         wlr_log(WLR_ERROR, "Invalid listener=%p or data=%p in server_new_xdg_popup", listener, data);
@@ -2642,6 +2845,114 @@ static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
     if (!parent_tree || parent_tree->node.type != WLR_SCENE_NODE_TREE) {
         wlr_log(WLR_ERROR, "Invalid parent scene tree: parent_tree=%p, type=%d",
                 parent_tree, parent_tree ? parent_tree->node.type : -1);
+        return;
+    }
+
+    // Check parent surface state
+    if (!parent->surface->mapped || !wlr_surface_has_buffer(parent->surface)) {
+        wlr_log(WLR_ERROR, "Parent surface not ready: mapped=%d, has_buffer=%d",
+                parent->surface->mapped, wlr_surface_has_buffer(parent->surface));
+        return; // Defer until parent is ready
+    }
+
+    // Allocate popup structure
+    struct tinywl_popup *popup = calloc(1, sizeof(struct tinywl_popup));
+    if (!popup) {
+        wlr_log(WLR_ERROR, "Failed to allocate tinywl_popup");
+        return;
+    }
+
+    popup->xdg_popup = xdg_popup;
+    popup->server = server;
+
+    // Create scene tree for popup
+    popup->scene_tree = wlr_scene_xdg_surface_create(parent_tree, xdg_popup->base);
+    if (!popup->scene_tree) {
+        wlr_log(WLR_ERROR, "Failed to create scene tree for popup: xdg_surface=%p", xdg_popup->base);
+        free(popup);
+        return;
+    }
+
+    // Set data pointers
+    popup->scene_tree->node.data = popup;
+    xdg_popup->base->data = popup; // Store popup for consistency with toplevels
+
+    // Set up event listeners
+    popup->map.notify = popup_map;
+    wl_signal_add(&xdg_popup->base->surface->events.map, &popup->map);
+    popup->unmap.notify = popup_unmap;
+    wl_signal_add(&xdg_popup->base->surface->events.unmap, &popup->unmap);
+    popup->destroy.notify = popup_destroy;
+    wl_signal_add(&xdg_popup->events.destroy, &popup->destroy);
+    popup->commit.notify = popup_commit;
+    wl_signal_add(&xdg_popup->base->surface->events.commit, &popup->commit);
+
+    // Add to server's popup list
+    wl_list_insert(&server->popups, &popup->link);
+    wlr_log(WLR_DEBUG, "Popup created: %p, parent=%p, scene_tree=%p, xdg_surface=%p",
+            xdg_popup, parent->surface, popup->scene_tree, xdg_popup->base);
+
+    // Schedule configure if needed
+    if (xdg_popup->base->initial_commit) {
+        wlr_xdg_surface_schedule_configure(xdg_popup->base);
+        wlr_log(WLR_DEBUG, "Scheduled configure for popup %p", xdg_popup);
+    }
+
+    // Schedule frame
+    struct tinywl_output *output;
+    wl_list_for_each(output, &server->outputs, link) {
+        if (output->wlr_output && output->wlr_output->enabled) {
+            wlr_output_schedule_frame(output->wlr_output);
+        }
+    }
+}*/
+
+
+static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
+    if (!listener || !data) {
+        wlr_log(WLR_ERROR, "Invalid listener=%p or data=%p in server_new_xdg_popup", listener, data);
+        return;
+    }
+
+    struct tinywl_server *server = wl_container_of(listener, server, new_xdg_popup);
+    if (!server || !server->wl_display || !server->xdg_shell || !server->scene) {
+        wlr_log(WLR_ERROR, "Invalid server state: server=%p, display=%p, xdg_shell=%p, scene=%p",
+                server, server ? server->wl_display : NULL, server ? server->xdg_shell : NULL, server ? server->scene : NULL);
+        return;
+    }
+
+    struct wlr_xdg_popup *xdg_popup = data;
+    wlr_log(WLR_INFO, "New XDG popup: %p, parent=%p, surface=%p, initial_commit=%d",
+            xdg_popup, xdg_popup->parent, xdg_popup->base ? xdg_popup->base->surface : NULL,
+            xdg_popup->base ? xdg_popup->base->initial_commit : 0);
+
+    // Validate popup surface and role
+    if (!xdg_popup->base || !xdg_popup->base->surface || xdg_popup->base->role != WLR_XDG_SURFACE_ROLE_POPUP) {
+        wlr_log(WLR_ERROR, "Invalid popup: base=%p, surface=%p, role=%d",
+                xdg_popup->base, xdg_popup->base ? xdg_popup->base->surface : NULL,
+                xdg_popup->base ? (int)xdg_popup->base->role : -1);
+        return;
+    }
+
+    // Validate parent surface
+    struct wlr_xdg_surface *parent = wlr_xdg_surface_try_from_wlr_surface(xdg_popup->parent);
+    if (!parent || !parent->surface) {
+        wlr_log(WLR_ERROR, "No valid parent XDG surface: parent=%p, parent->surface=%p",
+                parent, parent ? parent->surface : NULL);
+        return;
+    }
+
+    // Ensure parent is a toplevel (popups cannot have popup parents)
+    if (parent->role != WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
+        wlr_log(WLR_ERROR, "Parent surface is not a toplevel: role=%d", parent->role);
+        return;
+    }
+
+    // Validate parent scene tree
+    struct wlr_scene_tree *parent_tree = parent->data;
+    if (!parent_tree || parent_tree->node.type != WLR_SCENE_NODE_TREE) {
+        wlr_log(WLR_ERROR, "Invalid parent scene tree: parent_tree=%p, type=%d",
+                parent_tree, parent_tree ? (int)parent_tree->node.type : -1);
         return;
     }
 

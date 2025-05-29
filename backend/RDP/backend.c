@@ -338,11 +338,7 @@ static bool is_rdp_peer_connected(freerdp_peer *peer) {
     return true;
 }
 
-#include <pthread.h>
-#include <time.h>
-#include <wlr/types/wlr_buffer.h>
-#include <wlr/types/wlr_output.h>
-#include <freerdp/freerdp.h>
+
 
 struct rdp_transmit_job {
     struct wlr_buffer *buffer;
@@ -380,6 +376,16 @@ void *rdp_transmit_worker(void *arg) {
         
         return NULL;
     }
+
+if (job->width <= 0 || job->height <= 0 || job->stride <= 0) {
+    wlr_log(WLR_ERROR, "Invalid job dimensions or stride");
+    wlr_buffer_unlock(buffer);
+    free(job);
+    pthread_mutex_lock(&transmit_mutex);
+    transmission_in_progress = false;
+    pthread_mutex_unlock(&transmit_mutex);
+    return NULL;
+}
 
     struct rdp_peer_context *peerContext = (struct rdp_peer_context *)peer->context;
     rdpSettings *settings = peer->context->settings;
@@ -566,6 +572,247 @@ void rdp_transmit_surface(struct wlr_buffer *buffer) {
     }
     pthread_detach(thread);
 }
+
+
+/*void rdp_transmit_surface(struct wlr_buffer *buffer) {
+    static int transmission_attempts = 0;
+
+    // Check if a transmission is already in progress
+    pthread_mutex_lock(&transmit_mutex);
+    if (transmission_in_progress) {
+        pthread_mutex_unlock(&transmit_mutex);
+        wlr_log(WLR_DEBUG, "Transmission already in progress, skipping frame");
+        return;
+    }
+    // Mark transmission as starting
+    transmission_in_progress = true;
+    pthread_mutex_unlock(&transmit_mutex);
+
+    transmission_attempts++;
+    wlr_log(WLR_INFO, "RDP Transmission Attempt #%d", transmission_attempts);
+
+    freerdp_peer *peer = get_global_rdp_peer();
+    if (!is_rdp_peer_connected(peer)) {
+        wlr_log(WLR_ERROR, "Invalid or disconnected RDP peer, skipping transmission");
+        
+        // Mark transmission as complete since we're not starting one
+        pthread_mutex_lock(&transmit_mutex);
+        transmission_in_progress = false;
+        pthread_mutex_unlock(&transmit_mutex);
+        
+        return;
+    }
+
+    void *data = NULL;
+    uint32_t format = 0;
+    size_t stride = 0;
+    if (!wlr_buffer_begin_data_ptr_access(buffer,
+                                         WLR_BUFFER_DATA_PTR_ACCESS_READ,
+                                         &data,
+                                         &format,
+                                         &stride)) {
+        wlr_log(WLR_ERROR, "Failed to access buffer data");
+        
+        // Mark transmission as complete since we're not starting one
+        pthread_mutex_lock(&transmit_mutex);
+        transmission_in_progress = false;
+        pthread_mutex_unlock(&transmit_mutex);
+        
+        return;
+    }
+
+    struct wlr_buffer *locked_buffer = wlr_buffer_lock(buffer);
+    if (!locked_buffer) {
+        wlr_log(WLR_ERROR, "Failed to lock buffer");
+        wlr_buffer_end_data_ptr_access(buffer);
+        
+        // Mark transmission as complete since we're not starting one
+        pthread_mutex_lock(&transmit_mutex);
+        transmission_in_progress = false;
+        pthread_mutex_unlock(&transmit_mutex);
+        
+        return;
+    }
+
+    // Allocate a new buffer for flipped data
+    uint8_t *flipped_data = malloc(stride * buffer->height);
+    if (!flipped_data) {
+        wlr_log(WLR_ERROR, "Failed to allocate flipped buffer");
+        wlr_buffer_end_data_ptr_access(buffer);
+        wlr_buffer_unlock(locked_buffer);
+        
+        // Mark transmission as complete since we're not starting one
+        pthread_mutex_lock(&transmit_mutex);
+        transmission_in_progress = false;
+        pthread_mutex_unlock(&transmit_mutex);
+        
+        return;
+    }
+
+    // Flip the buffer vertically
+    for (uint32_t y = 0; y < (uint32_t)buffer->height; y++) {
+        uint32_t src_y = buffer->height - 1 - y; // Read from bottom to top
+        memcpy(flipped_data + y * stride, (uint8_t *)data + src_y * stride, stride);
+    }
+
+    wlr_buffer_end_data_ptr_access(buffer);
+
+    struct rdp_transmit_job *job = calloc(1, sizeof(*job));
+    if (!job) {
+        wlr_log(WLR_ERROR, "Failed to allocate rdp_transmit_job");
+        wlr_buffer_unlock(locked_buffer);
+        free(flipped_data);
+        
+        // Mark transmission as complete since we're not starting one
+        pthread_mutex_lock(&transmit_mutex);
+        transmission_in_progress = false;
+        pthread_mutex_unlock(&transmit_mutex);
+        
+        return;
+    }
+
+    // Set job fields with flipped data
+    job->buffer = locked_buffer;
+    job->peer = peer;
+    job->data = flipped_data; // Use flipped data
+    job->format = format;
+    job->stride = stride;
+    job->width = buffer->width;
+    job->height = buffer->height;
+
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, rdp_transmit_worker, job) != 0) {
+        wlr_log(WLR_ERROR, "Failed to create transmission thread");
+        wlr_buffer_unlock(locked_buffer);
+        free(flipped_data);
+        free(job);
+        
+        // Mark transmission as complete since we failed to start one
+        pthread_mutex_lock(&transmit_mutex);
+        transmission_in_progress = false;
+        pthread_mutex_unlock(&transmit_mutex);
+        
+        return;
+    }
+    pthread_detach(thread);
+}*/
+/*
+void rdp_transmit_surface(struct wlr_buffer *buffer) {
+    static int transmission_attempts = 0;
+    transmission_attempts++;
+
+    freerdp_peer *peer = get_global_rdp_peer();
+
+    wlr_log(WLR_ERROR, "RDP Transmission Attempt #%d", transmission_attempts);
+    wlr_log(WLR_ERROR, "Transmitting surface: peer=%p", (void*)peer);
+
+    if (!peer || !peer->context || !peer->context->update) {
+        wlr_log(WLR_ERROR, "Invalid peer state during surface transmission");
+        return;
+    }
+
+    struct rdp_peer_context *peerContext = (struct rdp_peer_context *)peer->context;
+    rdpSettings *settings = peer->context->settings;
+    rdpUpdate *update = peer->context->update;
+
+    void *data = NULL;
+    uint32_t format = 0;
+    size_t stride = 0;
+
+    if (!wlr_buffer_begin_data_ptr_access(buffer, 
+                                         WLR_BUFFER_DATA_PTR_ACCESS_READ, 
+                                         &data, 
+                                         &format, 
+                                         &stride)) {
+        wlr_log(WLR_ERROR, "Failed to access buffer data");
+        return;
+    }
+
+    wlr_log(WLR_ERROR, "Transmitting surface details:"
+            " width=%d, height=%d, stride=%zu, format=0x%x", 
+            buffer->width, buffer->height, stride, format);
+
+    // Allocate a temporary buffer for flipped image
+    size_t buffer_size = stride * buffer->height;
+    BYTE *flipped_data = malloc(buffer_size);
+    if (!flipped_data) {
+        wlr_log(WLR_ERROR, "Failed to allocate memory for flipped image");
+        wlr_buffer_end_data_ptr_access(buffer);
+        return;
+    }
+
+    // Flip the image vertically by copying rows in reverse order
+    for (int y = 0; y < buffer->height; y++) {
+        memcpy(flipped_data + (y * stride),
+               (BYTE *)data + ((buffer->height - 1 - y) * stride),
+               stride);
+    }
+
+    // Configure surface bits command
+    SURFACE_BITS_COMMAND cmd = { 0 };
+    cmd.cmdType = CMDTYPE_SET_SURFACE_BITS;
+    cmd.bmp.bpp = 32;
+    cmd.bmp.width = buffer->width;
+    cmd.bmp.height = buffer->height;
+    cmd.destLeft = 0;
+    cmd.destTop = 0;
+    cmd.destRight = buffer->width;
+    cmd.destBottom = buffer->height;
+
+    // Try NSCodec if available
+    if (settings->NSCodec && peerContext->nsc_context && peerContext->encode_stream) {
+        wlr_log(WLR_DEBUG, "Using NSCodec compression");
+        cmd.bmp.codecID = settings->NSCodecId;
+
+        Stream_Clear(peerContext->encode_stream);
+        Stream_SetPosition(peerContext->encode_stream, 0);
+
+        wlr_log(WLR_DEBUG, "NSCodec state - context: %p, stream: %p", 
+                (void*)peerContext->nsc_context, 
+                (void*)peerContext->encode_stream);
+
+        BOOL nsc_result = nsc_compose_message(peerContext->nsc_context,
+                                            peerContext->encode_stream,
+                                            flipped_data,
+                                            buffer->width,
+                                            buffer->height,
+                                            stride);
+
+        if (!nsc_result) {
+            wlr_log(WLR_ERROR, "NSCodec compression failed");
+            free(flipped_data);
+            wlr_buffer_end_data_ptr_access(buffer);
+            return;
+        }
+
+        size_t stream_pos = Stream_GetPosition(peerContext->encode_stream);
+        wlr_log(WLR_DEBUG, "NSCodec compressed size: %zu bytes", stream_pos);
+
+        cmd.bmp.bitmapDataLength = stream_pos;
+        cmd.bmp.bitmapData = Stream_Buffer(peerContext->encode_stream);
+
+    } else {
+        wlr_log(WLR_DEBUG, "Using raw bitmap transmission (NSCodec not available - settings: %d, context: %p)", 
+                settings->NSCodec,
+                peerContext->nsc_context);
+        // Fall back to raw bitmap if NSCodec not available
+        cmd.bmp.codecID = 0;  // Raw bitmap
+        cmd.bmp.bitmapDataLength = stride * buffer->height;
+        cmd.bmp.bitmapData = flipped_data;
+    }
+
+    if (!update->SurfaceBits(update->context, &cmd)) {
+        wlr_log(WLR_ERROR, "Failed to send surface bits - codec: %d, length: %u", 
+                cmd.bmp.codecID, cmd.bmp.bitmapDataLength);
+        free(flipped_data);
+        wlr_buffer_end_data_ptr_access(buffer);
+        return;
+    }
+
+    wlr_log(WLR_DEBUG, "Surface bits sent successfully");
+    free(flipped_data);
+    wlr_buffer_end_data_ptr_access(buffer);
+}*/
 static int rdp_listener_activity(int fd, uint32_t mask, void *data) {
     freerdp_listener* instance = (freerdp_listener*)data;
     
@@ -1484,14 +1731,40 @@ static BOOL xf_input_synchronize_event(rdpInput *input, UINT32 flags) {
     }
     return TRUE;
 }
+#include <unistd.h> // For usleep
+#include <wlr/util/log.h>
+
+#define MAX_RETRIES 30
+#define RETRY_DELAY_US 10000 // 10ms delay between retries
+
 static int rdp_client_activity(int fd, uint32_t mask, void *data)
 {
     freerdp_peer *client = (freerdp_peer *)data;
- //   struct rdp_peer_context *peerContext = (struct rdp_peer_context *)client->context;
+    // struct rdp_peer_context *peerContext = (struct rdp_peer_context *)client->context;
     
-    // Remove unused backend variable
-    if (!client->CheckFileDescriptor(client)) {
-        wlr_log(WLR_ERROR, "Unable to check descriptor for client %p", client);
+    // Retry checking the file descriptor
+    int retries = 0;
+    bool check_success = false;
+    
+    while (retries < MAX_RETRIES) {
+        if (client->CheckFileDescriptor(client)) {
+            check_success = true;
+            break;
+        }
+        
+        retries++;
+        wlr_log(WLR_ERROR, "CheckFileDescriptor failed for client %p (attempt %d/%d)", 
+                client, retries, MAX_RETRIES);
+        
+        if (retries < MAX_RETRIES) {
+            // Wait before retrying
+            USleep(RETRY_DELAY_US);
+        }
+    }
+
+    if (!check_success) {
+        wlr_log(WLR_ERROR, "Unable to check descriptor for client %p after %d retries", 
+                client, MAX_RETRIES);
         goto out_clean;
     }
 
