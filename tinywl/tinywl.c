@@ -266,7 +266,21 @@ struct wl_listener pointer_motion;
     struct wl_list popups;        // List of tinywl_popup objects
     struct wl_listener new_popup; // Listener for new xdg_popup events
 
-    GLuint shader_program; // Custom shader program for animations
+     GLuint shader_program; // Flame shader for buffers/animations
+    GLint flame_shader_mvp_loc;
+    GLint flame_shader_tex_loc;
+    GLint flame_shader_time_loc;
+    GLint flame_shader_res_loc;
+
+    // New: Rectangle Shader
+    GLuint rect_shader_program;
+    GLint rect_shader_mvp_loc;
+    GLint rect_shader_color_loc;
+    GLint rect_shader_time_loc;
+    GLint rect_shader_resolution_loc; // New: for iResolution
+
+
+     // Custom shader program for animations
     GLint scale_uniform;  // Location of the scale uniform in the shader
 
     // For shared quad rendering
@@ -290,10 +304,18 @@ struct tinywl_output {
     bool rendering; 
 };
 
+enum tinywl_toplevel_type {
+    TINYWL_TOPLEVEL_XDG,
+    TINYWL_TOPLEVEL_CUSTOM,
+};
+
 struct tinywl_toplevel {
     struct wl_list link;
     struct tinywl_server *server;
-    struct wlr_xdg_toplevel *xdg_toplevel;
+    union {
+        struct wlr_xdg_toplevel *xdg_toplevel;
+        struct wlr_scene_rect *custom_rect;
+    };
 
     // This 'scene_tree' should be the *main frame* for the window,
     // including decorations AND client content area.
@@ -314,14 +336,19 @@ struct tinywl_toplevel {
     struct wlr_texture *cached_texture;
     uint32_t last_commit_seq;
     bool needs_redraw;
-
+    struct wlr_texture *custom_texture;
+bool mapped;
     // Animation state
     bool is_animating;
     float scale;          // Current scale factor (1.0 = normal size)
     float target_scale;   // Target scale for animation (e.g., 1.0 for zoom in, 0.0 for minimize)
     float animation_start; // Animation start time (in seconds)
     float animation_duration; // Duration in seconds (e.g., 0.3 for 300ms)
+ bool pending_destroy;
+enum tinywl_toplevel_type type;
 };
+
+
 
 
 
@@ -371,6 +398,15 @@ void rdp_transmit_surface(struct wlr_buffer *buffer);
 struct wlr_egl *setup_surfaceless_egl(struct tinywl_server *server) ;
 void cleanup_egl(struct tinywl_server *server);
 static void process_cursor_motion(struct tinywl_server *server, uint32_t time);
+void check_scene_bypass_issue(struct wlr_scene_output *scene_output, struct wlr_output *output) ;
+void debug_scene_rendering(struct wlr_scene *scene, struct wlr_output *output) ;
+void debug_scene_tree(struct wlr_scene *scene, struct wlr_output *output);
+void test_red_rectangle_alternative(struct tinywl_server *server) ;
+
+ float get_monotonic_time_seconds_as_float(void) ;
+static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer, int sx, int sy, void *user_data); // If not already declared
+
+
 
 // Function to compile a shader
 static GLuint compile_shader(GLenum type, const char *source) {
@@ -579,6 +615,7 @@ const char *fragment_shader_src =
 "    \n"
 "    frag_color = vec4(final_color*4.0, final_alpha).bgra;\n"
 "}";
+
     GLuint vertex_shader = compile_shader(GL_VERTEX_SHADER, vertex_shader_src);
     GLuint fragment_shader = compile_shader(GL_FRAGMENT_SHADER, fragment_shader_src);
     if (!vertex_shader || !fragment_shader) {
@@ -614,6 +651,171 @@ const char *fragment_shader_src =
     wlr_log(WLR_INFO, "Shader program created successfully: program=%u",
             server->shader_program);
     return true;
+}
+
+// compile_shader function is reused
+
+static bool create_rect_shader_program(struct tinywl_server *server) {
+    struct wlr_egl *egl = wlr_gles2_renderer_get_egl(server->renderer);
+    GLenum err;
+    if (!egl) {
+        wlr_log(WLR_ERROR, "No EGL context for rect shader creation");
+        return false;
+    }
+
+    if (!wlr_egl_make_current(egl, NULL)) { // Ensure EGL context is current
+        wlr_log(WLR_ERROR, "Failed to make EGL context current for rect shader");
+        return false;
+    }
+    while ((err = glGetError()) != GL_NO_ERROR) { /* Clear previous errors */ }
+
+
+
+
+// Vertex shader for simple colored rectangles
+static const char *rect_vertex_shader_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2 position;      // Vertex positions (0 to 1 for unit quad)\n"
+    "in vec2 texcoord;      // Vertex texture/local coordinates (also 0 to 1 if VAO is set up for it)\n"
+    "out vec2 v_texcoord;   // Pass local quad coordinates to fragment shader (for vignette)\n"
+    "uniform mat3 mvp;\n"
+    "void main() {\n"
+    "    vec3 pos_transformed = mvp * vec3(position, 1.0);\n"
+    "    gl_Position = vec4(pos_transformed.xy, 0.0, 1.0);\n"
+    "    v_texcoord = texcoord; // Pass the VAO's texcoord attribute\n"
+    "}\n";
+
+static const char *rect_fragment_shader_src =
+    "/* Creative Commons Licence Attribution-NonCommercial-ShareAlike \n"
+    "phreax/jiagual 2025 \n"
+    "Variation of https://www.shadertoy.com/view/tfG3zt\n"
+    "             https://www.shadertoy.com/view/3XjXzK\n"
+    "Inspired by Xor's recent volumetric shaders\n"
+    "https://www.shadertoy.com/view/tXlXDX\n"
+    "*/\n"
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "\n"
+    "uniform float time;\n"
+    "uniform vec4 u_color;\n"
+    "\n"
+    "#define PALETTE 6\n"
+    "\n"
+    "mat2 rot(float x) {return mat2(cos(x), -sin(x), sin(x), cos(x));}\n"
+    "vec3 pal(float x) {return .5+.5*cos(6.28*x-vec3(5,4,1));}\n"
+    "\n"
+    "vec3 getPal(int palette, float x) {\n"
+    "    return pal(x);\n"
+    "}\n"
+    "\n"
+    "#define SIN(x) sin(x)\n"
+    "\n"
+    "void main() {\n"
+    "    vec2 fragCoord = gl_FragCoord.xy;\n"
+    "    vec2 iResolution = vec2(300.0, 300.0);\n"
+    "    float iTime = time * 0.5;\n"
+    "    \n"
+    "    vec2 uv = (fragCoord - .5*iResolution.xy)/iResolution.y;\n"
+    "    float tt = iTime*.5;\n"
+    "    \n"
+    "    uv.xy *= mix(.8, 1.2, SIN(-tt+5.*length(uv.xy)));\n"
+    "    \n"
+    "    vec3 col = vec3(0);\n"
+    "    vec3 rd = vec3(uv, 1);\n"
+    "    vec3 p = vec3(0);\n"
+    "    float t = .1;\n"
+    "    \n"
+    "    for(float i=0.; i<120.; i++) {\n"
+    "        vec3 p = t*rd + rd;\n"
+    "        \n"
+    "        float r = length(p);\n"
+    "        \n"
+    "        float z = p.z;\n"
+    "        p.xy *= rot(p.z*.75);\n"
+    "      \n"
+    "        // log spherical coords\n"
+    "        p = vec3(log(r)*.5,\n"
+    "            acos(p.z / r),\n"
+    "            atan(p.y, p.x));\n"
+    "        p = abs(p)-mix(.1, .5, SIN(.2*tt));\n"
+    "    \n"
+    "        for(float j=0.; j < 3.; j++) {     \n"
+    "            float  a= exp(j)/exp2(j);\n"
+    "            p += cos(2.*p.yzx*a + .5*tt - length(p.xy)*9.)/a; \n"
+    "        }\n"
+    "        \n"
+    "        float d = 0.007 + abs((exp2(1.4*p)-vec3(0,1.+.7*SIN(tt),0)).y-1.)/14.;\n"
+    "        float k = t*.7 +length(p)*.1 - .2*tt + z*.1;\n"
+    "        vec3 c = getPal(PALETTE, k);\n"
+    "        c = mix(c, c*vec3(0.922,0.973,0.725), SIN(z*.5));\n"
+    "        col += c*1e-3/d;       \n"
+    "        t += d/4.;\n"
+    "    }\n"
+    "    \n"
+    "    // add glow in the center\n"
+    "    float gl = exp(-17.*length(uv.xy));\n"
+    "    col += .4*mix(vec3(0.361,0.957,1.000), vec3(0.847,1.000,0.561), SIN(gl*2.-tt))*pow(gl*11., 1.);\n"
+    "    \n"
+    "    // tone mapping & gamma correction\n"
+    "    col *= tanh(col*.1);\n"
+    "    col = pow(col, vec3(.45));\n"
+    "    \n"
+    "    // Apply user color as subtle accent\n"
+    "    col = mix(col, col * u_color.rgb, 0.1);\n"
+    "    \n"
+    "    frag_color = vec4(col, u_color.a).bgra;\n"
+    "}\n";
+
+
+    GLuint vertex_shader = compile_shader(GL_VERTEX_SHADER, rect_vertex_shader_src);
+    GLuint fragment_shader = compile_shader(GL_FRAGMENT_SHADER, rect_fragment_shader_src);
+
+    if (!vertex_shader || !fragment_shader) {
+        if (vertex_shader) glDeleteShader(vertex_shader);
+        if (fragment_shader) glDeleteShader(fragment_shader);
+        wlr_egl_unset_current(egl);
+        return false;
+    }
+
+    server->rect_shader_program = glCreateProgram();
+    if (server->rect_shader_program == 0) {
+        wlr_log(WLR_ERROR, "glCreateProgram for rect shader failed");
+        glDeleteShader(vertex_shader);
+        glDeleteShader(fragment_shader);
+        wlr_egl_unset_current(egl);
+        return false;
+    }
+
+    glAttachShader(server->rect_shader_program, vertex_shader);
+    glAttachShader(server->rect_shader_program, fragment_shader);
+    glLinkProgram(server->rect_shader_program);
+
+    GLint success;
+    glGetProgramiv(server->rect_shader_program, GL_LINK_STATUS, &success);
+if (success) {
+        server->rect_shader_mvp_loc = glGetUniformLocation(server->rect_shader_program, "mvp");
+        server->rect_shader_color_loc = glGetUniformLocation(server->rect_shader_program, "u_color");
+        server->rect_shader_time_loc = glGetUniformLocation(server->rect_shader_program, "time");
+        server->rect_shader_resolution_loc = glGetUniformLocation(server->rect_shader_program, "iResolution"); // Get new uniform
+
+        wlr_log(WLR_INFO, "Rect shader: ID=%u, mvp=%d, color=%d, time=%d, iResolution=%d",
+                server->rect_shader_program, server->rect_shader_mvp_loc,
+                server->rect_shader_color_loc, server->rect_shader_time_loc,
+                server->rect_shader_resolution_loc);
+
+       if(server->rect_shader_mvp_loc == -1) wlr_log(WLR_ERROR, "Rect shader: 'mvp' uniform not found!");
+        if(server->rect_shader_color_loc == -1) wlr_log(WLR_ERROR, "Rect shader: 'u_color' uniform not found!");
+        if(server->rect_shader_time_loc == -1) wlr_log(WLR_ERROR, "Rect shader: 'time' uniform not found!"); // Check new uniform
+         if(server->rect_shader_resolution_loc == -1) wlr_log(WLR_ERROR, "Rect shader: 'iResolution' uniform NOT FOUND!");
+    }
+    glDeleteShader(vertex_shader); // Can delete after linking
+    glDeleteShader(fragment_shader);
+    wlr_egl_unset_current(egl); // Unset context
+    return success;
 }
 
 /* Function implementations */
@@ -721,6 +923,19 @@ static void server_destroy(struct tinywl_server *server) {
         wlr_egl_unset_current(egl_destroy);
     } else if (server->shader_program || server->quad_vao || server->quad_vbo || server->quad_ibo) {
         wlr_log(WLR_ERROR, "Could not make EGL context current to delete GL resources in server_destroy");
+    }
+
+       if (egl_destroy && wlr_egl_make_current(egl_destroy, NULL)) {
+        if (server->shader_program) { // Flame shader
+            glDeleteProgram(server->shader_program);
+            server->shader_program = 0;
+        }
+        if (server->rect_shader_program) { // New: Rect shader
+            glDeleteProgram(server->rect_shader_program);
+            server->rect_shader_program = 0;
+        }
+        // ... delete VAO, VBO, IBO ...
+        wlr_egl_unset_current(egl_destroy);
     }
 }
 
@@ -1103,10 +1318,6 @@ static struct tinywl_toplevel *desktop_toplevel_at(
 
 ///////////////////////////////////////////////////
 
-static void reset_cursor_mode(struct tinywl_server *server) {
-    server->cursor_mode = TINYWL_CURSOR_PASSTHROUGH;
-    server->grabbed_toplevel = NULL;
-}
 
 static void process_cursor_move(struct tinywl_server *server) {
     struct tinywl_toplevel *toplevel = server->grabbed_toplevel;
@@ -1820,206 +2031,309 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
 
     wlr_texture_destroy(texture);
 }*/
+#include <string.h> // For memcpy
+#include <math.h>   // For round, fmaxf, fminf
+#include <time.h>   // For clock_gettime
 
+float get_monotonic_time_seconds_as_float(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1) {
+        wlr_log_errno(WLR_ERROR, "clock_gettime failed");
+        return 0.0f;
+    }
+    return (float)ts.tv_sec + (float)ts.tv_nsec / 1e9f;
+}
+
+#include <string.h> // For memcpy
+#include <math.h>   // For round, fmaxf, fminf
+#include <time.h>   // For clock_gettime
+
+#include <string.h> // For memcpy
+#include <math.h>   // For round, fmaxf, fminf
+#include <time.h>   // For clock_gettime
+
+#include <string.h> // For memcpy
+#include <math.h>   // For round, fmaxf, fminf
+#include <time.h>   // For clock_gettime
+
+// Ensure this helper is defined somewhere accessible
+// static float get_monotonic_time_seconds_as_float() { /* ... */ }
+
+#include <string.h> // For memcpy
+#include <math.h>   // For round, fmaxf, fminf
+#include <time.h>   // For clock_gettime
+
+
+
+
+#include <string.h> // For memcpy
+#include <math.h>   // For round, fmaxf, fminf
+#include <time.h>   // For clock_gettime
+
+// Helper (ensure it's defined or declared before these functions)
+// static float get_monotonic_time_seconds_as_float() { /* ... */ }
+
+
+#include <string.h> // For memcpy
+#include <math.h>   // For round, fmaxf, fminf
+#include <time.h>   // For clock_gettime
+
+// Helper (ensure it's defined or declared before these functions)
+// static float get_monotonic_time_seconds_as_float() { /* ... */ }
+#include <GLES2/gl2.h>
+#include <wlr/render/gles2.h>
+#include <wlr/types/wlr_matrix.h>
+#include <wlr/types/wlr_output.h>
+#include <wlr/types/wlr_scene.h>
+#include <wlr/types/wlr_xdg_shell.h>
+#include <wlr/types/wlr_compositor.h>
+#include <wlr/util/log.h>
+#include <string.h>
+#include <stdlib.h>
+
+
+
+
+
+
+
+
+// STEP 5: Alternative test - Create rectangle differently
+void test_red_rectangle_alternative(struct tinywl_server *server) {
+    wlr_log(WLR_INFO, "=== ALTERNATIVE RECTANGLE TEST ===");
+    
+    // Method 1: Direct color array
+    float red_color[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+    struct wlr_scene_rect *rect1 = wlr_scene_rect_create(&server->scene->tree, 1024, 768, red_color);
+    if (rect1) {
+        wlr_scene_node_set_position(&rect1->node, 0, 0);
+        wlr_scene_node_set_enabled(&rect1->node, true);
+        wlr_log(WLR_INFO, "Alternative rect 1 created at (0,0)");
+    }
+    
+    
+    
+    
+}
+
+
+
+// ISSUE 5: Debug logging to verify scene tree state
+void debug_scene_tree(struct wlr_scene *scene, struct wlr_output *output) {
+    wlr_log(WLR_INFO, "[DEBUG] Scene tree state for output %s:", output->name);
+    
+    struct wlr_scene_node *node;
+    int node_count = 0;
+    
+    wl_list_for_each(node, &scene->tree.children, link) {
+        node_count++;
+        const char *type_name = "UNKNOWN";
+        
+        // Use correct enum values for wlroots 0.19
+        switch (node->type) {
+            case WLR_SCENE_NODE_TREE:
+                type_name = "TREE";
+                break;
+            case WLR_SCENE_NODE_RECT:
+                type_name = "RECT";
+                break;
+            case WLR_SCENE_NODE_BUFFER:
+                type_name = "BUFFER";
+                break;
+            default:
+                type_name = "UNKNOWN";
+                break;
+        }
+        
+        struct tinywl_toplevel *tl = node->data;
+        const char *custom_type = "NONE";
+        if (tl) {
+            custom_type = (tl->type == TINYWL_TOPLEVEL_CUSTOM) ? "CUSTOM" : "XDG";
+        }
+        
+        wlr_log(WLR_INFO, "[DEBUG] Node %d: type=%s, enabled=%d, custom_type=%s, pos=(%d,%d)",
+                node_count, type_name, node->enabled, custom_type, node->x, node->y);
+        
+        // If it's a rect node, show color info
+        if (node->type == WLR_SCENE_NODE_RECT) {
+            struct wlr_scene_rect *rect = wlr_scene_rect_from_node(node);
+            wlr_log(WLR_INFO, "[DEBUG] Rect: %dx%d, color=(%.2f,%.2f,%.2f,%.2f)",
+                    rect->width, rect->height, 
+                    rect->color[0], rect->color[1], rect->color[2], rect->color[3]);
+        }
+    }
+    
+    wlr_log(WLR_INFO, "[DEBUG] Total nodes: %d", node_count);
+}
+
+// Updated scene_buffer_iterator
 static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
-                                  int sx, int sy, void *user_data) {
+                                 int sx, int sy, void *user_data) {
     struct render_data *rdata = user_data;
     struct wlr_renderer *renderer = rdata->renderer;
     struct wlr_output *output = rdata->output;
     struct tinywl_server *server = rdata->server;
     struct wlr_gles2_texture_attribs tex_attribs;
+    const char *output_name_log = output ? output->name : "UNKNOWN_OUTPUT";
 
-    if (!rdata || !rdata->server || !rdata->renderer || !rdata->output) {
-        wlr_log(WLR_ERROR, "Invalid render_data or null pointers");
+    if (!rdata || !server || !renderer || !output || !scene_buffer->node.enabled) {
         return;
     }
-
-    if (!scene_buffer->node.enabled || !scene_buffer->buffer) {
-        return;
-    }
-
     if (output->width == 0 || output->height == 0) {
-        wlr_log(WLR_ERROR, "[ITERATOR:%s] Output width (%d) or height (%d) is ZERO.", output->name, output->width, output->height);
-        return;
-    }
-
-    struct wlr_scene_surface *current_scene_surface = wlr_scene_surface_try_from_buffer(scene_buffer);
-    struct wlr_surface *surface_to_render = current_scene_surface ? current_scene_surface->surface : NULL;
-
-    if (!surface_to_render) {
-        struct wlr_texture *fallback_texture = wlr_texture_from_buffer(renderer, scene_buffer->buffer);
-        if (fallback_texture) {
-            struct wlr_render_texture_options tex_opts = {
-                .texture = fallback_texture,
-                .dst_box = {sx, sy, fallback_texture->width, fallback_texture->height},
-                .transform = scene_buffer->transform,
-                .blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
-            };
-            if (rdata->pass) {
-                wlr_render_pass_add_texture(rdata->pass, &tex_opts);
-            }
-            wlr_texture_destroy(fallback_texture);
-        }
         return;
     }
 
     struct tinywl_toplevel *toplevel = NULL;
-    struct wlr_scene_node *node = &scene_buffer->node;
-    while (node) {
-        if (node->data) {
-            struct tinywl_toplevel *ptl = node->data;
-            bool is_in_list = false;
-            if (server->toplevels.next && server->toplevels.prev &&
-                !wl_list_empty(&server->toplevels)) {
-                struct tinywl_toplevel *check_tl, *tmp;
-                wl_list_for_each_safe(check_tl, tmp, &server->toplevels, link) {
-                    if (check_tl == ptl) {
-                        is_in_list = true;
-                        break;
-                    }
-                }
-            }
-            if (is_in_list) {
-                toplevel = ptl;
+    struct wlr_scene_node *node_iter = &scene_buffer->node;
+    while (node_iter) {
+        if (node_iter->data) {
+            struct tinywl_toplevel *temp_ptl = node_iter->data;
+            if (temp_ptl && temp_ptl->server == server && temp_ptl->scene_tree == (struct wlr_scene_tree*)node_iter) {
+                toplevel = temp_ptl;
                 break;
             }
         }
-        if (!node->parent) break;
-        node = &node->parent->node;
+        if (!node_iter->parent) break;
+        node_iter = &node_iter->parent->node;
     }
 
     float anim_scale_factor = 1.0f;
-    if (toplevel && toplevel->is_animating) {
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        float current_time = now.tv_sec + now.tv_nsec / 1e9f;
-        float elapsed = current_time - toplevel->animation_start;
-        float t = elapsed / toplevel->animation_duration;
-        if (t >= 1.0f) {
-            t = 1.0f;
-            toplevel->is_animating = false;
-            anim_scale_factor = toplevel->target_scale;
-            toplevel->scale = toplevel->target_scale;
-            if (toplevel->target_scale == 0.0f && surface_to_render->mapped && toplevel->scene_tree) {
-                wlr_scene_node_set_enabled(&toplevel->scene_tree->node, false);
-            }
+    char title_buffer[128] = "NO_TL_ITER";
+
+
+
+    if (!scene_buffer->buffer) return;
+    struct wlr_scene_surface *current_scene_surface = wlr_scene_surface_try_from_buffer(scene_buffer);
+    struct wlr_surface *surface_to_render = current_scene_surface ? current_scene_surface->surface : NULL;
+    if (!surface_to_render) return;
+
+    if (toplevel) {
+        if (toplevel->xdg_toplevel && toplevel->xdg_toplevel->title) {
+            snprintf(title_buffer, sizeof(title_buffer), "%s", toplevel->xdg_toplevel->title);
         } else {
-            anim_scale_factor = toplevel->scale + (toplevel->target_scale - toplevel->scale) * t;
+            snprintf(title_buffer, sizeof(title_buffer), "Ptr:%p (XDG maybe NULL)", toplevel);
         }
+
+        wlr_log(WLR_ERROR, "[ITERATOR DEBUG:%s] Processing TL ('%s' Ptr:%p). Anim:%d, Scale:%.3f, Target:%.3f, StartT:%.3f, PendingD:%d, NodeEn:%d",
+               output_name_log, title_buffer, toplevel,
+               toplevel->is_animating, toplevel->scale, toplevel->target_scale,
+               toplevel->animation_start, toplevel->pending_destroy,
+               (toplevel->scene_tree ? toplevel->scene_tree->node.enabled : -1));
+
         if (toplevel->is_animating) {
-            wlr_output_schedule_frame(output);
+            struct timespec now_anim;
+            clock_gettime(CLOCK_MONOTONIC, &now_anim);
+            float current_time_anim = now_anim.tv_sec + now_anim.tv_nsec / 1e9f;
+            float elapsed = current_time_anim - toplevel->animation_start;
+            if (elapsed < 0.0f) elapsed = 0.0f;
+            float t = 0.0f;
+            if (toplevel->animation_duration > 1e-5f) {
+                t = elapsed / toplevel->animation_duration;
+            } else if (elapsed > 0) {
+                t = 1.0f;
+            }
+
+            if (t >= 1.0f) {
+                t = 1.0f;
+                anim_scale_factor = toplevel->target_scale;
+                if (toplevel->target_scale == 0.0f && !toplevel->pending_destroy) {
+                    toplevel->scale = 0.0f;
+                    wlr_log(WLR_ERROR, "[ITERATOR DEBUG:%s] '%s' close anim reached t>=1. Scale=0.0.", output_name_log, title_buffer);
+                    wlr_output_schedule_frame(output);
+                } else {
+                    toplevel->is_animating = false;
+                    toplevel->scale = toplevel->target_scale;
+                }
+            } else {
+                anim_scale_factor = toplevel->scale + (toplevel->target_scale - toplevel->scale) * t;
+            }
+
+            if (toplevel->is_animating) {
+                wlr_output_schedule_frame(output);
+            }
+            wlr_log(WLR_ERROR, "[ITERATOR DEBUG:%s] '%s': t=%.3f, anim_scale_factor=%.3f",
+                   output_name_log, title_buffer, t, anim_scale_factor);
+        } else {
+            anim_scale_factor = toplevel->scale;
+            if (toplevel->target_scale == 0.0f && toplevel->scale <= 0.001f && !toplevel->pending_destroy) {
+                wlr_log(WLR_ERROR, "[ITERATOR DEBUG:%s] '%s' static at scale 0.0.", output_name_log, title_buffer);
+                wlr_output_schedule_frame(output);
+            }
         }
-    } else if (toplevel) {
-        anim_scale_factor = toplevel->scale;
     }
 
-    if (anim_scale_factor <= 0.001f && toplevel && toplevel->target_scale == 0.0f) {
-        return;
-    }
-    if (anim_scale_factor <= 0.001f) {
+    if (anim_scale_factor < 0.001f && !(toplevel && toplevel->target_scale == 0.0f && !toplevel->pending_destroy)) {
         anim_scale_factor = 0.001f;
     }
 
     struct wlr_texture *texture = wlr_texture_from_buffer(renderer, scene_buffer->buffer);
-    if (!texture) {
-        wlr_log(WLR_ERROR, "[ITERATOR:%s] Failed to create texture from buffer %p", output->name, scene_buffer->buffer);
-        return;
-    }
-
+    if (!texture) return;
     wlr_gles2_texture_get_attribs(texture, &tex_attribs);
-
     struct wlr_box render_box = {
-        .x = (int)round(sx + (texture->width * (1.0f - anim_scale_factor) / 2.0f)),
-        .y = (int)round(sy + (texture->height * (1.0f - anim_scale_factor) / 2.0f)),
-        .width = (int)round(texture->width * anim_scale_factor),
-        .height = (int)round(texture->height * anim_scale_factor),
+        .x = (int)round((double)sx + (double)texture->width * (1.0 - (double)anim_scale_factor) / 2.0),
+        .y = (int)round((double)sy + (double)texture->height * (1.0 - (double)anim_scale_factor) / 2.0),
+        .width = (int)round((double)texture->width * (double)anim_scale_factor),
+        .height = (int)round((double)texture->height * (double)anim_scale_factor),
     };
-
     if (render_box.width <= 0 || render_box.height <= 0) {
+        if (toplevel && !toplevel->pending_destroy && toplevel->target_scale == 0.0f) {
+            wlr_log(WLR_ERROR, "[ITERATOR DEBUG:%s] '%s' scaled to zero W/H.", output_name_log, title_buffer);
+            wlr_output_schedule_frame(output);
+        }
         wlr_texture_destroy(texture);
         return;
     }
-
     float mvp[9];
     wlr_matrix_identity(mvp);
-
     float box_scale_x = (float)render_box.width * (2.0f / output->width);
     float box_scale_y = (float)render_box.height * (-2.0f / output->height);
     float box_translate_x = ((float)render_box.x / output->width) * 2.0f - 1.0f;
     float box_translate_y = ((float)render_box.y / output->height) * -2.0f + 1.0f;
 
     if (output->transform == WL_OUTPUT_TRANSFORM_FLIPPED_180) {
-        mvp[0] = -box_scale_x;
-        mvp[4] = -box_scale_y;
-        mvp[6] = -box_translate_x;
-        mvp[7] = -box_translate_y;
+        mvp[0] = -box_scale_x; mvp[4] = -box_scale_y; mvp[6] = -box_translate_x; mvp[7] = -box_translate_y;
+        mvp[1] = mvp[2] = mvp[3] = mvp[5] = 0.0f; mvp[8] = 1.0f;
     } else if (output->transform == WL_OUTPUT_TRANSFORM_NORMAL) {
-        mvp[0] = box_scale_x;
-        mvp[4] = box_scale_y;
-        mvp[6] = box_translate_x;
-        mvp[7] = box_translate_y;
+        mvp[0] = box_scale_x; mvp[4] = box_scale_y; mvp[6] = box_translate_x; mvp[7] = box_translate_y;
+        mvp[1] = mvp[2] = mvp[3] = mvp[5] = 0.0f; mvp[8] = 1.0f;
     } else {
-        float temp_mvp[9];
-        temp_mvp[0] = box_scale_x; temp_mvp[1] = 0.0f; temp_mvp[2] = 0.0f;
-        temp_mvp[3] = 0.0f; temp_mvp[4] = box_scale_y; temp_mvp[5] = 0.0f;
-        temp_mvp[6] = box_translate_x; temp_mvp[7] = box_translate_y; temp_mvp[8] = 1.0f;
+        float temp_mvp[9] = {box_scale_x, 0.0f, 0.0f, 0.0f, box_scale_y, 0.0f, box_translate_x, box_translate_y, 1.0f};
         float transform_matrix[9];
         wlr_matrix_transform(transform_matrix, output->transform);
         wlr_matrix_multiply(mvp, transform_matrix, temp_mvp);
     }
-
     if (scene_buffer->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
-        float temp_mvp[9];
-        memcpy(temp_mvp, mvp, sizeof(mvp));
+        float temp_mvp_buffer[9];
+        memcpy(temp_mvp_buffer, mvp, sizeof(mvp));
         float buffer_matrix[9];
         wlr_matrix_transform(buffer_matrix, scene_buffer->transform);
-        wlr_matrix_multiply(mvp, temp_mvp, buffer_matrix);
+        wlr_matrix_multiply(mvp, temp_mvp_buffer, buffer_matrix);
     }
-
     GLint mvp_loc = glGetUniformLocation(server->shader_program, "mvp");
-    if (mvp_loc != -1) {
-        glUniformMatrix3fv(mvp_loc, 1, GL_FALSE, mvp);
-    }
-
-
-
+    if (mvp_loc != -1) glUniformMatrix3fv(mvp_loc, 1, GL_FALSE, mvp);
     GLint tex_loc = glGetUniformLocation(server->shader_program, "texture_sampler_uniform");
     if (tex_loc != -1) {
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(tex_attribs.target, tex_attribs.tex);
         glTexParameteri(tex_attribs.target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(tex_attribs.target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(tex_attribs.target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(tex_attribs.target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glUniform1i(tex_loc, 0);
     }
-
-    mvp_loc = glGetUniformLocation(server->shader_program, "mvp");
-if (mvp_loc != -1) {
-    glUniformMatrix3fv(mvp_loc, 1, GL_FALSE, mvp);
-}
-
-// ADD THE NEW UNIFORMS HERE:
-// Time uniform for animation
-struct timespec now;
-clock_gettime(CLOCK_MONOTONIC, &now);
-float time_value = now.tv_sec + now.tv_nsec / 1000000000.0f;
-GLint time_loc = glGetUniformLocation(server->shader_program, "time");
-if (time_loc != -1) {
-    glUniform1f(time_loc, time_value);
-}
-
-// Resolution uniform  
-float resolution[2] = {(float)output->width, (float)output->height};
-GLint resolution_loc = glGetUniformLocation(server->shader_program, "resolution");
-if (resolution_loc != -1) {
-    glUniform2fv(resolution_loc, 1, resolution);
-}
+    struct timespec now_shader_time_iter_draw;
+    clock_gettime(CLOCK_MONOTONIC, &now_shader_time_iter_draw);
+    float time_value_iter_draw = now_shader_time_iter_draw.tv_sec + now_shader_time_iter_draw.tv_nsec / 1e9f;
+    GLint time_loc_iter_draw = glGetUniformLocation(server->shader_program, "time");
+    if (time_loc_iter_draw != -1) glUniform1f(time_loc_iter_draw, time_value_iter_draw);
+    float resolution_iter_draw[2] = {(float)output->width, (float)output->height};
+    GLint resolution_loc_iter_draw = glGetUniformLocation(server->shader_program, "iResolution");
+    if (resolution_loc_iter_draw != -1) glUniform2fv(resolution_loc_iter_draw, 1, resolution_iter_draw);
 
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
-
-    glBindTexture(tex_attribs.target, 0);
+    if (tex_loc != -1) glBindTexture(tex_attribs.target, 0);
     wlr_texture_destroy(texture);
 }
-
 // --- Revised output_frame ---
 // Add a counter to tinywl_output if you don't have one for debugging
 /*
@@ -2034,7 +2348,7 @@ struct tinywl_output {
 #include <string.h>
 
 static pthread_mutex_t rdp_transmit_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int global_initial_frames_to_force_render = 5;
+
 
 struct scene_diagnostics_data {
     struct wlr_output *output;
@@ -2048,313 +2362,209 @@ struct scene_diagnostics_data {
 #include <string.h> // For memcpy if you use it, not directly in this function now
 
 
-/*
-static void output_frame(struct wl_listener *listener, void *data) {
-    struct tinywl_output *output_wrapper = wl_container_of(listener, output_wrapper, frame);
-    struct wlr_output *wlr_output = output_wrapper->wlr_output;
-    struct tinywl_server *server = output_wrapper->server;
-    struct wlr_scene *scene = server->scene;
 
-    // Early validation checks
-    if (wlr_output->frame_pending) {
-        return; // Skip logging for performance
-    }
-
-    if (!wlr_output->enabled || !wlr_output->renderer || !wlr_output->allocator) {
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(scene, wlr_output);
-        if (scene_output) {
-            wlr_scene_output_send_frame_done(scene_output, &now);
-        }
-        return;
-    }
-
-    struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(scene, wlr_output);
-    if (!scene_output) {
-        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] No scene_output found.", wlr_output->name);
-        if (wlr_output->enabled) {
-            wlr_output_schedule_frame(wlr_output);
-        }
-        return;
-    }
-
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-
-    if (!wlr_renderer_is_gles2(wlr_output->renderer)) {
-        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Renderer is not GLES2.", wlr_output->name);
-        wlr_scene_output_send_frame_done(scene_output, &now);
-        return;
-    }
-
-    bool use_custom_shader = (server->shader_program != 0);
-
-    // Initialize damage region and output state
-    pixman_region32_t damage;
-    pixman_region32_init(&damage);
-    struct wlr_output_state state;
-    wlr_output_state_init(&state);
-
-    // Build scene output state with damage detection
-    struct wlr_scene_output_state_options options = {0};
-    // Note: damage tracking may not be available in this wlroots version
+// STEP 2: Add this debug function to check scene state during rendering
+void debug_scene_rendering(struct wlr_scene *scene, struct wlr_output *output) {
+    wlr_log(WLR_INFO, "[RENDER_DEBUG:%s] === SCENE RENDERING DEBUG ===", output->name);
     
-    bool has_damage = wlr_scene_output_build_state(scene_output, &state, &options);
-
-    if (!use_custom_shader) {
-        // Standard rendering path - optimized
-        if (!has_damage) {
-            // No damage, skip render (this saves significant performance)
-            pixman_region32_fini(&damage);
-            wlr_output_state_finish(&state);
-            wlr_scene_output_send_frame_done(scene_output, &now);
-            return;
-        }
-
-        // Transmit the built buffer
-        if (state.committed & WLR_OUTPUT_STATE_BUFFER && state.buffer &&
-            state.buffer->width > 0 && state.buffer->height > 0) {
-            
-            pthread_mutex_lock(&rdp_transmit_mutex);
-            struct wlr_buffer *locked_buffer = wlr_buffer_lock(state.buffer);
-            if (locked_buffer) {
-                rdp_transmit_surface(locked_buffer);
-                wlr_buffer_unlock(locked_buffer);
-            }
-            pthread_mutex_unlock(&rdp_transmit_mutex);
+    int total_nodes = 0, enabled_nodes = 0, rect_nodes = 0;
+    struct wlr_scene_node *node;
+    
+    wl_list_for_each(node, &scene->tree.children, link) {
+        total_nodes++;
+        if (node->enabled) enabled_nodes++;
+        
+        const char *type_str = "UNKNOWN";
+        switch (node->type) {
+            case WLR_SCENE_NODE_TREE: type_str = "TREE"; break;
+            case WLR_SCENE_NODE_RECT: 
+                type_str = "RECT"; 
+                rect_nodes++;
+                // Detailed rect info
+                struct wlr_scene_rect *rect = wlr_scene_rect_from_node(node);
+                wlr_log(WLR_INFO, "[RENDER_DEBUG:%s] RECT found: %dx%d at (%d,%d), enabled=%d, color=(%.2f,%.2f,%.2f,%.2f)",
+                        output->name, rect->width, rect->height, node->x, node->y, node->enabled,
+                        rect->color[0], rect->color[1], rect->color[2], rect->color[3]);
+                break;
+            case WLR_SCENE_NODE_BUFFER: type_str = "BUFFER"; break;
         }
         
-        pixman_region32_fini(&damage);
-        wlr_output_state_finish(&state);
-        wlr_scene_output_send_frame_done(scene_output, &now);
+        wlr_log(WLR_INFO, "[RENDER_DEBUG:%s] Node: type=%s, pos=(%d,%d), enabled=%d", 
+                output->name, type_str, node->x, node->y, node->enabled);
+    }
+    
+    wlr_log(WLR_INFO, "[RENDER_DEBUG:%s] Summary: total=%d, enabled=%d, rects=%d", 
+            output->name, total_nodes, enabled_nodes, rect_nodes);
+    wlr_log(WLR_INFO, "[RENDER_DEBUG:%s] === SCENE RENDERING DEBUG END ===", output->name);
+}
+
+// STEP 3: Check if you're bypassing scene rendering entirely
+// Add this to your output_frame function RIGHT AFTER the scene_output check:
+void check_scene_bypass_issue(struct wlr_scene_output *scene_output, struct wlr_output *output) {
+    wlr_log(WLR_INFO, "[BYPASS_CHECK:%s] Scene output: %p", output->name, (void*)scene_output);
+    
+    // Check if you're using wlr_scene_output_commit properly
+    // This is CRITICAL - if you're not using this, scene rects won't render
+    
+    // In your output_frame, you should be doing:
+    // bool scene_commit_result = wlr_scene_output_commit(scene_output, NULL);
+    // wlr_log(WLR_INFO, "[BYPASS_CHECK:%s] Scene commit result: %d", output->name, scene_commit_result);
+    
+    wlr_log(WLR_INFO, "[BYPASS_CHECK:%s] If you see this but no rectangles, you might be bypassing scene rendering", output->name);
+}
+
+static void render_rect_node(struct wlr_scene_node *node, void *user_data) {
+     struct render_data *rdata = user_data; // rdata still useful for output, server
+    struct wlr_output *output = rdata->output;
+    struct tinywl_server *server = rdata->server;
+
+    if (node->type != WLR_SCENE_NODE_RECT || !node->enabled) {
+        return;
+    }
+    struct wlr_scene_rect *scene_rect = wlr_scene_rect_from_node(node);
+
+    int sx = node->x; // Assuming these are layout coordinates for the current output
+    int sy = node->y;
+
+    wlr_log(WLR_INFO, "[RECT_NODE_RENDER:%s] Rendering RECT %dx%d at layout_pos(%d,%d) with DEDICATED RECT SHADER. Color (%.2f, %.2f, %.2f, %.2f)",
+            output->name, scene_rect->width, scene_rect->height, sx, sy,
+            scene_rect->color[0], scene_rect->color[1], scene_rect->color[2], scene_rect->color[3]);
+
+    if (output->width == 0 || output->height == 0) return;
+    if (server->rect_shader_program == 0) {
+        wlr_log(WLR_ERROR, "Rect shader program is 0, cannot render rect.");
         return;
     }
 
-    // --- Custom Shader Path - Optimized ---
-    
-    // Optimized animation check - only check when we might have animations
-    bool needs_render_this_frame = has_damage || (global_initial_frames_to_force_render > 0);
-    
-    if (!needs_render_this_frame) {
-        // Only check animations if we haven't already determined we need to render
-        struct tinywl_toplevel *tl_iter;
-        wl_list_for_each(tl_iter, &server->toplevels, link) {
-            if (tl_iter->is_animating && tl_iter->xdg_toplevel &&
-                tl_iter->xdg_toplevel->base && tl_iter->xdg_toplevel->base->surface &&
-                tl_iter->xdg_toplevel->base->surface->mapped) {
-                needs_render_this_frame = true;
-                break; // Early exit once we find one animation
-            }
-        }
-    }
+    // Activate the rectangle shader
+    glUseProgram(server->rect_shader_program);
+    // VAO (server->quad_vao) is assumed to be bound by output_frame
 
-    if (global_initial_frames_to_force_render > 0) {
-        needs_render_this_frame = true;
-        global_initial_frames_to_force_render--;
-    }
-    
-    if (!needs_render_this_frame) {
-        pixman_region32_fini(&damage);
-        wlr_output_state_finish(&state);
-        wlr_scene_output_send_frame_done(scene_output, &now);
-        return;
-    }
+    float mvp[9];
+    wlr_matrix_identity(mvp);
 
-    // Clean up the build state since we're doing custom rendering
-    wlr_output_state_finish(&state);
+    float box_scale_x = (float)scene_rect->width * (2.0f / output->width);
+    float box_scale_y = (float)scene_rect->height * (-2.0f / output->height);
+    float box_translate_x = ((float)sx / output->width) * 2.0f - 1.0f;
+    float box_translate_y = ((float)sy / output->height) * -2.0f + 1.0f;
 
-    // Create new state for custom rendering
-    struct wlr_output_state custom_state;
-    wlr_output_state_init(&custom_state);
-    
-    // Use actual damage region instead of full screen when possible
-    if (pixman_region32_not_empty(&damage)) {
-        wlr_output_state_set_damage(&custom_state, &damage);
-    } else {
-        pixman_region32_t full_damage;
-        pixman_region32_init_rect(&full_damage, 0, 0, wlr_output->width, wlr_output->height);
-        wlr_output_state_set_damage(&custom_state, &full_damage);
-        pixman_region32_fini(&full_damage);
-    }
-
-    struct wlr_render_pass *pass = wlr_output_begin_render_pass(wlr_output, &custom_state, NULL);
-    if (!pass) {
-        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] wlr_output_begin_render_pass FAILED.", wlr_output->name);
-        pixman_region32_fini(&damage);
-        wlr_output_state_finish(&custom_state);
-        wlr_scene_output_send_frame_done(scene_output, &now);
-        return;
-    }
-
-    // Minimize GL state changes - set clear color once at startup, not every frame
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    struct render_data rdata = {
-        .renderer = server->renderer,
-        .shader_program = server->shader_program,
-        .server = server,
-        .output = wlr_output,
-        .pass = pass 
+    float base_mvp[9] = {
+        box_scale_x, 0.0f, 0.0f,
+        0.0f, box_scale_y, 0.0f,
+        box_translate_x, box_translate_y, 1.0f
     };
 
-    wlr_scene_node_for_each_buffer(&scene->tree.node, scene_buffer_iterator, &rdata);
-    
-    // Check GL errors only in debug builds
-    #ifdef DEBUG
-    GLenum gl_error = glGetError();
-    if (gl_error != GL_NO_ERROR) {
-        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] GL error: 0x%x", wlr_output->name, gl_error);
-    }
-    #endif
-
-    if (!wlr_render_pass_submit(pass)) {
-        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] wlr_render_pass_submit FAILED.", wlr_output->name);
+    if (output->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+        float output_transform_matrix[9];
+        wlr_matrix_identity(output_transform_matrix);
+        wlr_matrix_transform(output_transform_matrix, output->transform);
+        wlr_matrix_multiply(mvp, output_transform_matrix, base_mvp);
+    } else {
+        memcpy(mvp, base_mvp, sizeof(base_mvp));
     }
 
-    // Transmit the custom rendered buffer
-    if (custom_state.committed & WLR_OUTPUT_STATE_BUFFER && custom_state.buffer &&
-        custom_state.buffer->width > 0 && custom_state.buffer->height > 0) {
-        
-        pthread_mutex_lock(&rdp_transmit_mutex);
-        struct wlr_buffer *locked_buffer = wlr_buffer_lock(custom_state.buffer);
-        if (locked_buffer) {
-            rdp_transmit_surface(locked_buffer);
-            wlr_buffer_unlock(locked_buffer);
+    // Set uniforms for the RECT shader
+    if (server->rect_shader_mvp_loc != -1) {
+        glUniformMatrix3fv(server->rect_shader_mvp_loc, 1, GL_FALSE, mvp);
+    } else {
+        wlr_log(WLR_ERROR, "Rect shader MVP uniform location is -1!");
+    }
+
+    if (server->rect_shader_color_loc != -1) {
+        // scene_rect->color is float[4] {r,g,b,a}
+        glUniform4fv(server->rect_shader_color_loc, 1, scene_rect->color);
+    } else {
+        wlr_log(WLR_ERROR, "Rect shader color uniform location is -1!");
+    }
+
+     if (server->rect_shader_time_loc != -1) {
+        struct timespec current_render_time_spec;
+        clock_gettime(CLOCK_MONOTONIC, &current_render_time_spec);
+        float time_value_sec = (float)current_render_time_spec.tv_sec +
+                               (float)current_render_time_spec.tv_nsec / 1e9f;
+
+        // Optional: Log the time value being set, less frequently
+        static float last_logged_rect_time_val = 0.0f; // Static to persist across calls
+        if (fabs(time_value_sec - last_logged_rect_time_val) > 0.5f || last_logged_rect_time_val == 0.0f) {
+            wlr_log(WLR_INFO, "[render_rect_node] Setting 'time' (loc %d) to %.3f for rect on output %s",
+                server->rect_shader_time_loc, time_value_sec, output->name);
+            last_logged_rect_time_val = time_value_sec;
         }
-        pthread_mutex_unlock(&rdp_transmit_mutex);
+
+        glUniform1f(server->rect_shader_time_loc, time_value_sec); // *** THIS IS THE ACTUAL SETTING OF THE UNIFORM ***
+        GLenum err_after_time_uniform = glGetError();
+        if (err_after_time_uniform != GL_NO_ERROR) {
+            wlr_log(WLR_ERROR, "[render_rect_node] GL error AFTER glUniform1f(time): 0x%x", err_after_time_uniform);
+        }
+    } else {
+        // This log is correct: if rect_shader_time_loc is -1, we can't set it.
+        // This indicates an issue in create_rect_shader_program or the shader source.
+        wlr_log(WLR_ERROR, "[render_rect_node] Rect shader 'time' uniform location is -1! Cannot set time.");
     }
 
-    // Cleanup
-    pixman_region32_fini(&damage);
-    wlr_output_state_finish(&custom_state);
-    wlr_scene_output_send_frame_done(scene_output, &now);
-}*/
+    if (server->rect_shader_resolution_loc != -1) {
+        float resolution_vec[2] = {(float)output->width, (float)output->height};
+        glUniform2fv(server->rect_shader_resolution_loc, 1, resolution_vec);
+    } else {
+        // Log error if you haven't already in create_rect_shader_program
+    }
+
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+
+    // Do NOT call glUseProgram(0) here; output_frame will switch or unbind later.
+}
+
 
 static void output_frame(struct wl_listener *listener, void *data) {
     struct tinywl_output *output_wrapper = wl_container_of(listener, output_wrapper, frame);
     struct wlr_output *wlr_output = output_wrapper->wlr_output;
     struct tinywl_server *server = output_wrapper->server;
     struct wlr_scene *scene = server->scene;
-
-    if (wlr_output->frame_pending) {
-        return;
-    }
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
 
     if (!wlr_output->enabled || !wlr_output->renderer || !wlr_output->allocator) {
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(scene, wlr_output);
-        if (scene_output) {
-            wlr_scene_output_send_frame_done(scene_output, &now);
-        }
+        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Output not ready.", wlr_output->name);
+        struct wlr_scene_output *scene_output_early_exit = wlr_scene_get_scene_output(scene, wlr_output);
+        if (scene_output_early_exit) wlr_scene_output_send_frame_done(scene_output_early_exit, &now);
         return;
     }
 
     struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(scene, wlr_output);
     if (!scene_output) {
-        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] No scene_output found.", wlr_output->name);
-        if (wlr_output->enabled) {
-            wlr_output_schedule_frame(wlr_output);
-        }
+        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] No scene_output.", wlr_output->name);
         return;
     }
 
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
+    debug_scene_rendering(scene, wlr_output);
 
-    if (!wlr_renderer_is_gles2(wlr_output->renderer)) {
-        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Renderer is not GLES2.", wlr_output->name);
-        wlr_scene_output_send_frame_done(scene_output, &now);
-        return;
-    }
-
-    bool use_custom_shader = (server->shader_program != 0);
-
-    pixman_region32_t damage;
-    pixman_region32_init(&damage);
     struct wlr_output_state state;
     wlr_output_state_init(&state);
 
-    struct wlr_scene_output_state_options options = {0};
-    bool has_damage = wlr_scene_output_build_state(scene_output, &state, &options);
+    struct wlr_scene_output_state_options opts = {0};
+    bool has_damage = wlr_scene_output_build_state(scene_output, &state, &opts);
 
-    if (!use_custom_shader) {
-        if (!has_damage) {
-            pixman_region32_fini(&damage);
-            wlr_output_state_finish(&state);
-            wlr_scene_output_send_frame_done(scene_output, &now);
-            return;
-        }
-
-        if (state.committed & WLR_OUTPUT_STATE_BUFFER && state.buffer &&
-            state.buffer->width > 0 && state.buffer->height > 0) {
-            pthread_mutex_lock(&rdp_transmit_mutex);
-            struct wlr_buffer *locked_buffer = wlr_buffer_lock(state.buffer);
-            if (locked_buffer) {
-                rdp_transmit_surface(locked_buffer);
-                wlr_buffer_unlock(locked_buffer);
-            }
-            pthread_mutex_lock(&rdp_transmit_mutex);
-        }
-
-        pixman_region32_fini(&damage);
+    if (!has_damage && !(state.committed & WLR_OUTPUT_STATE_BUFFER)) {
+        wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] No damage or buffer, skipping render.", wlr_output->name);
         wlr_output_state_finish(&state);
         wlr_scene_output_send_frame_done(scene_output, &now);
         return;
     }
 
-    // --- Custom Shader Path ---
-    bool needs_render_this_frame = has_damage || (global_initial_frames_to_force_render > 0);
-    if (!needs_render_this_frame) {
-        struct tinywl_toplevel *tl_iter;
-        wl_list_for_each(tl_iter, &server->toplevels, link) {
-            if (tl_iter->is_animating && tl_iter->xdg_toplevel &&
-                tl_iter->xdg_toplevel->base && tl_iter->xdg_toplevel->base->surface &&
-                tl_iter->xdg_toplevel->base->surface->mapped) {
-                needs_render_this_frame = true;
-                break;
-            }
-        }
-    }
+    pixman_region32_t full_damage_region;
+    pixman_region32_init_rect(&full_damage_region, 0, 0, wlr_output->width, wlr_output->height);
+    wlr_output_state_set_damage(&state, &full_damage_region);
+    pixman_region32_fini(&full_damage_region);
 
-    if (global_initial_frames_to_force_render > 0) {
-        needs_render_this_frame = true;
-        global_initial_frames_to_force_render--;
-    }
-
-    if (!needs_render_this_frame) {
-        pixman_region32_fini(&damage);
-        wlr_output_state_finish(&state);
-        wlr_scene_output_send_frame_done(scene_output, &now);
-        return;
-    }
-
-    wlr_output_state_finish(&state);
-
-    struct wlr_output_state custom_state;
-    wlr_output_state_init(&custom_state);
-
-    if (pixman_region32_not_empty(&damage)) {
-        wlr_output_state_set_damage(&custom_state, &damage);
-    } else {
-        pixman_region32_t full_damage;
-        pixman_region32_init_rect(&full_damage, 0, 0, wlr_output->width, wlr_output->height);
-        wlr_output_state_set_damage(&custom_state, &full_damage);
-        pixman_region32_fini(&full_damage);
-    }
-
-    struct wlr_render_pass *pass = wlr_output_begin_render_pass(wlr_output, &custom_state, NULL);
+    struct wlr_render_pass *pass = wlr_output_begin_render_pass(wlr_output, &state, NULL);
     if (!pass) {
-        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] wlr_output_begin_render_pass FAILED.", wlr_output->name);
-        pixman_region32_fini(&damage);
-        wlr_output_state_finish(&custom_state);
+        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] wlr_output_begin_render_pass failed.", wlr_output->name);
+        wlr_output_state_finish(&state);
         wlr_scene_output_send_frame_done(scene_output, &now);
         return;
     }
 
-//glClearColor(0.2f, 0.2f, 0.2f, 0.2f);
-    // Set up GL state once per frame
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     glViewport(0, 0, wlr_output->width, wlr_output->height);
     glScissor(0, 0, wlr_output->width, wlr_output->height);
@@ -2363,50 +2573,87 @@ static void output_frame(struct wl_listener *listener, void *data) {
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     glDisable(GL_CULL_FACE);
     glDisable(GL_DEPTH_TEST);
-    glDepthMask(GL_TRUE);
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glUseProgram(server->shader_program);
-    glBindVertexArray(server->quad_vao);
-    glBindBuffer(GL_ARRAY_BUFFER, server->quad_vbo);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, server->quad_ibo);
 
-    struct render_data rdata = {
-        .renderer = server->renderer,
-        .shader_program = server->shader_program,
-        .server = server,
-        .output = wlr_output,
-        .pass = pass
-    };
+    if (server->quad_vao == 0) {
+         wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Quad VAO is zero! Skipping custom draw.", wlr_output->name);
+    } else {
+        glBindVertexArray(server->quad_vao); // Bind VAO once for all quad draws
 
-    wlr_scene_node_for_each_buffer(&scene->tree.node, scene_buffer_iterator, &rdata);
+        struct render_data rdata = {
+            .renderer = server->renderer,
+            // .shader_program is not strictly needed in rdata if iterators use server-> specific shaders
+            .server = server,
+            .output = wlr_output,
+            .pass = pass
+        };
 
-    // Reset GL state
-    glBindVertexArray(0);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-    glUseProgram(0);
+        // 1. Render Rectangles using the dedicated rect_shader_program
+        // render_rect_node will internally call glUseProgram(server->rect_shader_program)
+        if (server->rect_shader_program != 0) {
+            wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Iterating scene children for RECTS (using rect shader)", wlr_output->name);
+            struct wlr_scene_node *child_node;
+            wl_list_for_each(child_node, &scene->tree.children, link) {
+                if (child_node->type == WLR_SCENE_NODE_RECT) {
+                    render_rect_node(child_node, &rdata);
+                } else if (child_node->type == WLR_SCENE_NODE_TREE) {
+                    struct wlr_scene_node *sub_child_node;
+                    struct wlr_scene_tree *sub_tree = wlr_scene_tree_from_node(child_node);
+                    wl_list_for_each(sub_child_node, &sub_tree->children, link) {
+                        if (sub_child_node->type == WLR_SCENE_NODE_RECT) {
+                             render_rect_node(sub_child_node, &rdata);
+                        }
+                    }
+                }
+            }
+        } else {
+            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Rect shader program is 0, skipping rect rendering.", wlr_output->name);
+        }
+
+        // 2. Render client window buffers (WLR_SCENE_NODE_BUFFER) using the flame shader
+        // Ensure flame shader is active for buffers
+        if (server->shader_program != 0) { // shader_program is the flame shader
+            glUseProgram(server->shader_program);
+
+            wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Iterating for BUFFERS (client windows, using flame shader)", wlr_output->name);
+            wlr_scene_node_for_each_buffer(&scene->tree.node, scene_buffer_iterator, &rdata);
+            // scene_buffer_iterator uses uniforms from server->flame_shader_..._loc
+        } else {
+            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Flame shader program (shader_program) is 0, skipping buffer rendering.", wlr_output->name);
+        }
+
+        glBindVertexArray(0); // Unbind VAO
+        glUseProgram(0);      // Unbind any shader program
+    }
+
     glDisable(GL_SCISSOR_TEST);
 
     if (!wlr_render_pass_submit(pass)) {
-        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] wlr_render_pass_submit FAILED.", wlr_output->name);
+        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] wlr_render_pass_submit failed.", wlr_output->name);
     }
 
-    if (custom_state.committed & WLR_OUTPUT_STATE_BUFFER && custom_state.buffer &&
-        custom_state.buffer->width > 0 && custom_state.buffer->height > 0) {
+    GLenum gl_err = glGetError();
+    if (gl_err != GL_NO_ERROR) {
+        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] GL error after render pass submit: 0x%x", wlr_output->name, gl_err);
+    }
+
+    if (state.committed & WLR_OUTPUT_STATE_BUFFER && state.buffer &&
+        state.buffer->width > 0 && state.buffer->height > 0) {
         pthread_mutex_lock(&rdp_transmit_mutex);
-        struct wlr_buffer *locked_buffer = wlr_buffer_lock(custom_state.buffer);
+        struct wlr_buffer *locked_buffer = wlr_buffer_lock(state.buffer);
         if (locked_buffer) {
             rdp_transmit_surface(locked_buffer);
             wlr_buffer_unlock(locked_buffer);
+        } else {
+            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to lock buffer for RDP transmission.", wlr_output->name);
         }
         pthread_mutex_unlock(&rdp_transmit_mutex);
+    } else {
+        wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] No buffer to transmit or buffer invalid.", wlr_output->name);
     }
 
-    pixman_region32_fini(&damage);
-    wlr_output_state_finish(&custom_state);
+    wlr_output_state_finish(&state);
     wlr_scene_output_send_frame_done(scene_output, &now);
 }
-
 static void output_request_state(struct wl_listener *listener, void *data) {
     struct tinywl_output *output = wl_container_of(listener, output, request_state);
     const struct wlr_output_event_request_state *event = data;
@@ -2702,31 +2949,34 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
     wlr_log(WLR_ERROR, "!!!!!!!!!! XDG_TOPLEVEL_MAP FINISHED (CUSTOM PATH ACTIVE) for toplevel %p !!!!!!!!!!", (void*)toplevel);
 }*/
 
+#include <time.h> // For clock_gettime, ensure this is included
+
+
+
+#include <time.h> // For clock_gettime, ensure this is included
+#include <math.h>   // For fmaxf, fminf
+
+
+
+
+
 static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
-    struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, unmap);
-    wlr_log(WLR_INFO, "Unmapping XDG toplevel: %p", toplevel->xdg_toplevel);
+    struct tinywl_toplevel *toplevel_wrapper = wl_container_of(listener, toplevel_wrapper, unmap);
+    if (!toplevel_wrapper || !toplevel_wrapper->xdg_toplevel) return;
+    const char *title = toplevel_wrapper->xdg_toplevel->title ? toplevel_wrapper->xdg_toplevel->title : "N/A";
 
-    // Start minimize animation (zoom out to 0)
-    toplevel->is_animating = true;
-    toplevel->scale = 1.0f; // Start at normal size
-    toplevel->target_scale = 0.0f; // End at zero size
-    toplevel->animation_duration = 0.3f; // 300ms
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    toplevel->animation_start = now.tv_sec + now.tv_nsec / 1e9;
+    wlr_log(WLR_ERROR, "[UNMAP SUPER DEBUG RECT:%s Ptr:%p] Event received.", title, toplevel_wrapper);
 
-    if (toplevel == toplevel->server->grabbed_toplevel) {
-        reset_cursor_mode(toplevel->server);
+    // For this test, unmap does very little. Destroy will handle the debug rect.
+    toplevel_wrapper->is_animating = false;
+    toplevel_wrapper->pending_destroy = false; // It won't be destroyed by iterator
+
+    if (toplevel_wrapper->scene_tree && !toplevel_wrapper->scene_tree->node.enabled) {
+        wlr_scene_node_set_enabled(&toplevel_wrapper->scene_tree->node, true);
     }
-
-    // Keep the toplevel in the list until animation completes
-    // Defer wl_list_remove(&toplevel->link) to xdg_toplevel_destroy
+    struct tinywl_output *out;
+    wl_list_for_each(out, &toplevel_wrapper->server->outputs, link) { wlr_output_schedule_frame(out->wlr_output); }
 }
-
-// In tinywl.c
-
-// Ensure you have these includes at the top:
-// #include <wlr/types/wlr_scene.h> // For wlr_scene_get_scene_output
 static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
     struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, commit);
     struct wlr_surface *surface = toplevel->xdg_toplevel->base->surface;
@@ -2767,33 +3017,139 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
 }
 
 
+
+
+
+
+
+
 static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
-    struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, destroy);
-    wlr_log(WLR_DEBUG, "Destroying toplevel %p", toplevel);
+    struct tinywl_toplevel *toplevel_wrapper = wl_container_of(listener, toplevel_wrapper, destroy);
+    // Capture the pointer from the wrapper BEFORE it might be nulled by this function.
+    // This is the wlroots resource whose listeners we need to clean up.
+    struct wlr_xdg_toplevel *wlroots_resource_to_clean_listeners_from = toplevel_wrapper ? toplevel_wrapper->xdg_toplevel : NULL;
 
-    // Remove from server toplevels list
-    wl_list_remove(&toplevel->link);
-
-    // Remove listeners
-    wl_list_remove(&toplevel->map.link);
-    wl_list_remove(&toplevel->unmap.link);
-    wl_list_remove(&toplevel->commit.link);
-    wl_list_remove(&toplevel->destroy.link);
-    wl_list_remove(&toplevel->request_move.link);
-    wl_list_remove(&toplevel->request_resize.link);
-    wl_list_remove(&toplevel->request_maximize.link);
-    wl_list_remove(&toplevel->request_fullscreen.link);
-
-    // Destroy scene tree
-    if (toplevel->scene_tree) {
-        wlr_scene_node_destroy(&toplevel->scene_tree->node);
+    if (!toplevel_wrapper) {
+        wlr_log(WLR_ERROR, "[DESTROY KEEP ALIVE:%p] wl_container_of NULL! Listener %p, Data %p. Removing listener.",
+                toplevel_wrapper, listener, data);
+        if (listener && listener->link.next) { wl_list_remove(&listener->link); }
+        if (listener) { wl_list_init(&listener->link); }
+        return;
     }
 
-    // Free toplevel
-    free(toplevel);
-    wlr_log(WLR_DEBUG, "Toplevel %p freed", toplevel);
-}
+    char title_buffer[128];
+    if (wlroots_resource_to_clean_listeners_from && wlroots_resource_to_clean_listeners_from->title) {
+        strncpy(title_buffer, wlroots_resource_to_clean_listeners_from->title, sizeof(title_buffer) - 1);
+        title_buffer[sizeof(title_buffer) - 1] = '\0';
+    } else {
+        snprintf(title_buffer, sizeof(title_buffer), "WrapperPtr:%p (Initial XDG Ptr %p)",
+                 toplevel_wrapper, wlroots_resource_to_clean_listeners_from);
+    }
 
+    wlr_log(WLR_ERROR, "[DESTROY KEEP ALIVE:%s] Listener called. Wrapper Ptr:%p. XDG Ptr in wrapper (pre-null):%p. WLRoots 'data' arg Ptr:%p. Initial state: Anim:%d, Scale:%.2f, Target:%.2f, PendingD:%d",
+            title_buffer, toplevel_wrapper, wlroots_resource_to_clean_listeners_from, data,
+            toplevel_wrapper->is_animating, toplevel_wrapper->scale, toplevel_wrapper->target_scale, toplevel_wrapper->pending_destroy);
+
+    // If the wrapper's xdg_toplevel field is already NULL, it means this destroy sequence
+    // for this *wrapper* was already handled. The listener should have been removed.
+    if (!wlroots_resource_to_clean_listeners_from) { // Same as !toplevel_wrapper->xdg_toplevel
+        wlr_log(WLR_INFO, "[DESTROY KEEP ALIVE:%s] Wrapper's xdg_toplevel already NULL. Listener %p should have been removed.", title_buffer, listener);
+        if (listener == &toplevel_wrapper->destroy) {
+             if (toplevel_wrapper->destroy.link.next) wl_list_remove(&toplevel_wrapper->destroy.link);
+             wl_list_init(&toplevel_wrapper->destroy.link);
+        }
+        return;
+    }
+
+    // Sanity check: if wlroots provides 'data', it should match the resource our listener was for.
+    // The logs show 'data' is NULL, so this check might not be hit, but it's good for robustness.
+    if (data != NULL && (struct wlr_xdg_toplevel *)data != wlroots_resource_to_clean_listeners_from) {
+         wlr_log(WLR_ERROR, "[DESTROY KEEP ALIVE:%s] MISMATCH: Wrapper XDG %p, signal data XDG %p. Removing listener %p.",
+                title_buffer, wlroots_resource_to_clean_listeners_from, data, listener);
+        if (listener == &toplevel_wrapper->destroy && toplevel_wrapper->destroy.link.next) {
+            wl_list_remove(&toplevel_wrapper->destroy.link);
+        }
+        wl_list_init(&toplevel_wrapper->destroy.link);
+        return;
+    }
+
+    // --- CRITICAL: Remove ALL listeners from the dying wlroots_xdg_resource_being_destroyed_ref ---
+    wlr_log(WLR_INFO, "[DESTROY KEEP ALIVE:%s] Removing ALL listeners from wlr_xdg_toplevel Ptr:%p.", title_buffer, wlroots_resource_to_clean_listeners_from);
+
+    // Check if link is valid (i.e., part of a list) before removing, then re-initialize.
+    if (toplevel_wrapper->map.link.next) { wl_list_remove(&toplevel_wrapper->map.link); }
+    wl_list_init(&toplevel_wrapper->map.link);
+
+    if (toplevel_wrapper->unmap.link.next) { wl_list_remove(&toplevel_wrapper->unmap.link); }
+    wl_list_init(&toplevel_wrapper->unmap.link);
+
+    if (toplevel_wrapper->commit.link.next) { wl_list_remove(&toplevel_wrapper->commit.link); }
+    wl_list_init(&toplevel_wrapper->commit.link);
+
+    if (toplevel_wrapper->request_move.link.next) { wl_list_remove(&toplevel_wrapper->request_move.link); }
+    wl_list_init(&toplevel_wrapper->request_move.link);
+
+    if (toplevel_wrapper->request_resize.link.next) { wl_list_remove(&toplevel_wrapper->request_resize.link); }
+    wl_list_init(&toplevel_wrapper->request_resize.link);
+
+    if (toplevel_wrapper->request_maximize.link.next) { wl_list_remove(&toplevel_wrapper->request_maximize.link); }
+    wl_list_init(&toplevel_wrapper->request_maximize.link);
+
+    if (toplevel_wrapper->request_fullscreen.link.next) { wl_list_remove(&toplevel_wrapper->request_fullscreen.link); }
+    wl_list_init(&toplevel_wrapper->request_fullscreen.link);
+
+    // Remove this 'destroy' listener itself.
+    if (listener == &toplevel_wrapper->destroy) { // Ensure 'listener' is indeed our 'destroy' member
+        if (toplevel_wrapper->destroy.link.next) { // Check if it's actually in a list
+            wl_list_remove(&toplevel_wrapper->destroy.link);
+            wlr_log(WLR_DEBUG, "[DESTROY KEEP ALIVE:%s] Self 'destroy' listener link removed.", title_buffer);
+        }
+        wl_list_init(&toplevel_wrapper->destroy.link); // Always re-init to a safe state
+    } else {
+        wlr_log(WLR_ERROR, "[DESTROY KEEP ALIVE:%s] Listener argument %p does not match &toplevel_wrapper->destroy %p! Cannot reliably remove self listener by that path.",
+                title_buffer, listener, &toplevel_wrapper->destroy);
+    }
+    // --- End of listener removal ---
+
+
+    // Cooperate with the debug state potentially set by unmap.
+    // For this SUPER DEBUG, we want to force scale to 0.1 and pending_destroy to false.
+    if (toplevel_wrapper->is_animating && toplevel_wrapper->target_scale == 0.1f && !toplevel_wrapper->pending_destroy) {
+        wlr_log(WLR_INFO, "[DESTROY SUPER DEBUG KEEP ALIVE:%s] Unmap already set debug state (target 0.1, pending_destroy false). Preserving.", title_buffer);
+        // Scale and animation_start were set by unmap. Keep them.
+        // pending_destroy is already false.
+    } else {
+        // If unmap didn't set it, or set it to something else, force our debug state here.
+        wlr_log(WLR_ERROR, "[DESTROY SUPER DEBUG KEEP ALIVE:%s] Forcing static small scale state (0.1).", title_buffer);
+        toplevel_wrapper->is_animating = true;     // Set to true to make iterator process it once
+        toplevel_wrapper->scale        = 0.1f;
+        toplevel_wrapper->target_scale = 0.1f;
+        toplevel_wrapper->animation_duration = 0.001f; // To make it "finish" to static quickly
+        toplevel_wrapper->animation_start = get_monotonic_time_seconds_as_float();
+        toplevel_wrapper->pending_destroy = false; // CRITICAL FOR DEBUG: DO NOT CLEAN UP
+    }
+
+
+    if (toplevel_wrapper->scene_tree) {
+        if (!toplevel_wrapper->scene_tree->node.enabled) {
+            wlr_scene_node_set_enabled(&toplevel_wrapper->scene_tree->node, true);
+            wlr_log(WLR_ERROR, "[DESTROY SUPER DEBUG KEEP ALIVE:%s] Scene node RE-ENABLED.", title_buffer);
+        }
+    } else {
+        wlr_log(WLR_ERROR, "[DESTROY SUPER DEBUG KEEP ALIVE:%s] No scene_tree!", title_buffer);
+    }
+
+    wlr_log(WLR_ERROR, "[DESTROY SUPER DEBUG KEEP ALIVE:%s] Setting wrapper's xdg_toplevel field to NULL.", title_buffer);
+    toplevel_wrapper->xdg_toplevel = NULL; // Decouple from the (now listener-less from our side) wlroots resource
+
+    struct tinywl_output *output_sched;
+    wl_list_for_each(output_sched, &toplevel_wrapper->server->outputs, link) {
+        if (output_sched && output_sched->wlr_output && output_sched->wlr_output->enabled) {
+            wlr_output_schedule_frame(output_sched->wlr_output);
+        }
+    }
+
+   }
 static void begin_interactive(struct tinywl_toplevel *toplevel, enum tinywl_cursor_mode mode, uint32_t edges) {
     struct tinywl_server *server = toplevel->server;
     server->grabbed_toplevel = toplevel;
@@ -3233,7 +3589,7 @@ server.backend = wlr_RDP_backend_create(server.wl_display);
         return 1;
     }
 
-   
+  
 
 const char *vendor = (const char *)glGetString(GL_VENDOR);
     const char *renderer = (const char *)glGetString(GL_RENDERER);
@@ -3253,6 +3609,12 @@ const char *vendor = (const char *)glGetString(GL_VENDOR);
         server_destroy(&server);
         return 1;
     }
+
+ if (!create_rect_shader_program(&server)) { // Create the new rect shader
+        wlr_log(WLR_ERROR, "Failed to create rect shader program");
+        server_destroy(&server); // server_destroy should also clean up rect_shader_program if it was partially created
+        return 1;
+    }   
 
 
    // In main(), after create_shader_program() and before wlr_allocator_autocreate()
@@ -3331,7 +3693,7 @@ const char *vendor = (const char *)glGetString(GL_VENDOR);
     }
 
 
-
+ 
     wlr_compositor_create(server.wl_display, 5, server.renderer);
     wlr_subcompositor_create(server.wl_display);
     wlr_data_device_manager_create(server.wl_display);
@@ -3381,6 +3743,9 @@ const char *vendor = (const char *)glGetString(GL_VENDOR);
     server.new_input.notify = server_new_input;
     wl_signal_add(&server.backend->events.new_input, &server.new_input);
  
+
+test_red_rectangle_alternative(&server);
+
     const char *socket = wl_display_add_socket_auto(server.wl_display);
     if (!socket) {
         wlr_log(WLR_ERROR, "Unable to create wayland socket");
