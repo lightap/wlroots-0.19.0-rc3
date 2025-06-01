@@ -1860,100 +1860,109 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
     wlr_log(WLR_DEBUG, "[SCENE_ITERATOR:%s] Drew main window for '%s'", output_name_log, tl_title_for_log);
 
     // --- Preview Rendering (kept from first version) ---
-    if (toplevel && server->top_panel_node && server->top_panel_node->enabled &&
-        texture) { // Ensure texture is still valid
+    // --- Preview Rendering (modified for sequential positioning) ---
+if (toplevel && server->top_panel_node && server->top_panel_node->enabled &&
+    texture) { // Ensure texture is still valid
 
-        bool should_preview_this_toplevel = false;
-        // Example: Preview only the toplevel whose title is "simple-egl"
-        if (toplevel->xdg_toplevel && toplevel->xdg_toplevel->title &&
-            strcmp(toplevel->xdg_toplevel->title, "simple-egl") == 0) {
-            should_preview_this_toplevel = true;
-        }
+    bool should_preview_this_toplevel = true;
+    
+    if (should_preview_this_toplevel) {
+        wlr_log(WLR_INFO, "[SCENE_ITERATOR_PREVIEW:%s] Rendering preview for '%s' onto panel.", output_name_log, tl_title_for_log);
+        struct wlr_scene_rect *panel_srect = wlr_scene_rect_from_node(server->top_panel_node);
 
-        if (should_preview_this_toplevel) {
-            wlr_log(WLR_INFO, "[SCENE_ITERATOR_PREVIEW:%s] Rendering preview for '%s' onto panel.", output_name_log, tl_title_for_log);
-            struct wlr_scene_rect *panel_srect = wlr_scene_rect_from_node(server->top_panel_node);
+        if (panel_srect) {
+            int panel_screen_x = server->top_panel_node->x;
+            int panel_screen_y = server->top_panel_node->y;
 
-            if (panel_srect) {
-                int panel_screen_x = server->top_panel_node->x;
-                int panel_screen_y = server->top_panel_node->y;
-
-                float preview_x_offset_in_panel = 20.0f;
-                float preview_y_padding_in_panel = 5.0f;
-                float preview_height_pixels = (float)panel_srect->height - 2.0f * preview_y_padding_in_panel;
-                if (preview_height_pixels < 1.0f) preview_height_pixels = 1.0f;
-
-                float aspect_ratio = (texture->width > 0 && texture->height > 0) ? (float)texture->width / (float)texture->height : 1.0f;
-                float preview_width_pixels = preview_height_pixels * aspect_ratio;
-                if (preview_width_pixels < 1.0f) preview_width_pixels = 1.0f;
-
-                if (preview_x_offset_in_panel + preview_width_pixels > panel_srect->width - 5.0f) {
-                    preview_width_pixels = panel_srect->width - 5.0f - preview_x_offset_in_panel;
-                    if (preview_width_pixels < 1.0f) preview_width_pixels = 0;
+            // Calculate this toplevel's index in the list
+            int toplevel_index = 0;
+            struct tinywl_toplevel *current_tl;
+            wl_list_for_each(current_tl, &server->toplevels, link) {
+                if (current_tl == toplevel) {
+                    break;
                 }
-
-                struct wlr_box preview_box_on_screen = {
-                    .x = (int)round((double)panel_screen_x + preview_x_offset_in_panel),
-                    .y = (int)round((double)panel_screen_y + preview_y_padding_in_panel),
-                    .width = (int)round(preview_width_pixels),
-                    .height = (int)round(preview_height_pixels),
-                };
-
-                if (preview_box_on_screen.width > 0 && preview_box_on_screen.height > 0) {
-                    float preview_mvp[9];
-                    float p_box_scale_x = (float)preview_box_on_screen.width * (2.0f / output->width);
-                    float p_box_scale_y = (float)preview_box_on_screen.height * (-2.0f / output->height);
-                    float p_box_translate_x = ((float)preview_box_on_screen.x / output->width) * 2.0f - 1.0f;
-                    float p_box_translate_y = ((float)preview_box_on_screen.y / output->height) * -2.0f + 1.0f;
-                    float p_model_view[9] = { p_box_scale_x, 0.0f, 0.0f, 0.0f, p_box_scale_y, 0.0f, p_box_translate_x, p_box_translate_y, 1.0f };
-
-                    memcpy(preview_mvp, p_model_view, sizeof(p_model_view));
-                    
-                    // Apply output transform to the preview MVP
-                    if (output->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
-                        float temp_preview_mvp[9];
-                        memcpy(temp_preview_mvp, preview_mvp, sizeof(preview_mvp));
-                        float output_transform_matrix[9];
-                        wlr_matrix_identity(output_transform_matrix);
-                        wlr_matrix_transform(output_transform_matrix, output->transform);
-                        wlr_matrix_multiply(preview_mvp, output_transform_matrix, temp_preview_mvp);
-                    }
-
-                    // Re-set uniforms for the preview draw call
-                    GLint preview_mvp_loc = glGetUniformLocation(server->shader_program, "mvp");
-                    if (preview_mvp_loc != -1) glUniformMatrix3fv(preview_mvp_loc, 1, GL_FALSE, preview_mvp);
-                    
-                    GLint preview_tex_loc = glGetUniformLocation(server->shader_program, "texture_sampler_uniform");
-                    if (preview_tex_loc != -1) {
-                        glActiveTexture(GL_TEXTURE0);
-                        glBindTexture(tex_attribs.target, tex_attribs.tex);
-                        glUniform1i(preview_tex_loc, 0);
-                    }
-
-                    // Set iResolution specifically for the preview's dimensions
-                    GLint preview_res_loc = glGetUniformLocation(server->shader_program, "iResolution");
-                    if (preview_res_loc != -1) {
-                        float preview_res_vec[2] = {(float)preview_box_on_screen.width, (float)preview_box_on_screen.height};
-                        glUniform2fv(preview_res_loc, 1, preview_res_vec);
-                    }
-
-                    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
-                    wlr_log(WLR_DEBUG, "[SCENE_ITERATOR_PREVIEW:%s] Drew preview for '%s' at %d,%d %dx%d",
-                           output_name_log, tl_title_for_log,
-                           preview_box_on_screen.x, preview_box_on_screen.y,
-                           preview_box_on_screen.width, preview_box_on_screen.height);
-
-                    // Restore iResolution for subsequent main window rendering
-                    if (preview_res_loc != -1) {
-                         float main_res_vec[2] = {(float)output->width, (float)output->height};
-                         glUniform2fv(preview_res_loc, 1, main_res_vec);
-                    }
-                }
-            } else {
-                wlr_log(WLR_ERROR, "[SCENE_ITERATOR_PREVIEW:%s] Panel node is not a wlr_scene_rect, cannot get dimensions.", output_name_log);
+                toplevel_index++;
             }
+
+            // Position each preview at 20-pixel intervals: 20, 40, 60, etc.
+            float preview_x_offset_in_panel = 20.0f + (toplevel_index * 100.0f);
+            float preview_y_padding_in_panel = 5.0f;
+            float preview_height_pixels = (float)panel_srect->height - 2.0f * preview_y_padding_in_panel;
+            if (preview_height_pixels < 1.0f) preview_height_pixels = 1.0f;
+
+            float aspect_ratio = (texture->width > 0 && texture->height > 0) ? (float)texture->width / (float)texture->height : 1.0f;
+            float preview_width_pixels = preview_height_pixels * aspect_ratio;
+            if (preview_width_pixels < 1.0f) preview_width_pixels = 1.0f;
+
+            // Check if preview fits within panel bounds
+            if (preview_x_offset_in_panel + preview_width_pixels > panel_srect->width - 5.0f) {
+                preview_width_pixels = panel_srect->width - 5.0f - preview_x_offset_in_panel;
+                if (preview_width_pixels < 1.0f) preview_width_pixels = 0;
+            }
+
+            struct wlr_box preview_box_on_screen = {
+                .x = (int)round((double)panel_screen_x + preview_x_offset_in_panel),
+                .y = (int)round((double)panel_screen_y + preview_y_padding_in_panel),
+                .width = (int)round(preview_width_pixels),
+                .height = (int)round(preview_height_pixels),
+            };
+
+            if (preview_box_on_screen.width > 0 && preview_box_on_screen.height > 0) {
+                // Rest of the preview rendering code remains the same...
+                float preview_mvp[9];
+                float p_box_scale_x = (float)preview_box_on_screen.width * (2.0f / output->width);
+                float p_box_scale_y = (float)preview_box_on_screen.height * (-2.0f / output->height);
+                float p_box_translate_x = ((float)preview_box_on_screen.x / output->width) * 2.0f - 1.0f;
+                float p_box_translate_y = ((float)preview_box_on_screen.y / output->height) * -2.0f + 1.0f;
+                float p_model_view[9] = { p_box_scale_x, 0.0f, 0.0f, 0.0f, p_box_scale_y, 0.0f, p_box_translate_x, p_box_translate_y, 1.0f };
+
+                memcpy(preview_mvp, p_model_view, sizeof(p_model_view));
+                
+                // Apply output transform to the preview MVP
+                if (output->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+                    float temp_preview_mvp[9];
+                    memcpy(temp_preview_mvp, preview_mvp, sizeof(preview_mvp));
+                    float output_transform_matrix[9];
+                    wlr_matrix_identity(output_transform_matrix);
+                    wlr_matrix_transform(output_transform_matrix, output->transform);
+                    wlr_matrix_multiply(preview_mvp, output_transform_matrix, temp_preview_mvp);
+                }
+
+                // Re-set uniforms for the preview draw call
+                GLint preview_mvp_loc = glGetUniformLocation(server->shader_program, "mvp");
+                if (preview_mvp_loc != -1) glUniformMatrix3fv(preview_mvp_loc, 1, GL_FALSE, preview_mvp);
+                
+                GLint preview_tex_loc = glGetUniformLocation(server->shader_program, "texture_sampler_uniform");
+                if (preview_tex_loc != -1) {
+                    glActiveTexture(GL_TEXTURE0);
+                    glBindTexture(tex_attribs.target, tex_attribs.tex);
+                    glUniform1i(preview_tex_loc, 0);
+                }
+
+                // Set iResolution specifically for the preview's dimensions
+                GLint preview_res_loc = glGetUniformLocation(server->shader_program, "iResolution");
+                if (preview_res_loc != -1) {
+                    float preview_res_vec[2] = {(float)preview_box_on_screen.width, (float)preview_box_on_screen.height};
+                    glUniform2fv(preview_res_loc, 1, preview_res_vec);
+                }
+
+                glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+                wlr_log(WLR_DEBUG, "[SCENE_ITERATOR_PREVIEW:%s] Drew preview #%d for '%s' at %d,%d %dx%d",
+                       output_name_log, toplevel_index, tl_title_for_log,
+                       preview_box_on_screen.x, preview_box_on_screen.y,
+                       preview_box_on_screen.width, preview_box_on_screen.height);
+
+                // Restore iResolution for subsequent main window rendering
+                if (preview_res_loc != -1) {
+                     float main_res_vec[2] = {(float)output->width, (float)output->height};
+                     glUniform2fv(preview_res_loc, 1, main_res_vec);
+                }
+            }
+        } else {
+            wlr_log(WLR_ERROR, "[SCENE_ITERATOR_PREVIEW:%s] Panel node is not a wlr_scene_rect, cannot get dimensions.", output_name_log);
         }
     }
+}
 
     // Cleanup like second version
     if (tex_loc != -1) {
