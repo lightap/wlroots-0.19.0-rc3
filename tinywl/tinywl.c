@@ -279,6 +279,21 @@ struct wl_listener pointer_motion;
     GLint rect_shader_time_loc;
     GLint rect_shader_resolution_loc; // New: for iResolution
 
+    // New: Panel Shader
+    GLuint panel_shader_program;
+    GLint panel_shader_mvp_loc;
+    GLint panel_shader_time_loc;
+    GLint panel_shader_base_color_loc; // u_panel_base_color
+    GLint panel_shader_resolution_loc;
+
+     // ADD THESE UNIFORM LOCATIONS FOR THE PANEL PREVIEW
+    GLint panel_shader_preview_tex_loc;
+    GLint panel_shader_is_preview_active_loc;
+    GLint panel_shader_preview_rect_loc;
+    GLint panel_shader_preview_tex_transform_loc;
+
+    // Pointer to the top panel's scene node for easy identification
+    struct wlr_scene_node *top_panel_node;
 
      // Custom shader program for animations
     GLint scale_uniform;  // Location of the scale uniform in the shader
@@ -302,6 +317,7 @@ struct tinywl_output {
     struct wl_event_source *timer; /* Added for timer access */
     struct wlr_scene_output *scene_output;
     bool rendering; 
+    struct wlr_texture *cached_texture;
 };
 
 enum tinywl_toplevel_type {
@@ -389,6 +405,12 @@ struct tinywl_popup {
     struct wl_list link;          // Link for list management
 };
 
+struct shader_uniform_spec {
+    const char *name;       // Name of the uniform in GLSL
+    GLint *location_ptr;  // Pointer to where the GLint location should be stored
+};
+
+
 /* Function declarations */
 //struct wlr_backend *wlr_RDP_backend_create(struct wl_display *display, struct wlr_egl *egl);
 //struct wlr_renderer *wlr_gles2_renderer_create_surfaceless(void);
@@ -401,7 +423,7 @@ static void process_cursor_motion(struct tinywl_server *server, uint32_t time);
 void check_scene_bypass_issue(struct wlr_scene_output *scene_output, struct wlr_output *output) ;
 void debug_scene_rendering(struct wlr_scene *scene, struct wlr_output *output) ;
 void debug_scene_tree(struct wlr_scene *scene, struct wlr_output *output);
-void test_red_rectangle_alternative(struct tinywl_server *server) ;
+void desktop_background(struct tinywl_server *server) ;
 
  float get_monotonic_time_seconds_as_float(void) ;
 static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer, int sx, int sy, void *user_data); // If not already declared
@@ -425,398 +447,124 @@ static GLuint compile_shader(GLenum type, const char *source) {
     return shader;
 }
 
-static bool create_shader_program(struct tinywl_server *server) {
-    struct wlr_egl *egl = wlr_gles2_renderer_get_egl(server->renderer);
-    GLenum err;
+
+
+static bool create_generic_shader_program(
+    struct wlr_renderer *renderer,
+    const char *shader_name_for_log,
+    const char *vertex_src,
+    const char *fragment_src,
+    GLuint *program_id_out,
+    struct shader_uniform_spec *uniforms_to_get,
+    int num_uniforms_to_get
+) {
+    if (!renderer || !program_id_out || !vertex_src || !fragment_src) {
+        wlr_log(WLR_ERROR, "Invalid NULL arguments to create_generic_shader_program for %s", shader_name_for_log);
+        if (program_id_out) *program_id_out = 0;
+        return false;
+    }
+    if (num_uniforms_to_get > 0 && !uniforms_to_get) {
+        wlr_log(WLR_ERROR, "uniforms_to_get is NULL but num_uniforms_to_get is > 0 for %s", shader_name_for_log);
+        *program_id_out = 0;
+        return false;
+    }
+
+    *program_id_out = 0; // Initialize output
+
+    struct wlr_egl *egl = wlr_gles2_renderer_get_egl(renderer);
     if (!egl) {
-        wlr_log(WLR_ERROR, "No EGL context available for renderer");
+        wlr_log(WLR_ERROR, "Failed to get EGL context for %s shader", shader_name_for_log);
         return false;
     }
 
-    if (!wlr_egl_make_current(egl, NULL)) {
-        wlr_log(WLR_ERROR, "Failed to make EGL context current for shader creation");
-        return false;
-    }
-    while ((err = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "OpenGL Error before shader creation: 0x%x", err); }
-
-    const char *vendor = (const char *)glGetString(GL_VENDOR);
-    const char *renderer_str = (const char *)glGetString(GL_RENDERER); 
-    const char *version = (const char *)glGetString(GL_VERSION);
-    const char *shading_lang = (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
-    wlr_log(WLR_INFO, "GL_VENDOR: %s", vendor ? vendor : "unknown");
-    wlr_log(WLR_INFO, "GL_RENDERER: %s", renderer_str ? renderer_str : "unknown");
-    wlr_log(WLR_INFO, "GL_VERSION: %s", version ? version : "unknown");
-    wlr_log(WLR_INFO, "GL_SHADING_LANGUAGE_VERSION: %s", shading_lang ? shading_lang : "unknown");
-/*
-   const char *vertex_shader_src =
-    "#version 300 es\n"
-    "precision mediump float;\n"
-    "in vec2 position;\n"
-    "in vec2 texcoord;\n" 
-    "out vec2 v_texcoord;\n" 
-    "uniform mat3 mvp;\n"
-    "void main() {\n"
-    "    vec3 pos_transformed = mvp * vec3(position, 1.0);\n"
-    "    gl_Position = vec4(pos_transformed.xy, 0.0, 1.0);\n"
-    "    v_texcoord = position; // TEST: Use position (0-1) directly as texcoords\n" 
-    "}\n";
-
-    const char *fragment_shader_src = 
-        "#version 300 es\n" // Keep this for now, but the key is texture2D
-        "precision mediump float;\n"
-        "in vec2 v_texcoord;\n"
-        "out vec4 frag_color;\n"
-        "uniform sampler2D texture;\n" // sampler2D is correct for both
-        "void main() {\n"
-        "    frag_color = texture2D(texture, v_texcoord).bgra;\n" // CHANGED HERE
-        "}\n";
-*/
-const char *vertex_shader_src =
-    "#version 300 es\n"
-    "precision mediump float;\n"
-    "in vec2 position;\n"
-    "in vec2 texcoord;\n" 
-    "out vec2 v_texcoord;\n" 
-    "uniform mat3 mvp;\n"
-    "void main() {\n"
-    "    vec3 pos_transformed = mvp * vec3(position, 1.0);\n"
-    "    gl_Position = vec4(pos_transformed.xy, 0.0, 1.0);\n"
-    "    v_texcoord = position;\n" 
-    "}\n";
-
-const char *fragment_shader_src = 
-"#version 300 es\n"
-"precision mediump float;\n"
-"in vec2 v_texcoord;\n"
-"out vec4 frag_color;\n"
-"uniform sampler2D texture_sampler_uniform;\n"
-"uniform float time;\n"
-"uniform vec2 iResolution;\n"
-"\n"
-"float rand(vec2 n) {\n"
-"    return fract(sin(cos(dot(n, vec2(12.9898, 12.1414)))) * 83758.5453);\n"
-"}\n"
-"\n"
-"float noise(vec2 n) {\n"
-"    const vec2 d = vec2(0.0, 1.0);\n"
-"    vec2 b = floor(n), f = smoothstep(vec2(0.0), vec2(1.0), fract(n));\n"
-"    return mix(mix(rand(b), rand(b + d.yx), f.x), mix(rand(b + d.xy), rand(b + d.yy), f.x), f.y);\n"
-"}\n"
-"\n"
-"float fbm(vec2 n) {\n"
-"    float total = 0.0, amplitude = 1.0;\n"
-"    for (int i = 0; i < 5; i++) {\n"
-"        total += noise(n) * amplitude;\n"
-"        n += n * 1.7;\n"
-"        amplitude *= 0.67;\n"
-"    }\n"
-"    return total;\n"
-"}\n"
-"\n"
-"void main() {\n"
-"    float alpha_threshold = 0.9;\n"
-"    vec2 uv = v_texcoord;\n"
-"    \n"
-"    // Sample original texture\n"
-"    vec4 tex_color = texture2D(texture_sampler_uniform, uv);\n"
-"    \n"
-"    // Preserve transparent areas\n"
-"    if(tex_color.a <= alpha_threshold) {\n"
-"        frag_color = vec4(0.0, 0.0, 0.0, 0.0).bgra;\n"
-"        return;\n"
-"    }\n"
-"    \n"
-"    // Normalize time\n"
-"    float iTime = mod(time, 100.0);\n"
-"    \n"
-"    // Color palette from Remix 2 with white\n"
-"    const vec3 c1 = vec3(0.5, 0.0, 0.1); // Red\n"
-"    const vec3 c2 = vec3(0.9, 0.1, 0.0); // Orange\n"
-"    const vec3 c3 = vec3(0.2, 0.1, 0.7); // Subtle blue\n"
-"    const vec3 c4 = vec3(1.0, 0.9, 0.1); // Yellow\n"
-"    const vec3 c7 = vec3(1.0, 1.0, 1.0); // White for highlights\n"
-"    \n"
-"    // Speed and shift\n"
-"    vec2 speed = vec2(0.1, 0.9);\n"
-"    float shift = 1.327 + sin(iTime * 2.0) / 2.4;\n"
-"    float dist = 3.5 - sin(iTime * 0.4) / 1.89;\n"
-"    \n"
-"    // Adjust UV to position flames (base at bottom, tips at top)\n"
-"    vec2 adjusted_uv = vec2(uv.x, 1.0 - uv.y * 1.2 + 0.2);\n"
-"    vec2 p = adjusted_uv * dist;\n"
-"    p += sin(p.yx * 4.0 + vec2(0.2, -0.3) * iTime) * 0.04;\n"
-"    p += sin(p.yx * 8.0 + vec2(0.6, 0.1) * iTime) * 0.01;\n"
-"    p.x -= iTime / 1.1;\n"
-"    \n"
-"    // Multiple FBM layers for base flames\n"
-"    float q = fbm(p - iTime * 0.3 + 1.0 * sin(iTime + 0.5) / 2.0);\n"
-"    float qb = fbm(p - iTime * 0.4 + 0.1 * cos(iTime) / 2.0);\n"
-"    float q2 = fbm(p - iTime * 0.44 - 5.0 * cos(iTime) / 2.0) - 6.0;\n"
-"    float q3 = fbm(p - iTime * 0.9 - 10.0 * cos(iTime) / 15.0) - 4.0;\n"
-"    float q4 = fbm(p - iTime * 1.4 - 20.0 * sin(iTime) / 14.0) + 2.0;\n"
-"    q = (q + qb - 0.4 * q2 - 2.0 * q3 + 0.6 * q4) / 3.8;\n"
-"    \n"
-"    // Top flame layer for taller flames\n"
-"    vec2 top_flame_p = vec2(adjusted_uv.x * 5.0 + sin(iTime * 0.8) * 0.2, (adjusted_uv.y + iTime * 1.2) * 16.0);\n"
-"    float top_flame_q = fbm(top_flame_p - iTime * 0.3 + 1.0 * sin(iTime + 0.5) / 2.0);\n"
-"    float top_flame_qb = fbm(top_flame_p - iTime * 0.4 + 0.1 * cos(iTime) / 2.0);\n"
-"    float top_flame_q2 = fbm(top_flame_p - iTime * 0.44 - 5.0 * cos(iTime) / 2.0) - 6.0;\n"
-"    float top_flame_q3 = fbm(top_flame_p - iTime * 0.9 - 10.0 * cos(iTime) / 15.0) - 4.0;\n"
-"    float top_flame_q4 = fbm(top_flame_p - iTime * 1.4 - 20.0 * sin(iTime) / 14.0) + 2.0;\n"
-"    float top_flame_noise = (top_flame_q + top_flame_qb - 0.4 * top_flame_q2 - 2.0 * top_flame_q3 + 0.6 * top_flame_q4) / 3.8;\n"
-"    top_flame_noise = clamp(top_flame_noise * 1.2, 0.0, 1.0);\n"
-"    \n"
-"    // Flame shapes\n"
-"    float dist_from_fire_line = adjusted_uv.y;\n"
-"    float flame_shape = smoothstep(0.0, 0.3, dist_from_fire_line);\n"
-"    float top_flame_shape = smoothstep(0.0, 1.0, dist_from_fire_line);\n"
-"    \n"
-"    // Flame intensities\n"
-"    vec2 r = vec2(fbm(p + q / 2.0 + iTime * speed.x - p.x - p.y), fbm(p + q - iTime * speed.y));\n"
-"    float flame_intensity = q * flame_shape;\n"
-"    float flame_intensity_smooth = smoothstep(0.1, 0.95, flame_intensity);\n"
-"    float top_flame_intensity = top_flame_noise * top_flame_shape;\n"
-"    top_flame_intensity *= (1.0 + sin(iTime * 2.0 + adjusted_uv.x * 5.0) * 0.3);\n"
-"    float top_flame_intensity_smooth = smoothstep(0.15, 0.95, top_flame_intensity);\n"
-"    \n"
-"    // Color blending\n"
-"    vec3 fire_color = mix(c1, c2, fbm(p + r));\n"
-"    fire_color = mix(c3, c4, r.x);\n"
-"    fire_color = vec3(1.0 / pow(fire_color + 1.61, vec3(4.0)));\n"
-"    fire_color = mix(fire_color, c7, pow(flame_intensity, 2.0) * 0.1);\n"
-"    fire_color = vec3(1.0, 0.2, 0.05) / pow((r.y + r.y) * max(0.0, adjusted_uv.y) + 0.1, 4.0);\n"
-"    fire_color += tex_color.xyz * 0.01 * pow((r.y + r.y) * 0.65, 5.0) * mix(vec3(0.9, 0.4, 0.3), vec3(0.7, 0.5, 0.2), adjusted_uv.y);\n"
-"    fire_color = fire_color / (10.0 + max(vec3(0.0), fire_color));\n"
-"    \n"
-"    // Top flame color\n"
-"    vec2 top_r = vec2(fbm(top_flame_p + top_flame_q / 2.0 + iTime * speed.x - top_flame_p.x - top_flame_p.y), fbm(top_flame_p + top_flame_q - iTime * speed.y));\n"
-"    vec3 top_fire_color = mix(c2, c4, fbm(top_flame_p + top_r));\n"
-"    top_fire_color += mix(c3, c4, top_r.x) * 0.5;\n"
-"    top_fire_color = vec3(1.0 / pow(top_fire_color + 1.61, vec3(4.0)));\n"
-"    top_fire_color = mix(top_fire_color, c7, pow(top_flame_intensity, 2.0) * 0.95);\n"
-"    top_fire_color = top_fire_color / (1.0 + max(vec3(0.0), top_fire_color));\n"
-"    \n"
-"    // Flickering\n"
-"    float flicker = fbm(vec2(iTime * 10.0 + adjusted_uv.x * 8.0, iTime * 7.0)) * 0.4 + 0.6;\n"
-"    \n"
-"    // Blend with background\n"
-"    vec3 final_color = mix(vec3(0.0), fire_color, flame_intensity_smooth);\n"
-"    final_color = mix(final_color, top_fire_color, top_flame_intensity_smooth * 0.01);\n"
-"    float final_alpha = max(flame_intensity_smooth, top_flame_intensity_smooth);\n"
-"    \n"
-"    // Apply texture overlay at 60% opacity\n"
-"    final_color = mix(final_color, tex_color.xyz, 0.2);\n"
-"    \n"
-"    // Make low-intensity areas transparent\n"
-"    if(final_alpha < 0.1) {\n"
-"        frag_color = vec4(0.0, 0.0, 0.0, 0.0).bgra;\n"
-"        return;\n"
-"    }\n"
-"    \n"
-"    frag_color = vec4(final_color*4.0, final_alpha).bgra;\n"
-"}";
-
-    GLuint vertex_shader = compile_shader(GL_VERTEX_SHADER, vertex_shader_src);
-    GLuint fragment_shader = compile_shader(GL_FRAGMENT_SHADER, fragment_shader_src);
-    if (!vertex_shader || !fragment_shader) {
-        if (vertex_shader) glDeleteShader(vertex_shader);
-        if (fragment_shader) glDeleteShader(fragment_shader);
-        wlr_egl_unset_current(egl);
+    struct wlr_egl_context saved_egl_ctx;
+    // Save the current EGL context and make ours current
+    if (!wlr_egl_make_current(egl, &saved_egl_ctx)) {
+        wlr_log(WLR_ERROR, "Failed to make EGL context current for %s shader", shader_name_for_log);
         return false;
     }
 
-    server->shader_program = glCreateProgram();
-    glAttachShader(server->shader_program, vertex_shader);
-    glAttachShader(server->shader_program, fragment_shader);
-    glLinkProgram(server->shader_program);
-    while ((err = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "OpenGL Error after glLinkProgram: 0x%x", err); }
+    GLenum gl_err;
+    while ((gl_err = glGetError()) != GL_NO_ERROR) {
+        wlr_log(WLR_DEBUG, "%s: Clearing pre-existing GL error: 0x%x", shader_name_for_log, gl_err);
+    }
 
-    GLint success;
-    glGetProgramiv(server->shader_program, GL_LINK_STATUS, &success);
-    if (!success) {
-        char log_buf[512]; 
-        glGetProgramInfoLog(server->shader_program, sizeof(log_buf), NULL, log_buf);
-        wlr_log(WLR_ERROR, "Shader program linking failed: %s", log_buf);
-        glDeleteProgram(server->shader_program);
-        server->shader_program = 0;
-        glDeleteShader(vertex_shader);
-        glDeleteShader(fragment_shader);
-        wlr_egl_unset_current(egl);
+    GLuint vs = compile_shader(GL_VERTEX_SHADER, vertex_src);
+    if (!vs) {
+        wlr_log(WLR_ERROR, "Vertex shader compilation failed for %s", shader_name_for_log);
+        wlr_egl_restore_context(&saved_egl_ctx);
         return false;
     }
 
-    glDeleteShader(vertex_shader);
-    glDeleteShader(fragment_shader);
-    wlr_egl_unset_current(egl);
-    wlr_log(WLR_INFO, "Shader program created successfully: program=%u",
-            server->shader_program);
+    GLuint fs = compile_shader(GL_FRAGMENT_SHADER, fragment_src);
+    if (!fs) {
+        wlr_log(WLR_ERROR, "Fragment shader compilation failed for %s", shader_name_for_log);
+        glDeleteShader(vs);
+        wlr_egl_restore_context(&saved_egl_ctx);
+        return false;
+    }
+
+    GLuint program = glCreateProgram();
+    if (program == 0) {
+        wlr_log(WLR_ERROR, "glCreateProgram failed for %s: GL error 0x%x", shader_name_for_log, glGetError());
+        glDeleteShader(vs);
+        glDeleteShader(fs);
+        wlr_egl_restore_context(&saved_egl_ctx);
+        return false;
+    }
+
+    glAttachShader(program, vs);
+    glAttachShader(program, fs);
+    glLinkProgram(program);
+
+    // Shaders can be deleted after linking
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+
+    GLint link_status;
+    glGetProgramiv(program, GL_LINK_STATUS, &link_status);
+    if (!link_status) {
+        char log_buf[1024];
+        glGetProgramInfoLog(program, sizeof(log_buf), NULL, log_buf);
+        wlr_log(WLR_ERROR, "%s shader program linking failed: %s", shader_name_for_log, log_buf);
+        glDeleteProgram(program);
+        wlr_egl_restore_context(&saved_egl_ctx);
+        return false;
+    }
+
+    wlr_log(WLR_INFO, "%s shader program created successfully: ID=%u", shader_name_for_log, program);
+    *program_id_out = program;
+
+    // Get uniform locations if requested
+    if (num_uniforms_to_get > 0) {
+        glUseProgram(program); // Program must be active to query uniform locations
+        for (int i = 0; i < num_uniforms_to_get; ++i) {
+            if (uniforms_to_get[i].name && uniforms_to_get[i].location_ptr) {
+                *(uniforms_to_get[i].location_ptr) = glGetUniformLocation(program, uniforms_to_get[i].name);
+                if (*(uniforms_to_get[i].location_ptr) == -1) {
+                    wlr_log(WLR_ERROR, "%s shader: Uniform '%s' not found (or optimized out). Location: %d",
+                            shader_name_for_log, uniforms_to_get[i].name, *(uniforms_to_get[i].location_ptr));
+                } else {
+                    wlr_log(WLR_DEBUG, "%s shader: Uniform '%s' found at location %d.",
+                            shader_name_for_log, uniforms_to_get[i].name, *(uniforms_to_get[i].location_ptr));
+                }
+            } else {
+                wlr_log(WLR_ERROR, "%s shader: Invalid uniform_spec at index %d (null name or ptr).", shader_name_for_log, i);
+            }
+        }
+        glUseProgram(0); // Unbind program after getting locations
+    }
+
+    // Restore the previous EGL context
+    if (!wlr_egl_restore_context(&saved_egl_ctx)) {
+        wlr_log(WLR_ERROR, "Failed to restore previous EGL context after %s shader creation.", shader_name_for_log);
+        // This isn't necessarily fatal for the shader creation itself, but good to know.
+    }
+
     return true;
 }
 
-// compile_shader function is reused
 
-static bool create_rect_shader_program(struct tinywl_server *server) {
-    struct wlr_egl *egl = wlr_gles2_renderer_get_egl(server->renderer);
-    GLenum err;
-    if (!egl) {
-        wlr_log(WLR_ERROR, "No EGL context for rect shader creation");
-        return false;
-    }
-
-    if (!wlr_egl_make_current(egl, NULL)) { // Ensure EGL context is current
-        wlr_log(WLR_ERROR, "Failed to make EGL context current for rect shader");
-        return false;
-    }
-    while ((err = glGetError()) != GL_NO_ERROR) { /* Clear previous errors */ }
-
-
-
-
-// Vertex shader for simple colored rectangles
-static const char *rect_vertex_shader_src =
-    "#version 300 es\n"
-    "precision mediump float;\n"
-    "in vec2 position;      // Vertex positions (0 to 1 for unit quad)\n"
-    "in vec2 texcoord;      // Vertex texture/local coordinates (also 0 to 1 if VAO is set up for it)\n"
-    "out vec2 v_texcoord;   // Pass local quad coordinates to fragment shader (for vignette)\n"
-    "uniform mat3 mvp;\n"
-    "void main() {\n"
-    "    vec3 pos_transformed = mvp * vec3(position, 1.0);\n"
-    "    gl_Position = vec4(pos_transformed.xy, 0.0, 1.0);\n"
-    "    v_texcoord = texcoord; // Pass the VAO's texcoord attribute\n"
-    "}\n";
-
-static const char *rect_fragment_shader_src =
-    "/* Creative Commons Licence Attribution-NonCommercial-ShareAlike \n"
-    "phreax/jiagual 2025 \n"
-    "Variation of https://www.shadertoy.com/view/tfG3zt\n"
-    "             https://www.shadertoy.com/view/3XjXzK\n"
-    "Inspired by Xor's recent volumetric shaders\n"
-    "https://www.shadertoy.com/view/tXlXDX\n"
-    "*/\n"
-    "#version 300 es\n"
-    "precision mediump float;\n"
-    "\n"
-    "in vec2 v_texcoord;\n"
-    "out vec4 frag_color;\n"
-    "\n"
-    "uniform float time;\n"
-    "uniform vec4 u_color;\n"
-    "\n"
-    "#define PALETTE 6\n"
-    "\n"
-    "mat2 rot(float x) {return mat2(cos(x), -sin(x), sin(x), cos(x));}\n"
-    "vec3 pal(float x) {return .5+.5*cos(6.28*x-vec3(5,4,1));}\n"
-    "\n"
-    "vec3 getPal(int palette, float x) {\n"
-    "    return pal(x);\n"
-    "}\n"
-    "\n"
-    "#define SIN(x) sin(x)\n"
-    "\n"
-    "void main() {\n"
-    "    vec2 fragCoord = gl_FragCoord.xy;\n"
-    "    vec2 iResolution = vec2(1024.0, 768.0);\n"
-    "    float iTime = time * 0.5;\n"
-    "    \n"
-    "    vec2 uv = (fragCoord - .5*iResolution.xy)/min(iResolution.x, iResolution.y);\n"
-    "    float tt = iTime*.5;\n"
-    "    \n"
-    "    uv.xy *= mix(.8, 1.2, SIN(-tt+5.*length(uv.xy)));\n"
-    "    \n"
-    "    vec3 col = vec3(0);\n"
-    "    vec3 rd = vec3(uv, 1);\n"
-    "    vec3 p = vec3(0);\n"
-    "    float t = .1;\n"
-    "    \n"
-    "    for(float i=0.; i<120.; i++) {\n"
-    "        vec3 p = t*rd + rd;\n"
-    "        \n"
-    "        float r = length(p);\n"
-    "        \n"
-    "        float z = p.z;\n"
-    "        p.xy *= rot(p.z*.75);\n"
-    "      \n"
-    "        // log spherical coords\n"
-    "        p = vec3(log(r)*.5,\n"
-    "            acos(p.z / r),\n"
-    "            atan(p.y, p.x));\n"
-    "        p = abs(p)-mix(.1, .5, SIN(.2*tt));\n"
-    "    \n"
-    "        for(float j=0.; j < 3.; j++) {     \n"
-    "            float  a= exp(j)/exp2(j);\n"
-    "            p += cos(2.*p.yzx*a + .5*tt - length(p.xy)*9.)/a; \n"
-    "        }\n"
-    "        \n"
-    "        float d = 0.007 + abs((exp2(1.4*p)-vec3(0,1.+.7*SIN(tt),0)).y-1.)/14.;\n"
-    "        float k = t*.7 +length(p)*.1 - .2*tt + z*.1;\n"
-    "        vec3 c = getPal(PALETTE, k);\n"
-    "        c = mix(c, c*vec3(0.922,0.973,0.725), SIN(z*.5));\n"
-    "        col += c*1e-3/d;       \n"
-    "        t += d/4.;\n"
-    "    }\n"
-    "    \n"
-    "    // add glow in the center\n"
-    "    float gl = exp(-17.*length(uv.xy));\n"
-    "    col += .4*mix(vec3(0.361,0.957,1.000), vec3(0.847,1.000,0.561), SIN(gl*2.-tt))*pow(gl*11., 1.);\n"
-    "    \n"
-    "    // tone mapping & gamma correction\n"
-    "    col *= tanh(col*.1);\n"
-    "    col = pow(col, vec3(.45));\n"
-    "    \n"
-    "    // Apply user color as subtle accent\n"
-    "    col = mix(col, col * u_color.rgb, 0.1);\n"
-    "    \n"
-    "    frag_color = vec4(col, u_color.a).bgra;\n"
-    "}\n";
-
-
-    GLuint vertex_shader = compile_shader(GL_VERTEX_SHADER, rect_vertex_shader_src);
-    GLuint fragment_shader = compile_shader(GL_FRAGMENT_SHADER, rect_fragment_shader_src);
-
-    if (!vertex_shader || !fragment_shader) {
-        if (vertex_shader) glDeleteShader(vertex_shader);
-        if (fragment_shader) glDeleteShader(fragment_shader);
-        wlr_egl_unset_current(egl);
-        return false;
-    }
-
-    server->rect_shader_program = glCreateProgram();
-    if (server->rect_shader_program == 0) {
-        wlr_log(WLR_ERROR, "glCreateProgram for rect shader failed");
-        glDeleteShader(vertex_shader);
-        glDeleteShader(fragment_shader);
-        wlr_egl_unset_current(egl);
-        return false;
-    }
-
-    glAttachShader(server->rect_shader_program, vertex_shader);
-    glAttachShader(server->rect_shader_program, fragment_shader);
-    glLinkProgram(server->rect_shader_program);
-
-    GLint success;
-    glGetProgramiv(server->rect_shader_program, GL_LINK_STATUS, &success);
-if (success) {
-        server->rect_shader_mvp_loc = glGetUniformLocation(server->rect_shader_program, "mvp");
-        server->rect_shader_color_loc = glGetUniformLocation(server->rect_shader_program, "u_color");
-        server->rect_shader_time_loc = glGetUniformLocation(server->rect_shader_program, "time");
-        server->rect_shader_resolution_loc = glGetUniformLocation(server->rect_shader_program, "iResolution"); // Get new uniform
-
-        wlr_log(WLR_INFO, "Rect shader: ID=%u, mvp=%d, color=%d, time=%d, iResolution=%d",
-                server->rect_shader_program, server->rect_shader_mvp_loc,
-                server->rect_shader_color_loc, server->rect_shader_time_loc,
-                server->rect_shader_resolution_loc);
-
-       if(server->rect_shader_mvp_loc == -1) wlr_log(WLR_ERROR, "Rect shader: 'mvp' uniform not found!");
-        if(server->rect_shader_color_loc == -1) wlr_log(WLR_ERROR, "Rect shader: 'u_color' uniform not found!");
-        if(server->rect_shader_time_loc == -1) wlr_log(WLR_ERROR, "Rect shader: 'time' uniform not found!"); // Check new uniform
-         if(server->rect_shader_resolution_loc == -1) wlr_log(WLR_ERROR, "Rect shader: 'iResolution' uniform NOT FOUND!");
-    }
-    glDeleteShader(vertex_shader); // Can delete after linking
-    glDeleteShader(fragment_shader);
-    wlr_egl_unset_current(egl); // Unset context
-    return success;
-}
 
 /* Function implementations */
 static void server_destroy(struct tinywl_server *server) {
@@ -1778,259 +1526,6 @@ struct render_data {
 #include <wlr/types/wlr_matrix.h>
 
 
-/*
-static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
-                                  int sx, int sy, void *user_data) {
-    struct render_data *rdata = user_data;
-    struct wlr_renderer *renderer = rdata->renderer;
-    struct wlr_output *output = rdata->output;
-    struct tinywl_server *server = rdata->server;
- //   GLenum gl_err_iter; 
-    struct wlr_gles2_texture_attribs tex_attribs; 
-
-    enum wl_output_transform initial_buffer_transform_enum = scene_buffer->transform;
-
-    wlr_log(WLR_INFO, "[ITERATOR:%s] VISITED scene_buffer %p (internal wlr_buffer %p) at sx=%d, sy=%d. Node Enabled: %d. Has .buffer: %s. Output WxH: %dx%d OutputTransform: %d RawBufferTransformEnum: %d",
-            output->name, (void*)scene_buffer, (void*)scene_buffer->buffer, sx, sy,
-            scene_buffer->node.enabled,
-            scene_buffer->buffer ? "yes" : "no",
-            output->width, output->height, output->transform,
-            initial_buffer_transform_enum);
-
-    // Add safety checks for the render_data structure
-    if (!rdata || !rdata->server || !rdata->renderer || !rdata->output) {
-        wlr_log(WLR_ERROR, "Invalid render_data or null pointers in render_data");
-        return;
-    }
-    
-    // Comprehensive validation of server and toplevels list
-    if (!server) {
-        wlr_log(WLR_ERROR, "Server pointer is null");
-        return;
-    }
-    
-    // Check if the toplevels list is properly initialized
-    if (server->toplevels.next == NULL || server->toplevels.prev == NULL) {
-        wlr_log(WLR_ERROR, "server->toplevels list is not initialized (next=%p, prev=%p)", 
-                (void*)server->toplevels.next, (void*)server->toplevels.prev);
-        return;
-    }
-    
-    // Additional corruption check - in a valid empty list, next and prev should point to itself
-    if (wl_list_empty(&server->toplevels)) {
-        if (server->toplevels.next != &server->toplevels || server->toplevels.prev != &server->toplevels) {
-            wlr_log(WLR_ERROR, "Empty toplevels list is corrupted: next=%p, prev=%p, expected=%p",
-                    (void*)server->toplevels.next, (void*)server->toplevels.prev, (void*)&server->toplevels);
-            return;
-        }
-        wlr_log(WLR_DEBUG, "Server toplevels list is empty but valid");
-    }
-
-    if (!scene_buffer->node.enabled || !scene_buffer->buffer) {
-        return;
-    }
-    if (output->width == 0 || output->height == 0) {
-        wlr_log(WLR_ERROR, "[ITERATOR:%s] Output width (%d) or height (%d) is ZERO.", output->name, output->width, output->height);
-        return;
-    }
-    
-    struct wlr_scene_surface *current_scene_surface = wlr_scene_surface_try_from_buffer(scene_buffer);
-    struct wlr_surface *surface_to_render = current_scene_surface ? current_scene_surface->surface : NULL;
-
-    if (!surface_to_render) {
-        struct wlr_texture *fallback_texture = wlr_texture_from_buffer(renderer, scene_buffer->buffer);
-        if (fallback_texture) {
-            struct wlr_render_texture_options tex_opts = {
-                .texture = fallback_texture,
-                .dst_box = {sx, sy, fallback_texture->width, fallback_texture->height},
-                .transform = initial_buffer_transform_enum,
-                .blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
-            };
-            if (rdata->pass) {
-                wlr_render_pass_add_texture(rdata->pass, &tex_opts);
-            }
-            wlr_texture_destroy(fallback_texture);
-        }
-        return;
-    }
-    
-    struct tinywl_toplevel *toplevel = NULL;
-    struct wlr_scene_node *iter_node_find = &scene_buffer->node;
-    while(iter_node_find) {
-        if(iter_node_find->data) {
-            struct tinywl_toplevel *ptl = iter_node_find->data;
-            bool is_in_list = false;
-        //    struct tinywl_toplevel *check_tl;
-            
-            // Add comprehensive safety checks before iterating the list
-            if (server->toplevels.next != NULL && server->toplevels.prev != NULL && 
-                server->toplevels.next != &server->toplevels && 
-                !wl_list_empty(&server->toplevels)) {
-                
-                struct tinywl_toplevel *check_tl, *tmp_tl;
-                
-                // Use the safe iteration macro to prevent crashes from corrupted lists
-                wl_list_for_each_safe(check_tl, tmp_tl, &server->toplevels, link) {
-                    if (check_tl == ptl) { 
-                        is_in_list = true; 
-                        break; 
-                    }
-                }
-            } else {
-                wlr_log(WLR_ERROR, "[ITERATOR:%s] server->toplevels list appears corrupted: next=%p, prev=%p", 
-                        output->name, (void*)server->toplevels.next, (void*)server->toplevels.prev);
-            }
-            if (is_in_list) { toplevel = ptl; break; }
-        }
-        if (!iter_node_find->parent) break;
-        iter_node_find = &iter_node_find->parent->node;
-    }
-
-    float anim_scale_factor = 1.0f;
-    if (toplevel) {
-        if (toplevel->is_animating) {
-            struct timespec now_anim; clock_gettime(CLOCK_MONOTONIC, &now_anim);
-            float current_time_anim = now_anim.tv_sec + now_anim.tv_nsec / 1e9f;
-            float elapsed = current_time_anim - toplevel->animation_start;
-            float t = elapsed / toplevel->animation_duration;
-            if (t >= 1.0f) {
-                t = 1.0f; toplevel->is_animating = false;
-                anim_scale_factor = toplevel->target_scale;
-                toplevel->scale = toplevel->target_scale;
-                if (toplevel->target_scale == 0.0f && surface_to_render->mapped && toplevel->scene_tree) {
-                    wlr_scene_node_set_enabled(&toplevel->scene_tree->node, false);
-                }
-            } else {
-                anim_scale_factor = toplevel->scale + (toplevel->target_scale - toplevel->scale) * t;
-            }
-            if (toplevel->is_animating) wlr_output_schedule_frame(output);
-        } else {
-            anim_scale_factor = toplevel->scale;
-        }
-    }
-
-    if (anim_scale_factor <= 0.001f && toplevel && toplevel->target_scale == 0.0f) return;
-    if (anim_scale_factor <= 0.001f) anim_scale_factor = 0.001f;
-
-    wlr_log(WLR_INFO, "[ITERATOR:%s] Creating texture from scene_buffer->buffer %p",
-            output->name, (void*)scene_buffer->buffer);
-    struct wlr_texture *texture = wlr_texture_from_buffer(renderer, scene_buffer->buffer);
-    if (!texture) {
-         wlr_log(WLR_ERROR, "[ITERATOR:%s] FAILED to create texture from buffer %p", output->name, scene_buffer->buffer);
-        return;
-    }
-     wlr_log(WLR_INFO, "[ITERATOR:%s] Created wlr_texture %p from scene_buffer->buffer %p",
-            output->name, (void*)texture, (void*)scene_buffer->buffer);
-    
-    wlr_gles2_texture_get_attribs(texture, &tex_attribs);
-    
-    struct wlr_box render_box = {
-        .x = (int)round(sx + (texture->width * (1.0f - anim_scale_factor) / 2.0f)),
-        .y = (int)round(sy + (texture->height * (1.0f - anim_scale_factor) / 2.0f)),
-        .width = (int)round(texture->width * anim_scale_factor),
-        .height = (int)round(texture->height * anim_scale_factor),
-    };
-    if (render_box.width <= 0 || render_box.height <= 0) { wlr_texture_destroy(texture); return; }
-
-    float final_shader_mvp[9];
-    wlr_matrix_identity(final_shader_mvp);
-
-    float box_scale_x = (float)render_box.width * (2.0f / output->width);
-    float box_scale_y = (float)render_box.height * (-2.0f / output->height);
-    float box_translate_x = ((float)render_box.x / output->width) * 2.0f - 1.0f;
-    float box_translate_y = ((float)render_box.y / output->height) * -2.0f + 1.0f;
-
-    if (output->transform == WL_OUTPUT_TRANSFORM_FLIPPED_180) { 
-        final_shader_mvp[0] = -box_scale_x;
-        final_shader_mvp[4] = -box_scale_y;
-        final_shader_mvp[6] = -box_translate_x;
-        final_shader_mvp[7] = -box_translate_y;
-    } else if (output->transform == WL_OUTPUT_TRANSFORM_NORMAL) {
-        final_shader_mvp[0] = box_scale_x;
-        final_shader_mvp[4] = box_scale_y;
-        final_shader_mvp[6] = box_translate_x;
-        final_shader_mvp[7] = box_translate_y;
-    } else {
-        float mvp_for_normal_box_temp[9];
-        mvp_for_normal_box_temp[0] = box_scale_x; mvp_for_normal_box_temp[1] = 0.0f; mvp_for_normal_box_temp[2] = 0.0f;
-        mvp_for_normal_box_temp[3] = 0.0f; mvp_for_normal_box_temp[4] = box_scale_y; mvp_for_normal_box_temp[5] = 0.0f;
-        mvp_for_normal_box_temp[6] = box_translate_x; mvp_for_normal_box_temp[7] = box_translate_y; mvp_for_normal_box_temp[8] = 1.0f;
-        float output_transform_matrix_ndc_temp[9];
-        wlr_matrix_identity(output_transform_matrix_ndc_temp);
-        wlr_matrix_transform(output_transform_matrix_ndc_temp, output->transform);
-        wlr_matrix_multiply(final_shader_mvp, output_transform_matrix_ndc_temp, mvp_for_normal_box_temp);
-    }
-    
-    if (initial_buffer_transform_enum != WL_OUTPUT_TRANSFORM_NORMAL) {
-        float temp_mvp_for_buffer_tf[9];
-        memcpy(temp_mvp_for_buffer_tf, final_shader_mvp, sizeof(final_shader_mvp));
-        float actual_buffer_tf_matrix[9];
-        wlr_matrix_transform(actual_buffer_tf_matrix, initial_buffer_transform_enum);
-        wlr_matrix_multiply(final_shader_mvp, temp_mvp_for_buffer_tf, actual_buffer_tf_matrix);
-    }
-
-    wlr_log(WLR_ERROR, "[ITERATOR:%s] FinalShaderMVP: [%.6f %.6f %.6f] [%.6f %.6f %.6f] [%.6f %.6f %.6f]",
-        output->name,
-        final_shader_mvp[0], final_shader_mvp[1], final_shader_mvp[2],
-        final_shader_mvp[3], final_shader_mvp[4], final_shader_mvp[5],
-        final_shader_mvp[6], final_shader_mvp[7], final_shader_mvp[8]);
-    
-    glViewport(0, 0, output->width, output->height);
-    glScissor(0, 0, output->width, output->height);
-    glEnable(GL_SCISSOR_TEST);
-    glEnable(GL_BLEND); 
-    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-    glDisable(GL_CULL_FACE);
-    glDisable(GL_DEPTH_TEST); 
-    glDepthMask(GL_TRUE);     
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE); 
-    
-    glUseProgram(server->shader_program);
-    GLint mvp_loc = glGetUniformLocation(server->shader_program, "mvp");
-    if (mvp_loc != -1) {
-        glUniformMatrix3fv(mvp_loc, 1, GL_FALSE, final_shader_mvp);
-    } else {
-        wlr_log(WLR_ERROR, "MVP_Uniform_Not_Found in shader program %u", server->shader_program);
-    }
-
-    GLint tex_loc = glGetUniformLocation(server->shader_program, "texture"); 
-    if (tex_loc != -1) {
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(tex_attribs.target, tex_attribs.tex); 
-        glTexParameteri(tex_attribs.target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(tex_attribs.target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glUniform1i(tex_loc, 0);
-        wlr_log(WLR_DEBUG, "[ITERATOR] Texture uniform 'texture' FOUND at %d and bound to unit 0. Filters set to GL_LINEAR.", tex_loc);
-    } else {
-        wlr_log(WLR_ERROR, "[ITERATOR] Texture uniform 'texture' NOT FOUND! This is an error for texture shader.");
-    }
-
-    glBindVertexArray(server->quad_vao);
-    glBindBuffer(GL_ARRAY_BUFFER, server->quad_vbo); 
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, server->quad_ibo); 
-
-    wlr_log(WLR_DEBUG, "[ITERATOR] Drawing elements (texture shader).");
-    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
-    GLenum draw_err = glGetError();
-    if (draw_err != GL_NO_ERROR) {
-        wlr_log(WLR_ERROR, "[ITERATOR:%s] glDrawElements error: 0x%x", output->name, draw_err);
-    } else {
-        wlr_log(WLR_DEBUG, "[ITERATOR:%s] glDrawElements called successfully.", output->name);
-    }
-    
-    glFinish(); 
-    wlr_log(WLR_DEBUG, "[ITERATOR] glFinish completed.");
-
-    if (tex_loc != -1) {
-      glBindTexture(tex_attribs.target, 0); 
-    }
-    glBindVertexArray(0);
-    glBindBuffer(GL_ARRAY_BUFFER, 0); 
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0); 
-    glUseProgram(0);
-
-    wlr_texture_destroy(texture);
-}*/
 #include <string.h> // For memcpy
 #include <math.h>   // For round, fmaxf, fminf
 #include <time.h>   // For clock_gettime
@@ -2048,35 +1543,6 @@ float get_monotonic_time_seconds_as_float(void) {
 #include <math.h>   // For round, fmaxf, fminf
 #include <time.h>   // For clock_gettime
 
-#include <string.h> // For memcpy
-#include <math.h>   // For round, fmaxf, fminf
-#include <time.h>   // For clock_gettime
-
-#include <string.h> // For memcpy
-#include <math.h>   // For round, fmaxf, fminf
-#include <time.h>   // For clock_gettime
-
-// Ensure this helper is defined somewhere accessible
-// static float get_monotonic_time_seconds_as_float() { /* ... */ }
-
-#include <string.h> // For memcpy
-#include <math.h>   // For round, fmaxf, fminf
-#include <time.h>   // For clock_gettime
-
-
-
-
-#include <string.h> // For memcpy
-#include <math.h>   // For round, fmaxf, fminf
-#include <time.h>   // For clock_gettime
-
-// Helper (ensure it's defined or declared before these functions)
-// static float get_monotonic_time_seconds_as_float() { /* ... */ }
-
-
-#include <string.h> // For memcpy
-#include <math.h>   // For round, fmaxf, fminf
-#include <time.h>   // For clock_gettime
 
 // Helper (ensure it's defined or declared before these functions)
 // static float get_monotonic_time_seconds_as_float() { /* ... */ }
@@ -2099,7 +1565,7 @@ float get_monotonic_time_seconds_as_float(void) {
 
 
 // STEP 5: Alternative test - Create rectangle differently
-void test_red_rectangle_alternative(struct tinywl_server *server) {
+void desktop_background(struct tinywl_server *server) {
     wlr_log(WLR_INFO, "=== ALTERNATIVE RECTANGLE TEST ===");
     
     // Method 1: Direct color array
@@ -2116,6 +1582,28 @@ void test_red_rectangle_alternative(struct tinywl_server *server) {
     
 }
 
+
+void desktop_panel(struct tinywl_server *server) {
+    int panel_height=60;
+    wlr_log(WLR_INFO, "=== DESKTOP PANEL TEST ===");
+    float panel_tint_color[4] = {0.2f, 0.8f, 0.3f, 0.9f}; // Give it a distinct tint
+    struct wlr_scene_rect *panel_srect = wlr_scene_rect_create(
+        &server->scene->tree,
+        1024, // Assuming output width
+        panel_height,   // Panel height
+        panel_tint_color
+    );
+    if (panel_srect) {
+        server->top_panel_node = &panel_srect->node; // CRITICAL: Store the node
+        wlr_scene_node_set_position(server->top_panel_node, 0, 768-panel_height); // Position at top
+        wlr_scene_node_set_enabled(server->top_panel_node, true);
+        wlr_scene_node_raise_to_top(server->top_panel_node); // Ensure it's on top
+        wlr_log(WLR_INFO, "Desktop panel rect created and assigned to server->top_panel_node: %p at (0,0)", server->top_panel_node);
+    } else {
+        wlr_log(WLR_ERROR, "Failed to create desktop_panel rect.");
+        server->top_panel_node = NULL; // Ensure it's NULL if creation fails
+    }
+}
 
 
 // ISSUE 5: Debug logging to verify scene tree state
@@ -2166,9 +1654,10 @@ void debug_scene_tree(struct wlr_scene *scene, struct wlr_output *output) {
     wlr_log(WLR_INFO, "[DEBUG] Total nodes: %d", node_count);
 }
 
-// Updated scene_buffer_iterator
+// scene_buffer_iterator with preview rendering logic and detailed logging
 static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
-                                 int sx, int sy, void *user_data) {
+                                 int sx, int sy,
+                                 void *user_data) {
     struct render_data *rdata = user_data;
     struct wlr_renderer *renderer = rdata->renderer;
     struct wlr_output *output = rdata->output;
@@ -2176,13 +1665,29 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
     struct wlr_gles2_texture_attribs tex_attribs;
     const char *output_name_log = output ? output->name : "UNKNOWN_OUTPUT";
 
-    if (!rdata || !server || !renderer || !output || !scene_buffer->node.enabled) {
+    // Basic validation
+    if (!rdata || !server || !renderer || !output) {
+        wlr_log(WLR_ERROR, "[SCENE_ITERATOR_FATAL:%s] Invalid render_data, server, renderer, or output.", output_name_log);
+        return;
+    }
+    if (!scene_buffer) {
+        wlr_log(WLR_ERROR, "[SCENE_ITERATOR_FATAL:%s] scene_buffer is NULL.", output_name_log);
+        return;
+    }
+    if (!scene_buffer->node.enabled) {
+        wlr_log(WLR_DEBUG, "[SCENE_ITERATOR:%s] scene_buffer %p node not enabled, skipping.", output_name_log, (void*)scene_buffer);
         return;
     }
     if (output->width == 0 || output->height == 0) {
+        wlr_log(WLR_ERROR, "[SCENE_ITERATOR:%s] Output has zero width/height.", output_name_log);
+        return;
+    }
+    if (!scene_buffer->buffer) {
+        wlr_log(WLR_DEBUG, "[SCENE_ITERATOR:%s] scene_buffer %p has NULL wlr_buffer, skipping.", output_name_log, (void*)scene_buffer);
         return;
     }
 
+    // --- Toplevel identification (simplified like second version) ---
     struct tinywl_toplevel *toplevel = NULL;
     struct wlr_scene_node *node_iter = &scene_buffer->node;
     while (node_iter) {
@@ -2199,19 +1704,21 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
 
     float anim_scale_factor = 1.0f;
     char title_buffer[128] = "NO_TL_ITER";
+    const char* tl_title_for_log = "UNKNOWN_OR_NOT_TOPLEVEL_CONTENT";
 
-
-
-    if (!scene_buffer->buffer) return;
+    // Surface validation like second version
     struct wlr_scene_surface *current_scene_surface = wlr_scene_surface_try_from_buffer(scene_buffer);
     struct wlr_surface *surface_to_render = current_scene_surface ? current_scene_surface->surface : NULL;
     if (!surface_to_render) return;
 
+    // --- Animation Scaling (same logic but with debugging like second version) ---
     if (toplevel) {
         if (toplevel->xdg_toplevel && toplevel->xdg_toplevel->title) {
             snprintf(title_buffer, sizeof(title_buffer), "%s", toplevel->xdg_toplevel->title);
+            tl_title_for_log = title_buffer;
         } else {
             snprintf(title_buffer, sizeof(title_buffer), "Ptr:%p (XDG maybe NULL)", toplevel);
+            tl_title_for_log = "TOPLEVEL_NO_TITLE";
         }
 
         wlr_log(WLR_ERROR, "[ITERATOR DEBUG:%s] Processing TL ('%s' Ptr:%p). Anim:%d, Scale:%.3f, Target:%.3f, StartT:%.3f, PendingD:%d, NodeEn:%d",
@@ -2266,16 +1773,23 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
         anim_scale_factor = 0.001f;
     }
 
+    // --- Main Window Rendering (using second version's approach) ---
     struct wlr_texture *texture = wlr_texture_from_buffer(renderer, scene_buffer->buffer);
-    if (!texture) return;
+    if (!texture) {
+        wlr_log(WLR_ERROR, "[SCENE_ITERATOR:%s] Failed to create wlr_texture from buffer %p for '%s'.",
+                output_name_log, (void*)scene_buffer->buffer, tl_title_for_log);
+        return;
+    }
     wlr_gles2_texture_get_attribs(texture, &tex_attribs);
-    struct wlr_box render_box = {
+
+    struct wlr_box main_render_box = {
         .x = (int)round((double)sx + (double)texture->width * (1.0 - (double)anim_scale_factor) / 2.0),
         .y = (int)round((double)sy + (double)texture->height * (1.0 - (double)anim_scale_factor) / 2.0),
         .width = (int)round((double)texture->width * (double)anim_scale_factor),
         .height = (int)round((double)texture->height * (double)anim_scale_factor),
     };
-    if (render_box.width <= 0 || render_box.height <= 0) {
+
+    if (main_render_box.width <= 0 || main_render_box.height <= 0) {
         if (toplevel && !toplevel->pending_destroy && toplevel->target_scale == 0.0f) {
             wlr_log(WLR_ERROR, "[ITERATOR DEBUG:%s] '%s' scaled to zero W/H.", output_name_log, title_buffer);
             wlr_output_schedule_frame(output);
@@ -2283,34 +1797,42 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
         wlr_texture_destroy(texture);
         return;
     }
-    float mvp[9];
-    wlr_matrix_identity(mvp);
-    float box_scale_x = (float)render_box.width * (2.0f / output->width);
-    float box_scale_y = (float)render_box.height * (-2.0f / output->height);
-    float box_translate_x = ((float)render_box.x / output->width) * 2.0f - 1.0f;
-    float box_translate_y = ((float)render_box.y / output->height) * -2.0f + 1.0f;
 
+    // Calculate MVP matrix using second version's simpler approach
+    float main_mvp[9];
+    wlr_matrix_identity(main_mvp);
+    float box_scale_x = (float)main_render_box.width * (2.0f / output->width);
+    float box_scale_y = (float)main_render_box.height * (-2.0f / output->height);
+    float box_translate_x = ((float)main_render_box.x / output->width) * 2.0f - 1.0f;
+    float box_translate_y = ((float)main_render_box.y / output->height) * -2.0f + 1.0f;
+
+    // Handle output transforms like second version
     if (output->transform == WL_OUTPUT_TRANSFORM_FLIPPED_180) {
-        mvp[0] = -box_scale_x; mvp[4] = -box_scale_y; mvp[6] = -box_translate_x; mvp[7] = -box_translate_y;
-        mvp[1] = mvp[2] = mvp[3] = mvp[5] = 0.0f; mvp[8] = 1.0f;
+        main_mvp[0] = -box_scale_x; main_mvp[4] = -box_scale_y; main_mvp[6] = -box_translate_x; main_mvp[7] = -box_translate_y;
+        main_mvp[1] = main_mvp[2] = main_mvp[3] = main_mvp[5] = 0.0f; main_mvp[8] = 1.0f;
     } else if (output->transform == WL_OUTPUT_TRANSFORM_NORMAL) {
-        mvp[0] = box_scale_x; mvp[4] = box_scale_y; mvp[6] = box_translate_x; mvp[7] = box_translate_y;
-        mvp[1] = mvp[2] = mvp[3] = mvp[5] = 0.0f; mvp[8] = 1.0f;
+        main_mvp[0] = box_scale_x; main_mvp[4] = box_scale_y; main_mvp[6] = box_translate_x; main_mvp[7] = box_translate_y;
+        main_mvp[1] = main_mvp[2] = main_mvp[3] = main_mvp[5] = 0.0f; main_mvp[8] = 1.0f;
     } else {
         float temp_mvp[9] = {box_scale_x, 0.0f, 0.0f, 0.0f, box_scale_y, 0.0f, box_translate_x, box_translate_y, 1.0f};
         float transform_matrix[9];
         wlr_matrix_transform(transform_matrix, output->transform);
-        wlr_matrix_multiply(mvp, transform_matrix, temp_mvp);
+        wlr_matrix_multiply(main_mvp, transform_matrix, temp_mvp);
     }
+
+    // Handle buffer transforms like second version
     if (scene_buffer->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
         float temp_mvp_buffer[9];
-        memcpy(temp_mvp_buffer, mvp, sizeof(mvp));
+        memcpy(temp_mvp_buffer, main_mvp, sizeof(main_mvp));
         float buffer_matrix[9];
         wlr_matrix_transform(buffer_matrix, scene_buffer->transform);
-        wlr_matrix_multiply(mvp, temp_mvp_buffer, buffer_matrix);
+        wlr_matrix_multiply(main_mvp, temp_mvp_buffer, buffer_matrix);
     }
+
+    // Set uniforms using glGetUniformLocation like second version
     GLint mvp_loc = glGetUniformLocation(server->shader_program, "mvp");
-    if (mvp_loc != -1) glUniformMatrix3fv(mvp_loc, 1, GL_FALSE, mvp);
+    if (mvp_loc != -1) glUniformMatrix3fv(mvp_loc, 1, GL_FALSE, main_mvp);
+
     GLint tex_loc = glGetUniformLocation(server->shader_program, "texture_sampler_uniform");
     if (tex_loc != -1) {
         glActiveTexture(GL_TEXTURE0);
@@ -2321,27 +1843,125 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
         glTexParameteri(tex_attribs.target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glUniform1i(tex_loc, 0);
     }
+
+    // Set time uniform like second version
     struct timespec now_shader_time_iter_draw;
     clock_gettime(CLOCK_MONOTONIC, &now_shader_time_iter_draw);
     float time_value_iter_draw = now_shader_time_iter_draw.tv_sec + now_shader_time_iter_draw.tv_nsec / 1e9f;
     GLint time_loc_iter_draw = glGetUniformLocation(server->shader_program, "time");
     if (time_loc_iter_draw != -1) glUniform1f(time_loc_iter_draw, time_value_iter_draw);
+
+    // Set resolution uniform like second version
     float resolution_iter_draw[2] = {(float)output->width, (float)output->height};
     GLint resolution_loc_iter_draw = glGetUniformLocation(server->shader_program, "iResolution");
     if (resolution_loc_iter_draw != -1) glUniform2fv(resolution_loc_iter_draw, 1, resolution_iter_draw);
 
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
-    if (tex_loc != -1) glBindTexture(tex_attribs.target, 0);
+    wlr_log(WLR_DEBUG, "[SCENE_ITERATOR:%s] Drew main window for '%s'", output_name_log, tl_title_for_log);
+
+    // --- Preview Rendering (kept from first version) ---
+    if (toplevel && server->top_panel_node && server->top_panel_node->enabled &&
+        texture) { // Ensure texture is still valid
+
+        bool should_preview_this_toplevel = false;
+        // Example: Preview only the toplevel whose title is "simple-egl"
+        if (toplevel->xdg_toplevel && toplevel->xdg_toplevel->title &&
+            strcmp(toplevel->xdg_toplevel->title, "simple-egl") == 0) {
+            should_preview_this_toplevel = true;
+        }
+
+        if (should_preview_this_toplevel) {
+            wlr_log(WLR_INFO, "[SCENE_ITERATOR_PREVIEW:%s] Rendering preview for '%s' onto panel.", output_name_log, tl_title_for_log);
+            struct wlr_scene_rect *panel_srect = wlr_scene_rect_from_node(server->top_panel_node);
+
+            if (panel_srect) {
+                int panel_screen_x = server->top_panel_node->x;
+                int panel_screen_y = server->top_panel_node->y;
+
+                float preview_x_offset_in_panel = 20.0f;
+                float preview_y_padding_in_panel = 5.0f;
+                float preview_height_pixels = (float)panel_srect->height - 2.0f * preview_y_padding_in_panel;
+                if (preview_height_pixels < 1.0f) preview_height_pixels = 1.0f;
+
+                float aspect_ratio = (texture->width > 0 && texture->height > 0) ? (float)texture->width / (float)texture->height : 1.0f;
+                float preview_width_pixels = preview_height_pixels * aspect_ratio;
+                if (preview_width_pixels < 1.0f) preview_width_pixels = 1.0f;
+
+                if (preview_x_offset_in_panel + preview_width_pixels > panel_srect->width - 5.0f) {
+                    preview_width_pixels = panel_srect->width - 5.0f - preview_x_offset_in_panel;
+                    if (preview_width_pixels < 1.0f) preview_width_pixels = 0;
+                }
+
+                struct wlr_box preview_box_on_screen = {
+                    .x = (int)round((double)panel_screen_x + preview_x_offset_in_panel),
+                    .y = (int)round((double)panel_screen_y + preview_y_padding_in_panel),
+                    .width = (int)round(preview_width_pixels),
+                    .height = (int)round(preview_height_pixels),
+                };
+
+                if (preview_box_on_screen.width > 0 && preview_box_on_screen.height > 0) {
+                    float preview_mvp[9];
+                    float p_box_scale_x = (float)preview_box_on_screen.width * (2.0f / output->width);
+                    float p_box_scale_y = (float)preview_box_on_screen.height * (-2.0f / output->height);
+                    float p_box_translate_x = ((float)preview_box_on_screen.x / output->width) * 2.0f - 1.0f;
+                    float p_box_translate_y = ((float)preview_box_on_screen.y / output->height) * -2.0f + 1.0f;
+                    float p_model_view[9] = { p_box_scale_x, 0.0f, 0.0f, 0.0f, p_box_scale_y, 0.0f, p_box_translate_x, p_box_translate_y, 1.0f };
+
+                    memcpy(preview_mvp, p_model_view, sizeof(p_model_view));
+                    
+                    // Apply output transform to the preview MVP
+                    if (output->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+                        float temp_preview_mvp[9];
+                        memcpy(temp_preview_mvp, preview_mvp, sizeof(preview_mvp));
+                        float output_transform_matrix[9];
+                        wlr_matrix_identity(output_transform_matrix);
+                        wlr_matrix_transform(output_transform_matrix, output->transform);
+                        wlr_matrix_multiply(preview_mvp, output_transform_matrix, temp_preview_mvp);
+                    }
+
+                    // Re-set uniforms for the preview draw call
+                    GLint preview_mvp_loc = glGetUniformLocation(server->shader_program, "mvp");
+                    if (preview_mvp_loc != -1) glUniformMatrix3fv(preview_mvp_loc, 1, GL_FALSE, preview_mvp);
+                    
+                    GLint preview_tex_loc = glGetUniformLocation(server->shader_program, "texture_sampler_uniform");
+                    if (preview_tex_loc != -1) {
+                        glActiveTexture(GL_TEXTURE0);
+                        glBindTexture(tex_attribs.target, tex_attribs.tex);
+                        glUniform1i(preview_tex_loc, 0);
+                    }
+
+                    // Set iResolution specifically for the preview's dimensions
+                    GLint preview_res_loc = glGetUniformLocation(server->shader_program, "iResolution");
+                    if (preview_res_loc != -1) {
+                        float preview_res_vec[2] = {(float)preview_box_on_screen.width, (float)preview_box_on_screen.height};
+                        glUniform2fv(preview_res_loc, 1, preview_res_vec);
+                    }
+
+                    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+                    wlr_log(WLR_DEBUG, "[SCENE_ITERATOR_PREVIEW:%s] Drew preview for '%s' at %d,%d %dx%d",
+                           output_name_log, tl_title_for_log,
+                           preview_box_on_screen.x, preview_box_on_screen.y,
+                           preview_box_on_screen.width, preview_box_on_screen.height);
+
+                    // Restore iResolution for subsequent main window rendering
+                    if (preview_res_loc != -1) {
+                         float main_res_vec[2] = {(float)output->width, (float)output->height};
+                         glUniform2fv(preview_res_loc, 1, main_res_vec);
+                    }
+                }
+            } else {
+                wlr_log(WLR_ERROR, "[SCENE_ITERATOR_PREVIEW:%s] Panel node is not a wlr_scene_rect, cannot get dimensions.", output_name_log);
+            }
+        }
+    }
+
+    // Cleanup like second version
+    if (tex_loc != -1) {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(tex_attribs.target, 0);
+    }
     wlr_texture_destroy(texture);
 }
-// --- Revised output_frame ---
-// Add a counter to tinywl_output if you don't have one for debugging
-/*
-struct tinywl_output {
-    // ... existing ...
-    int frame_count; // Add this
-};
-*/
 
 #include <pthread.h>
 #include <pixman.h>
@@ -2514,6 +2134,240 @@ static void render_rect_node(struct wlr_scene_node *node, void *user_data) {
     // Do NOT call glUseProgram(0) here; output_frame will switch or unbind later.
 }
 
+static void render_panel_node(struct wlr_scene_node *node, void *user_data) {
+    struct render_data *rdata = user_data;
+    struct wlr_output *output = rdata->output;
+    struct tinywl_server *server = rdata->server;
+
+    if (node->type != WLR_SCENE_NODE_RECT || !node->enabled) {
+        return;
+    }
+    struct wlr_scene_rect *panel_srect = wlr_scene_rect_from_node(node);
+
+    if (output->width == 0 || output->height == 0) {
+        static struct wlr_output *last_logged_zero_dim_output = NULL;
+        if (last_logged_zero_dim_output != output) {
+            wlr_log(WLR_ERROR, "[render_panel_node] Output %s has zero width/height.", output->name);
+            last_logged_zero_dim_output = output;
+        }
+        return;
+    }
+    if (server->panel_shader_program == 0) {
+        static bool panel_shader_is_zero_logged = false;
+        if (!panel_shader_is_zero_logged) {
+            wlr_log(WLR_ERROR, "[render_panel_node] Panel shader program is 0.");
+            panel_shader_is_zero_logged = true;
+        }
+        return;
+    }
+
+    glUseProgram(server->panel_shader_program);
+    GLenum err_after_use_program = glGetError();
+    if (err_after_use_program != GL_NO_ERROR) {
+        wlr_log(WLR_ERROR, "[render_panel_node] GL error AFTER glUseProgram(panel_shader: %u): 0x%x",
+                server->panel_shader_program, err_after_use_program);
+        return;
+    }
+
+    // --- Standard Panel Uniforms (MVP, time, iResolution for panel's own shader effects) ---
+    float mvp_for_panel_geometry[9];
+    int sx = node->x;
+    int sy = node->y;
+    float box_scale_x = (float)panel_srect->width * (2.0f / output->width);
+    float box_scale_y = (float)panel_srect->height * (-2.0f / output->height);
+    float box_translate_x = ((float)sx / output->width) * 2.0f - 1.0f;
+    float box_translate_y = ((float)sy / output->height) * -2.0f + 1.0f;
+
+    float base_mvp[9] = {
+        box_scale_x, 0.0f, 0.0f,
+        0.0f, box_scale_y, 0.0f,
+        box_translate_x, box_translate_y, 1.0f
+    };
+    if (output->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+        float output_transform_matrix[9];
+        wlr_matrix_identity(output_transform_matrix);
+        wlr_matrix_transform(output_transform_matrix, output->transform);
+        wlr_matrix_multiply(mvp_for_panel_geometry, output_transform_matrix, base_mvp);
+    } else {
+        memcpy(mvp_for_panel_geometry, base_mvp, sizeof(base_mvp));
+    }
+
+    if (server->panel_shader_mvp_loc != -1) {
+        glUniformMatrix3fv(server->panel_shader_mvp_loc, 1, GL_FALSE, mvp_for_panel_geometry);
+    } else {
+         wlr_log(WLR_ERROR, "[render_panel_node] Panel shader 'mvp' uniform location is -1.");
+    }
+
+    if (server->panel_shader_time_loc != -1) {
+        glUniform1f(server->panel_shader_time_loc, get_monotonic_time_seconds_as_float());
+    } else {
+        static bool panel_time_loc_missing_logged = false;
+        if (!panel_time_loc_missing_logged) {
+            wlr_log(WLR_INFO, "[render_panel_node] Panel shader 'time' uniform location is -1 (or shader doesn't use it).");
+            panel_time_loc_missing_logged = true;
+        }
+    }
+
+    if (server->panel_shader_resolution_loc != -1) {
+        float panel_resolution_vec[2] = {(float)output->width, (float)output->height};
+        glUniform2fv(server->panel_shader_resolution_loc, 1, panel_resolution_vec);
+    } else {
+        static bool panel_res_loc_missing_logged = false;
+        if (!panel_res_loc_missing_logged) {
+            wlr_log(WLR_INFO, "[render_panel_node] Panel shader 'iResolution' uniform location is -1 (or shader doesn't use it).");
+            panel_res_loc_missing_logged = true;
+        }
+    }
+    // --- End Standard Panel Uniforms ---
+
+    // --- Preview-Specific Uniform Setup (using cached_texture strategy) ---
+    struct tinywl_toplevel *preview_toplevel_candidate = NULL;
+    struct wlr_texture *texture_for_preview = NULL;
+    struct wlr_gles2_texture_attribs preview_gl_tex_attribs = {0}; // Initialize
+    bool is_preview_active_flag = false; // Default to false
+
+    float calculated_norm_x = 0.f, calculated_norm_y = 0.f, calculated_norm_w = 0.f, calculated_norm_h = 0.f;
+    float calculated_preview_tex_transform_matrix[9];
+    wlr_matrix_identity(calculated_preview_tex_transform_matrix); // Initialize to identity
+
+    wlr_log(WLR_DEBUG, "[PNODE_PREVIEW] Finding preview toplevel to use its cached_texture. Total toplevels: %d", wl_list_length(&server->toplevels));
+
+    if (!wl_list_empty(&server->toplevels)) {
+        struct tinywl_toplevel *iter_tl;
+        wl_list_for_each_reverse(iter_tl, &server->toplevels, link) {
+            const char *title = (iter_tl->xdg_toplevel && iter_tl->xdg_toplevel->title) ? iter_tl->xdg_toplevel->title : "N/A";
+            wlr_log(WLR_DEBUG, "[PNODE_PREVIEW_ITER] Checking TL: %p (Title: %s) for cached_texture: %p",
+                    (void*)iter_tl, title, (void*)iter_tl->cached_texture);
+
+            if (iter_tl->xdg_toplevel &&
+                iter_tl->scene_tree && iter_tl->scene_tree->node.enabled &&
+                iter_tl->scale > 0.01f && !iter_tl->pending_destroy &&
+                iter_tl->cached_texture != NULL) {
+                
+                wlr_log(WLR_INFO, "[PNODE_PREVIEW_ITER] TL '%s': Using its cached_texture %p (Size: %dx%d).",
+                        title, (void*)iter_tl->cached_texture,
+                        iter_tl->cached_texture->width, iter_tl->cached_texture->height);
+                preview_toplevel_candidate = iter_tl;
+                texture_for_preview = iter_tl->cached_texture;
+                break; 
+            }
+        }
+    }
+
+    if (preview_toplevel_candidate && texture_for_preview) {
+        wlr_log(WLR_INFO, "[PNODE_PREVIEW] Preparing to use TL '%s's cached_texture %p for preview.",
+            preview_toplevel_candidate->xdg_toplevel->title, (void*)texture_for_preview);
+
+        is_preview_active_flag = true; 
+        wlr_gles2_texture_get_attribs(texture_for_preview, &preview_gl_tex_attribs);
+
+        glActiveTexture(GL_TEXTURE1); 
+        glBindTexture(preview_gl_tex_attribs.target, preview_gl_tex_attribs.tex);
+        glTexParameteri(preview_gl_tex_attribs.target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(preview_gl_tex_attribs.target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(preview_gl_tex_attribs.target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(preview_gl_tex_attribs.target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        GLenum gl_err_texbind = glGetError();
+        if(gl_err_texbind != GL_NO_ERROR) {
+            wlr_log(WLR_ERROR, "[PNODE_PREVIEW_GL_ERROR] Error after binding/setting params for preview texture unit 1: 0x%x", gl_err_texbind);
+            is_preview_active_flag = false;
+        }
+
+        if (is_preview_active_flag && server->panel_shader_preview_tex_loc != -1) {
+            glUniform1i(server->panel_shader_preview_tex_loc, 1); 
+             wlr_log(WLR_INFO, "[PNODE_PREVIEW] Set u_previewTexture (loc %d) to unit 1. GL Tex ID: %u",
+                    server->panel_shader_preview_tex_loc, preview_gl_tex_attribs.tex);
+        } else if(is_preview_active_flag) { 
+             wlr_log(WLR_ERROR, "[PNODE_PREVIEW] u_previewTexture location is -1! Cannot set sampler.");
+             is_preview_active_flag = false;
+        }
+
+        if (is_preview_active_flag) { 
+            float preview_pixel_height = (float)panel_srect->height - 10.0f; 
+            if (preview_pixel_height < 1.0f) preview_pixel_height = 1.0f;
+            float aspect = (texture_for_preview->width > 0 && texture_for_preview->height > 0) ?
+                           (float)texture_for_preview->width / (float)texture_for_preview->height : 1.0f;
+            float preview_pixel_width = preview_pixel_height * aspect;
+            if (preview_pixel_width < 1.0f) preview_pixel_width = 1.0f;
+            float preview_pixel_x_start = 20.0f;
+
+            if (panel_srect->width > 0 && panel_srect->height > 0) {
+                calculated_norm_x = preview_pixel_x_start / (float)panel_srect->width;
+                calculated_norm_y = 5.0f / (float)panel_srect->height; 
+                calculated_norm_w = preview_pixel_width / (float)panel_srect->width;
+                calculated_norm_h = preview_pixel_height / (float)panel_srect->height;
+                calculated_norm_w = fmaxf(0.0f, fminf(calculated_norm_w, 1.0f - calculated_norm_x)); 
+                calculated_norm_h = fmaxf(0.0f, fminf(calculated_norm_h, 1.0f - calculated_norm_y)); 
+                
+                if (calculated_norm_w > 0.001f && calculated_norm_h > 0.001f && server->panel_shader_preview_rect_loc != -1) {
+                     // Value setting will happen below, after all is_preview_active_flag checks
+                } else {
+                    wlr_log(WLR_ERROR, "[PNODE_PREVIEW] Cannot set u_previewRect or rect too small. norm_w=%.3f, norm_h=%.3f, loc=%d. Panel Dims: %dx%d",
+                            calculated_norm_w, calculated_norm_h, server->panel_shader_preview_rect_loc, panel_srect->width, panel_srect->height);
+                    is_preview_active_flag = false; 
+                }
+            } else {
+                 wlr_log(WLR_ERROR, "[PNODE_PREVIEW] Panel has zero dimensions (%dx%d), cannot calculate u_previewRect.", panel_srect->width, panel_srect->height);
+                 is_preview_active_flag = false;
+            }
+        }
+            
+        if (is_preview_active_flag) { 
+            calculated_preview_tex_transform_matrix[4] = -1.0f; 
+            calculated_preview_tex_transform_matrix[7] =  1.0f; 
+            if (server->panel_shader_preview_tex_transform_loc == -1) {
+                 wlr_log(WLR_ERROR, "[PNODE_PREVIEW] u_previewTexTransform location is -1! Cannot set tex transform.");
+                 // Potentially set is_preview_active_flag = false; if this transform is critical
+            }
+        }
+    } else { 
+        wlr_log(WLR_DEBUG, "[PNODE_PREVIEW] No suitable toplevel with a cached_texture found, or texture_for_preview is NULL.");
+        is_preview_active_flag = false;
+    }
+
+    // Set u_isPreviewActive now that all conditions have been checked
+    if (server->panel_shader_is_preview_active_loc != -1) {
+        glUniform1i(server->panel_shader_is_preview_active_loc, is_preview_active_flag ? 1 : 0);
+        wlr_log(WLR_INFO, "[PNODE_PREVIEW] FINAL u_isPreviewActive (loc %d) set to: %s",
+                server->panel_shader_is_preview_active_loc, is_preview_active_flag ? "TRUE (1)" : "FALSE (0)");
+    } else {
+        wlr_log(WLR_ERROR, "[PNODE_PREVIEW] u_isPreviewActive uniform location is -1!");
+    }
+
+    // Set the other preview uniforms ONLY IF preview is active
+    if (is_preview_active_flag) {
+        if (server->panel_shader_preview_rect_loc != -1) {
+            float rect_data[4] = {calculated_norm_x, calculated_norm_y, calculated_norm_w, calculated_norm_h};
+            glUniform4fv(server->panel_shader_preview_rect_loc, 1, rect_data);
+            wlr_log(WLR_INFO, "[PNODE_PREVIEW] Actually set u_previewRect (loc %d) to: (%.3f, %.3f, %.3f, %.3f)",
+                    server->panel_shader_preview_rect_loc, calculated_norm_x, calculated_norm_y, calculated_norm_w, calculated_norm_h);
+        }
+        if (server->panel_shader_preview_tex_transform_loc != -1) {
+            glUniformMatrix3fv(server->panel_shader_preview_tex_transform_loc, 1, GL_FALSE, calculated_preview_tex_transform_matrix);
+            wlr_log(WLR_INFO, "[PNODE_PREVIEW] Actually set u_previewTexTransform (loc %d).", server->panel_shader_preview_tex_transform_loc);
+        }
+    }
+
+
+    GLenum err_before_draw = glGetError();
+    if (err_before_draw != GL_NO_ERROR) {
+        wlr_log(WLR_ERROR, "[PNODE_PRE_DRAW_GL_ERROR] GL error BEFORE panel draw: 0x%x", err_before_draw);
+    }
+
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+
+    GLenum err_after_draw = glGetError();
+    if (err_after_draw != GL_NO_ERROR) {
+        wlr_log(WLR_ERROR, "[PNODE_POST_DRAW_GL_ERROR] GL error AFTER panel draw: 0x%x", err_after_draw);
+    }
+
+    if (is_preview_active_flag && texture_for_preview) { 
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(preview_gl_tex_attribs.target, 0); 
+        glActiveTexture(GL_TEXTURE0); 
+        // DO NOT destroy `texture_for_preview` here (it's cached)
+    }
+}
 
 static void output_frame(struct wl_listener *listener, void *data) {
     struct tinywl_output *output_wrapper = wl_container_of(listener, output_wrapper, frame);
@@ -2570,59 +2424,116 @@ static void output_frame(struct wl_listener *listener, void *data) {
     glScissor(0, 0, wlr_output->width, wlr_output->height);
     glEnable(GL_SCISSOR_TEST);
     glEnable(GL_BLEND);
+    // Important: Choose the correct blend func. If your shaders output PREMULTIPLIED ALPHA:
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    // If your shaders output STRAIGHT (NON-PREMULTIPLIED) ALPHA:
+    // glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDisable(GL_CULL_FACE);
     glDisable(GL_DEPTH_TEST);
 
     if (server->quad_vao == 0) {
          wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Quad VAO is zero! Skipping custom draw.", wlr_output->name);
     } else {
-        glBindVertexArray(server->quad_vao); // Bind VAO once for all quad draws
+        glBindVertexArray(server->quad_vao);
 
         struct render_data rdata = {
             .renderer = server->renderer,
-            // .shader_program is not strictly needed in rdata if iterators use server-> specific shaders
             .server = server,
             .output = wlr_output,
-            .pass = pass
+            .pass = pass // Though pass is not directly used by custom GL calls in iterators
         };
 
-        // 1. Render Rectangles using the dedicated rect_shader_program
-        // render_rect_node will internally call glUseProgram(server->rect_shader_program)
-        if (server->rect_shader_program != 0) {
-            wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Iterating scene children for RECTS (using rect shader)", wlr_output->name);
-            struct wlr_scene_node *child_node;
-            wl_list_for_each(child_node, &scene->tree.children, link) {
-                if (child_node->type == WLR_SCENE_NODE_RECT) {
+       
+
+        // --- Render Generic Rectangles (middle layer) ---
+        wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Iterating scene children for custom rects (non-panel).", wlr_output->name);
+        struct wlr_scene_node *child_node;
+        wl_list_for_each(child_node, &scene->tree.children, link) {
+            if (!child_node->enabled) {
+                continue;
+            }
+
+            // Skip panel nodes in this pass - we'll render them later
+            if (child_node == server->top_panel_node) {
+                continue;
+            }
+
+            if (child_node->type == WLR_SCENE_NODE_RECT) {
+                if (server->rect_shader_program != 0) {
+                    wlr_log(WLR_DEBUG, "[OUTPUT_FRAME] Rendering generic RECT node %p with rect_shader (Melt, ID: %u).", child_node, server->rect_shader_program);
                     render_rect_node(child_node, &rdata);
-                } else if (child_node->type == WLR_SCENE_NODE_TREE) {
-                    struct wlr_scene_node *sub_child_node;
-                    struct wlr_scene_tree *sub_tree = wlr_scene_tree_from_node(child_node);
-                    wl_list_for_each(sub_child_node, &sub_tree->children, link) {
-                        if (sub_child_node->type == WLR_SCENE_NODE_RECT) {
-                             render_rect_node(sub_child_node, &rdata);
+                } else {
+                    wlr_log(WLR_ERROR, "[OUTPUT_FRAME] server->rect_shader_program is 0, cannot render generic rect.");
+                }
+            } else if (child_node->type == WLR_SCENE_NODE_TREE && child_node->enabled) {
+                struct wlr_scene_node *sub_child_node;
+                struct wlr_scene_tree *sub_tree = wlr_scene_tree_from_node(child_node);
+                wl_list_for_each(sub_child_node, &sub_tree->children, link) {
+                    if (!sub_child_node->enabled) continue;
+                    
+                    // Skip panel nodes in subtrees too
+                    if (sub_child_node == server->top_panel_node) {
+                        continue;
+                    }
+                    
+                    if (sub_child_node->type == WLR_SCENE_NODE_RECT) {
+                        if (server->rect_shader_program != 0) {
+                            wlr_log(WLR_DEBUG, "[OUTPUT_FRAME] Rendering generic RECT node %p (in subtree) with rect_shader (Melt, ID: %u).", sub_child_node, server->rect_shader_program);
+                            render_rect_node(sub_child_node, &rdata);
+                        } else {
+                            wlr_log(WLR_ERROR, "[OUTPUT_FRAME] server->rect_shader_program is 0 for generic rect in subtree!");
                         }
                     }
                 }
             }
-        } else {
-            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Rect shader program is 0, skipping rect rendering.", wlr_output->name);
         }
 
-        // 2. Render client window buffers (WLR_SCENE_NODE_BUFFER) using the flame shader
-        // Ensure flame shader is active for buffers
-        if (server->shader_program != 0) { // shader_program is the flame shader
-            glUseProgram(server->shader_program);
+      
 
-            wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Iterating for BUFFERS (client windows, using flame shader)", wlr_output->name);
+        // --- Render Panel Nodes LAST (foreground layer) ---
+        wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Rendering panel nodes on top.", wlr_output->name);
+        wl_list_for_each(child_node, &scene->tree.children, link) {
+            if (!child_node->enabled) {
+                continue;
+            }
+
+            if (child_node == server->top_panel_node) {
+                if (server->panel_shader_program != 0) {
+                    wlr_log(WLR_DEBUG, "[OUTPUT_FRAME] Rendering TOP PANEL node %p with panel_shader (ID: %u) ON TOP.", child_node, server->panel_shader_program);
+                    render_panel_node(child_node, &rdata);
+                } else {
+                    wlr_log(WLR_ERROR, "[OUTPUT_FRAME] server->panel_shader_program is 0, cannot render top panel.");
+                }
+            } else if (child_node->type == WLR_SCENE_NODE_TREE && child_node->enabled) {
+                struct wlr_scene_node *sub_child_node;
+                struct wlr_scene_tree *sub_tree = wlr_scene_tree_from_node(child_node);
+                wl_list_for_each(sub_child_node, &sub_tree->children, link) {
+                    if (!sub_child_node->enabled) continue;
+                    if (sub_child_node == server->top_panel_node) {
+                         if (server->panel_shader_program != 0) {
+                            wlr_log(WLR_DEBUG, "[OUTPUT_FRAME] Rendering TOP PANEL node %p (in subtree) with panel_shader (ID: %u) ON TOP.", sub_child_node, server->panel_shader_program);
+                            render_panel_node(sub_child_node, &rdata);
+                        } else {
+                             wlr_log(WLR_ERROR, "[OUTPUT_FRAME] server->panel_shader_program is 0 for top_panel_node in subtree!");
+                        }
+                    }
+                }
+            }
+        }
+
+           // --- Render Client Window Buffers FIRST (background layer) ---
+        if (server->shader_program != 0) { // This is the flame shader for client windows
+            glUseProgram(server->shader_program); // Ensure flame shader is active
+
+            wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Iterating for BUFFERS (client windows, using flame shader ID %u)",
+                    wlr_output->name, server->shader_program);
             wlr_scene_node_for_each_buffer(&scene->tree.node, scene_buffer_iterator, &rdata);
-            // scene_buffer_iterator uses uniforms from server->flame_shader_..._loc
         } else {
-            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Flame shader program (shader_program) is 0, skipping buffer rendering.", wlr_output->name);
+            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Flame shader program (server->shader_program) is 0, skipping buffer rendering.", wlr_output->name);
         }
 
-        glBindVertexArray(0); // Unbind VAO
-        glUseProgram(0);      // Unbind any shader program
+        glBindVertexArray(0);
+        glUseProgram(0);
     }
 
     glDisable(GL_SCISSOR_TEST);
@@ -2653,6 +2564,15 @@ static void output_frame(struct wl_listener *listener, void *data) {
 
     wlr_output_state_finish(&state);
     wlr_scene_output_send_frame_done(scene_output, &now);
+
+    // // TEMPORARY: Force continuous rendering for animation debugging
+    // if (wlr_output && wlr_output->enabled &&
+    //     ( (server->panel_shader_program != 0 && server->panel_shader_time_loc != -1) ||
+    //       (server->rect_shader_program != 0 && server->rect_shader_time_loc != -1) ||
+    //       (server->shader_program != 0 && server->flame_shader_time_loc != -1) ) ) {
+    //      wlr_log(WLR_DEBUG, "[OUTPUT_FRAME %s] Scheduling next frame due to active shader animation.", wlr_output->name);
+    //      wlr_output_schedule_frame(wlr_output);
+    // }
 }
 static void output_request_state(struct wl_listener *listener, void *data) {
     struct tinywl_output *output = wl_container_of(listener, output, request_state);
@@ -2977,40 +2897,86 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
     struct tinywl_output *out;
     wl_list_for_each(out, &toplevel_wrapper->server->outputs, link) { wlr_output_schedule_frame(out->wlr_output); }
 }
+
 static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
     struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, commit);
     struct wlr_surface *surface = toplevel->xdg_toplevel->base->surface;
-    struct tinywl_server *server = toplevel->server; 
+    struct tinywl_server *server = toplevel->server;
+    const char *title = (toplevel->xdg_toplevel && toplevel->xdg_toplevel->title) ? toplevel->xdg_toplevel->title : "N/A";
 
-    if (surface && wlr_surface_has_buffer(surface)) {
-        wlr_log(WLR_INFO, "[COMMIT:%s] Surface %p committed with NEW wlr_buffer %p (seq: %u).",
-                toplevel->xdg_toplevel->title ? toplevel->xdg_toplevel->title : "N/A",
-                (void*)surface, 
-                (void*)surface->current.buffer, // Log the wlr_buffer pointer
-                surface->current.seq);
-    } else if (surface) {
-        wlr_log(WLR_DEBUG, "[COMMIT:%s] Surface %p committed WITHOUT a new buffer (config change or ack?). Seq: %u",
-                toplevel->xdg_toplevel->title ? toplevel->xdg_toplevel->title : "N/A",
-                (void*)surface, surface->current.seq);
+    if (!surface) {
+        wlr_log(WLR_ERROR, "[COMMIT:%s] Surface pointer was NULL!", title);
+        return;
     }
 
+    wlr_log(WLR_INFO, "[COMMIT:%s] Surface %p (mapped: %d) commit event. Current buffer: %p (size %dx%d), Seq: %u. Cached tex before: %p, Last cached seq: %u",
+            title, (void*)surface, surface->mapped,
+            (void*)surface->current.buffer,
+            surface->current.buffer ? surface->current.buffer->width : 0,
+            surface->current.buffer ? surface->current.buffer->height : 0,
+            surface->current.seq,
+            (void*)toplevel->cached_texture,
+            toplevel->last_commit_seq);
+
+    if (surface->current.buffer) {
+        // A buffer is present in the current state of the surface for this commit.
+        // Let's try to cache/update the texture.
+        if (toplevel->cached_texture && toplevel->last_commit_seq == surface->current.seq) {
+            // Buffer is current, and seq matches our cached texture's seq. Assume texture is still valid.
+            wlr_log(WLR_DEBUG, "[COMMIT:%s] Current buffer %p and seq %u match cached. No texture update.",
+                title, (void*)surface->current.buffer, surface->current.seq);
+        } else {
+            // Either no cached texture, or sequence number changed, indicating new content.
+            if (toplevel->cached_texture) {
+                wlr_log(WLR_DEBUG, "[COMMIT:%s] Destroying old cached_texture %p (old seq %u, new seq %u).",
+                        title, (void*)toplevel->cached_texture, toplevel->last_commit_seq, surface->current.seq);
+                wlr_texture_destroy(toplevel->cached_texture);
+                toplevel->cached_texture = NULL;
+            }
+
+            wlr_log(WLR_INFO, "[COMMIT:%s] Attempting to create new cached_texture from current.buffer %p.",
+                    title, (void*)surface->current.buffer);
+            toplevel->cached_texture = wlr_texture_from_buffer(server->renderer, surface->current.buffer);
+
+            if (toplevel->cached_texture) {
+                wlr_log(WLR_INFO, "[COMMIT:%s] Successfully cached new texture %p (from buffer %p, size %dx%d). New last_commit_seq: %u",
+                        title, (void*)toplevel->cached_texture, (void*)surface->current.buffer,
+                        toplevel->cached_texture->width, toplevel->cached_texture->height, surface->current.seq);
+                toplevel->last_commit_seq = surface->current.seq;
+            } else {
+                wlr_log(WLR_ERROR, "[COMMIT:%s] Failed to create texture from current.buffer %p for caching. last_commit_seq remains %u.",
+                        title, (void*)surface->current.buffer, toplevel->last_commit_seq);
+                // Consider what last_commit_seq should be if caching fails. Keeping old might be misleading.
+                // Perhaps set to a value indicating failure or current seq anyway.
+                toplevel->last_commit_seq = surface->current.seq; // Update seq even on failure to prevent retrying this exact failed buffer.
+            }
+        }
+    } else {
+        // surface->current.buffer is NULL for this commit.
+        // This means the client committed without a buffer, or detached its buffer.
+        if (toplevel->cached_texture) {
+            wlr_log(WLR_INFO, "[COMMIT:%s] Current buffer is NULL. Destroying stale cached_texture %p (was for seq %u).",
+                    title, (void*)toplevel->cached_texture, toplevel->last_commit_seq);
+            wlr_texture_destroy(toplevel->cached_texture);
+            toplevel->cached_texture = NULL;
+        }
+        toplevel->last_commit_seq = surface->current.seq; // Update seq to reflect this bufferless state.
+    }
+
+    // Handle initial commit and configuration
     if (toplevel->xdg_toplevel->base->initial_commit) {
         wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel, 0, 0);
         if (!toplevel->xdg_toplevel->base->configured) {
              wlr_xdg_surface_schedule_configure(toplevel->xdg_toplevel->base);
-             wlr_log(WLR_DEBUG, "[COMMIT:%s] Scheduled configure for initial commit.",
-                     toplevel->xdg_toplevel->title ? toplevel->xdg_toplevel->title : "N/A");
+             wlr_log(WLR_DEBUG, "[COMMIT:%s] Scheduled configure for initial commit.", title);
         }
     }
 
-    if (surface && surface->mapped) { 
-        struct tinywl_output *output;
-        wl_list_for_each(output, &server->outputs, link) {
-            if (output->wlr_output && output->wlr_output->enabled) {
-                wlr_log(WLR_DEBUG, "[COMMIT:%s] Scheduling frame for output %s",
-                    toplevel->xdg_toplevel->title ? toplevel->xdg_toplevel->title : "N/A",
-                    output->wlr_output->name);
-                wlr_output_schedule_frame(output->wlr_output);
+    if (surface->mapped) {
+        struct tinywl_output *output_iter;
+        wl_list_for_each(output_iter, &server->outputs, link) {
+            if (output_iter->wlr_output && output_iter->wlr_output->enabled) {
+                wlr_output_schedule_frame(output_iter->wlr_output);
             }
         }
     }
@@ -3021,135 +2987,90 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
 
 
 
-
-
 static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
     struct tinywl_toplevel *toplevel_wrapper = wl_container_of(listener, toplevel_wrapper, destroy);
-    // Capture the pointer from the wrapper BEFORE it might be nulled by this function.
-    // This is the wlroots resource whose listeners we need to clean up.
-    struct wlr_xdg_toplevel *wlroots_resource_to_clean_listeners_from = toplevel_wrapper ? toplevel_wrapper->xdg_toplevel : NULL;
+    struct wlr_xdg_toplevel *wlroots_xdg_toplevel = toplevel_wrapper ? toplevel_wrapper->xdg_toplevel : NULL;
+    const char *title_for_log = "N/A_DESTROY";
+    if (wlroots_xdg_toplevel && wlroots_xdg_toplevel->title) {
+        title_for_log = wlroots_xdg_toplevel->title;
+    } else if (toplevel_wrapper) {
+        // If title isn't available, use pointer for logging
+        char ptr_buf[32];
+        snprintf(ptr_buf, sizeof(ptr_buf), "TL_WRAPPER:%p", (void*)toplevel_wrapper);
+        title_for_log = ptr_buf; // Not ideal but better than N/A if title is gone
+    }
+
+
+    wlr_log(WLR_INFO, "[DESTROY:%s] Listener called. Wrapper Ptr:%p.", title_for_log, (void*)toplevel_wrapper);
 
     if (!toplevel_wrapper) {
-        wlr_log(WLR_ERROR, "[DESTROY KEEP ALIVE:%p] wl_container_of NULL! Listener %p, Data %p. Removing listener.",
-                toplevel_wrapper, listener, data);
-        if (listener && listener->link.next) { wl_list_remove(&listener->link); }
-        if (listener) { wl_list_init(&listener->link); }
+        // ... (existing early exit for null wrapper) ...
         return;
     }
 
-    char title_buffer[128];
-    if (wlroots_resource_to_clean_listeners_from && wlroots_resource_to_clean_listeners_from->title) {
-        strncpy(title_buffer, wlroots_resource_to_clean_listeners_from->title, sizeof(title_buffer) - 1);
-        title_buffer[sizeof(title_buffer) - 1] = '\0';
-    } else {
-        snprintf(title_buffer, sizeof(title_buffer), "WrapperPtr:%p (Initial XDG Ptr %p)",
-                 toplevel_wrapper, wlroots_resource_to_clean_listeners_from);
+    // Destroy cached_texture FIRST, as it might be tied to the surface/renderer
+    if (toplevel_wrapper->cached_texture) {
+        wlr_log(WLR_INFO, "[DESTROY:%s] Destroying cached_texture %p.",
+                title_for_log, (void*)toplevel_wrapper->cached_texture);
+        wlr_texture_destroy(toplevel_wrapper->cached_texture);
+        toplevel_wrapper->cached_texture = NULL;
     }
 
-    wlr_log(WLR_ERROR, "[DESTROY KEEP ALIVE:%s] Listener called. Wrapper Ptr:%p. XDG Ptr in wrapper (pre-null):%p. WLRoots 'data' arg Ptr:%p. Initial state: Anim:%d, Scale:%.2f, Target:%.2f, PendingD:%d",
-            title_buffer, toplevel_wrapper, wlroots_resource_to_clean_listeners_from, data,
-            toplevel_wrapper->is_animating, toplevel_wrapper->scale, toplevel_wrapper->target_scale, toplevel_wrapper->pending_destroy);
-
-    // If the wrapper's xdg_toplevel field is already NULL, it means this destroy sequence
-    // for this *wrapper* was already handled. The listener should have been removed.
-    if (!wlroots_resource_to_clean_listeners_from) { // Same as !toplevel_wrapper->xdg_toplevel
-        wlr_log(WLR_INFO, "[DESTROY KEEP ALIVE:%s] Wrapper's xdg_toplevel already NULL. Listener %p should have been removed.", title_buffer, listener);
+    // Remove listeners from the wlroots XDG toplevel resource if it still exists
+    if (wlroots_xdg_toplevel) { // Check if xdg_toplevel pointer in wrapper is still valid
+        wlr_log(WLR_DEBUG, "[DESTROY:%s] Removing listeners from wlr_xdg_toplevel %p.", title_for_log, (void*)wlroots_xdg_toplevel);
+        wl_list_remove(&toplevel_wrapper->map.link);
+        wl_list_remove(&toplevel_wrapper->unmap.link);
+        wl_list_remove(&toplevel_wrapper->commit.link);
+        // Ensure this destroy listener itself is removed
+        // This check is important: only remove if 'listener' is indeed our 'destroy' member
         if (listener == &toplevel_wrapper->destroy) {
-             if (toplevel_wrapper->destroy.link.next) wl_list_remove(&toplevel_wrapper->destroy.link);
-             wl_list_init(&toplevel_wrapper->destroy.link);
+             wl_list_remove(&toplevel_wrapper->destroy.link);
+        } else {
+             // If somehow another listener triggered this, still remove the official one
+             wl_list_remove(&toplevel_wrapper->destroy.link);
+             wlr_log(WLR_ERROR, "[DESTROY:%s] Called from unexpected listener, but removed destroy listener anyway.", title_for_log);
         }
-        return;
-    }
-
-    // Sanity check: if wlroots provides 'data', it should match the resource our listener was for.
-    // The logs show 'data' is NULL, so this check might not be hit, but it's good for robustness.
-    if (data != NULL && (struct wlr_xdg_toplevel *)data != wlroots_resource_to_clean_listeners_from) {
-         wlr_log(WLR_ERROR, "[DESTROY KEEP ALIVE:%s] MISMATCH: Wrapper XDG %p, signal data XDG %p. Removing listener %p.",
-                title_buffer, wlroots_resource_to_clean_listeners_from, data, listener);
-        if (listener == &toplevel_wrapper->destroy && toplevel_wrapper->destroy.link.next) {
-            wl_list_remove(&toplevel_wrapper->destroy.link);
-        }
-        wl_list_init(&toplevel_wrapper->destroy.link);
-        return;
-    }
-
-    // --- CRITICAL: Remove ALL listeners from the dying wlroots_xdg_resource_being_destroyed_ref ---
-    wlr_log(WLR_INFO, "[DESTROY KEEP ALIVE:%s] Removing ALL listeners from wlr_xdg_toplevel Ptr:%p.", title_buffer, wlroots_resource_to_clean_listeners_from);
-
-    // Check if link is valid (i.e., part of a list) before removing, then re-initialize.
-    if (toplevel_wrapper->map.link.next) { wl_list_remove(&toplevel_wrapper->map.link); }
-    wl_list_init(&toplevel_wrapper->map.link);
-
-    if (toplevel_wrapper->unmap.link.next) { wl_list_remove(&toplevel_wrapper->unmap.link); }
-    wl_list_init(&toplevel_wrapper->unmap.link);
-
-    if (toplevel_wrapper->commit.link.next) { wl_list_remove(&toplevel_wrapper->commit.link); }
-    wl_list_init(&toplevel_wrapper->commit.link);
-
-    if (toplevel_wrapper->request_move.link.next) { wl_list_remove(&toplevel_wrapper->request_move.link); }
-    wl_list_init(&toplevel_wrapper->request_move.link);
-
-    if (toplevel_wrapper->request_resize.link.next) { wl_list_remove(&toplevel_wrapper->request_resize.link); }
-    wl_list_init(&toplevel_wrapper->request_resize.link);
-
-    if (toplevel_wrapper->request_maximize.link.next) { wl_list_remove(&toplevel_wrapper->request_maximize.link); }
-    wl_list_init(&toplevel_wrapper->request_maximize.link);
-
-    if (toplevel_wrapper->request_fullscreen.link.next) { wl_list_remove(&toplevel_wrapper->request_fullscreen.link); }
-    wl_list_init(&toplevel_wrapper->request_fullscreen.link);
-
-    // Remove this 'destroy' listener itself.
-    if (listener == &toplevel_wrapper->destroy) { // Ensure 'listener' is indeed our 'destroy' member
-        if (toplevel_wrapper->destroy.link.next) { // Check if it's actually in a list
-            wl_list_remove(&toplevel_wrapper->destroy.link);
-            wlr_log(WLR_DEBUG, "[DESTROY KEEP ALIVE:%s] Self 'destroy' listener link removed.", title_buffer);
-        }
-        wl_list_init(&toplevel_wrapper->destroy.link); // Always re-init to a safe state
+        wl_list_remove(&toplevel_wrapper->request_move.link);
+        wl_list_remove(&toplevel_wrapper->request_resize.link);
+        wl_list_remove(&toplevel_wrapper->request_maximize.link);
+        wl_list_remove(&toplevel_wrapper->request_fullscreen.link);
     } else {
-        wlr_log(WLR_ERROR, "[DESTROY KEEP ALIVE:%s] Listener argument %p does not match &toplevel_wrapper->destroy %p! Cannot reliably remove self listener by that path.",
-                title_buffer, listener, &toplevel_wrapper->destroy);
-    }
-    // --- End of listener removal ---
-
-
-    // Cooperate with the debug state potentially set by unmap.
-    // For this SUPER DEBUG, we want to force scale to 0.1 and pending_destroy to false.
-    if (toplevel_wrapper->is_animating && toplevel_wrapper->target_scale == 0.1f && !toplevel_wrapper->pending_destroy) {
-        wlr_log(WLR_INFO, "[DESTROY SUPER DEBUG KEEP ALIVE:%s] Unmap already set debug state (target 0.1, pending_destroy false). Preserving.", title_buffer);
-        // Scale and animation_start were set by unmap. Keep them.
-        // pending_destroy is already false.
-    } else {
-        // If unmap didn't set it, or set it to something else, force our debug state here.
-        wlr_log(WLR_ERROR, "[DESTROY SUPER DEBUG KEEP ALIVE:%s] Forcing static small scale state (0.1).", title_buffer);
-        toplevel_wrapper->is_animating = true;     // Set to true to make iterator process it once
-        toplevel_wrapper->scale        = 0.1f;
-        toplevel_wrapper->target_scale = 0.1f;
-        toplevel_wrapper->animation_duration = 0.001f; // To make it "finish" to static quickly
-        toplevel_wrapper->animation_start = get_monotonic_time_seconds_as_float();
-        toplevel_wrapper->pending_destroy = false; // CRITICAL FOR DEBUG: DO NOT CLEAN UP
+         wlr_log(WLR_INFO, "[DESTROY:%s] Wrapper's xdg_toplevel was already NULL. Listeners might have been removed prior.", title_for_log);
+         // Still ensure this listener's link is cleaned if it's the one being called
+         if (listener == &toplevel_wrapper->destroy) {
+              wl_list_remove(&toplevel_wrapper->destroy.link);
+         }
     }
 
 
+    // Scene node destruction
     if (toplevel_wrapper->scene_tree) {
-        if (!toplevel_wrapper->scene_tree->node.enabled) {
-            wlr_scene_node_set_enabled(&toplevel_wrapper->scene_tree->node, true);
-            wlr_log(WLR_ERROR, "[DESTROY SUPER DEBUG KEEP ALIVE:%s] Scene node RE-ENABLED.", title_buffer);
-        }
-    } else {
-        wlr_log(WLR_ERROR, "[DESTROY SUPER DEBUG KEEP ALIVE:%s] No scene_tree!", title_buffer);
+        wlr_log(WLR_DEBUG, "[DESTROY:%s] Destroying scene_tree node %p.", title_for_log, (void*)&toplevel_wrapper->scene_tree->node);
+        wlr_scene_node_destroy(&toplevel_wrapper->scene_tree->node); // This also destroys client_xdg_scene_tree if it's a child
+        toplevel_wrapper->scene_tree = NULL;
+        toplevel_wrapper->client_xdg_scene_tree = NULL; // It's destroyed as part of scene_tree
     }
 
-    wlr_log(WLR_ERROR, "[DESTROY SUPER DEBUG KEEP ALIVE:%s] Setting wrapper's xdg_toplevel field to NULL.", title_buffer);
-    toplevel_wrapper->xdg_toplevel = NULL; // Decouple from the (now listener-less from our side) wlroots resource
+    // Remove from server's list
+    wl_list_remove(&toplevel_wrapper->link);
+    wlr_log(WLR_DEBUG, "[DESTROY:%s] Removed toplevel wrapper from server list.", title_for_log);
 
-    struct tinywl_output *output_sched;
-    wl_list_for_each(output_sched, &toplevel_wrapper->server->outputs, link) {
-        if (output_sched && output_sched->wlr_output && output_sched->wlr_output->enabled) {
-            wlr_output_schedule_frame(output_sched->wlr_output);
-        }
-    }
 
-   }
+    // If this destroy is called directly (e.g. from server_destroy), we'd free here.
+    // If it's from the xdg_toplevel->events.destroy signal, wlroots handles the xdg_toplevel.
+    // The wrapper struct should be freed.
+    // The KEEP_ALIVE logic made this complicated. For a normal destroy:
+    // free(toplevel_wrapper);
+    // toplevel_wrapper = NULL; // Good practice if pointer is reused, though not here.
+    // For your KEEP_ALIVE debug, you skip the free.
+    // For now, let's assume the "KEEP_ALIVE" implies you are not freeing toplevel_wrapper here.
+
+    wlr_log(WLR_INFO, "[DESTROY:%s] Finished processing destroy for wrapper %p.", title_for_log, (void*)toplevel_wrapper);
+    // Nullify the xdg_toplevel pointer in the wrapper, as the wlroots resource is gone (or going).
+    // This prevents use-after-free if the wrapper struct persists.
+    toplevel_wrapper->xdg_toplevel = NULL;
+}
 static void begin_interactive(struct tinywl_toplevel *toplevel, enum tinywl_cursor_mode mode, uint32_t edges) {
     struct tinywl_server *server = toplevel->server;
     server->grabbed_toplevel = toplevel;
@@ -3307,6 +3228,7 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
     // Create client XDG surface scene node
     toplevel->client_xdg_scene_tree = wlr_scene_xdg_surface_create(toplevel->scene_tree, xdg_toplevel->base);
     if (!toplevel->client_xdg_scene_tree) {
+        toplevel->client_xdg_scene_tree->node.data = toplevel; 
         wlr_log(WLR_ERROR, "SERVER_NEW_XDG_TOPLEVEL: Failed to create client_xdg_scene_tree");
         wlr_scene_node_destroy(&toplevel->scene_tree->node);
         free(toplevel);
@@ -3488,6 +3410,401 @@ void cleanup_egl(struct tinywl_server *server) {
 /* Updated main function */
 int main(int argc, char *argv[]) {
     
+
+
+// Vertex shader for simple colored rectangles
+static const char *rect_vertex_shader_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2 position;      // Vertex positions (0 to 1 for unit quad)\n"
+    "in vec2 texcoord;      // Vertex texture/local coordinates (also 0 to 1 if VAO is set up for it)\n"
+    "out vec2 v_texcoord;   // Pass local quad coordinates to fragment shader (for vignette)\n"
+    "uniform mat3 mvp;\n"
+    "void main() {\n"
+    "    vec3 pos_transformed = mvp * vec3(position, 1.0);\n"
+    "    gl_Position = vec4(pos_transformed.xy, 0.0, 1.0);\n"
+    "    v_texcoord = texcoord; // Pass the VAO's texcoord attribute\n"
+    "}\n";
+
+static const char *rect_fragment_shader_src =
+    "/* Creative Commons Licence Attribution-NonCommercial-ShareAlike \n"
+    "phreax/jiagual 2025 \n"
+    "Variation of https://www.shadertoy.com/view/tfG3zt\n"
+    "             https://www.shadertoy.com/view/3XjXzK\n"
+    "Inspired by Xor's recent volumetric shaders\n"
+    "https://www.shadertoy.com/view/tXlXDX\n"
+    "*/\n"
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "\n"
+    "uniform float time;\n"
+    "uniform vec4 u_color;\n"
+    "\n"
+    "#define PALETTE 6\n"
+    "\n"
+    "mat2 rot(float x) {return mat2(cos(x), -sin(x), sin(x), cos(x));}\n"
+    "vec3 pal(float x) {return .5+.5*cos(6.28*x-vec3(5,4,1));}\n"
+    "\n"
+    "vec3 getPal(int palette, float x) {\n"
+    "    return pal(x);\n"
+    "}\n"
+    "\n"
+    "#define SIN(x) sin(x)\n"
+    "\n"
+    "void main() {\n"
+    "    vec2 fragCoord = gl_FragCoord.xy;\n"
+    "    vec2 iResolution = vec2(1024.0, 768.0);\n"
+    "    float iTime = time * 0.5;\n"
+    "    \n"
+    "    vec2 uv = (fragCoord - .5*iResolution.xy)/min(iResolution.x, iResolution.y);\n"
+    "    float tt = iTime*.5;\n"
+    "    \n"
+    "    uv.xy *= mix(.8, 1.2, SIN(-tt+5.*length(uv.xy)));\n"
+    "    \n"
+    "    vec3 col = vec3(0);\n"
+    "    vec3 rd = vec3(uv, 1);\n"
+    "    vec3 p = vec3(0);\n"
+    "    float t = .1;\n"
+    "    \n"
+    "    for(float i=0.; i<120.; i++) {\n"
+    "        vec3 p = t*rd + rd;\n"
+    "        \n"
+    "        float r = length(p);\n"
+    "        \n"
+    "        float z = p.z;\n"
+    "        p.xy *= rot(p.z*.75);\n"
+    "      \n"
+    "        // log spherical coords\n"
+    "        p = vec3(log(r)*.5,\n"
+    "            acos(p.z / r),\n"
+    "            atan(p.y, p.x));\n"
+    "        p = abs(p)-mix(.1, .5, SIN(.2*tt));\n"
+    "    \n"
+    "        for(float j=0.; j < 3.; j++) {     \n"
+    "            float  a= exp(j)/exp2(j);\n"
+    "            p += cos(2.*p.yzx*a + .5*tt - length(p.xy)*9.)/a; \n"
+    "        }\n"
+    "        \n"
+    "        float d = 0.007 + abs((exp2(1.4*p)-vec3(0,1.+.7*SIN(tt),0)).y-1.)/14.;\n"
+    "        float k = t*.7 +length(p)*.1 - .2*tt + z*.1;\n"
+    "        vec3 c = getPal(PALETTE, k);\n"
+    "        c = mix(c, c*vec3(0.922,0.973,0.725), SIN(z*.5));\n"
+    "        col += c*1e-3/d;       \n"
+    "        t += d/4.;\n"
+    "    }\n"
+    "    \n"
+    "    // add glow in the center\n"
+    "    float gl = exp(-17.*length(uv.xy));\n"
+    "    col += .4*mix(vec3(0.361,0.957,1.000), vec3(0.847,1.000,0.561), SIN(gl*2.-tt))*pow(gl*11., 1.);\n"
+    "    \n"
+    "    // tone mapping & gamma correction\n"
+    "    col *= tanh(col*.1);\n"
+    "    col = pow(col, vec3(.45));\n"
+    "    \n"
+    "    // Apply user color as subtle accent\n"
+    "    col = mix(col, col * u_color.rgb, 0.1);\n"
+    "    \n"
+    "    frag_color = vec4(col, u_color.a).bgra;\n"
+    "}\n";
+
+
+const char *vertex_shader_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2 position;\n"
+    "in vec2 texcoord;\n" 
+    "out vec2 v_texcoord;\n" 
+    "uniform mat3 mvp;\n"
+    "void main() {\n"
+    "    vec3 pos_transformed = mvp * vec3(position, 1.0);\n"
+    "    gl_Position = vec4(pos_transformed.xy, 0.0, 1.0);\n"
+    "    v_texcoord = position;\n" 
+    "}\n";
+
+const char *fragment_shader_src = 
+"#version 300 es\n"
+"precision mediump float;\n"
+"in vec2 v_texcoord;\n"
+"out vec4 frag_color;\n"
+"uniform sampler2D texture_sampler_uniform;\n"
+"uniform float time;\n"
+"uniform vec2 iResolution;\n"
+"\n"
+"float rand(vec2 n) {\n"
+"    return fract(sin(cos(dot(n, vec2(12.9898, 12.1414)))) * 83758.5453);\n"
+"}\n"
+"\n"
+"float noise(vec2 n) {\n"
+"    const vec2 d = vec2(0.0, 1.0);\n"
+"    vec2 b = floor(n), f = smoothstep(vec2(0.0), vec2(1.0), fract(n));\n"
+"    return mix(mix(rand(b), rand(b + d.yx), f.x), mix(rand(b + d.xy), rand(b + d.yy), f.x), f.y);\n"
+"}\n"
+"\n"
+"float fbm(vec2 n) {\n"
+"    float total = 0.0, amplitude = 1.0;\n"
+"    for (int i = 0; i < 5; i++) {\n"
+"        total += noise(n) * amplitude;\n"
+"        n += n * 1.7;\n"
+"        amplitude *= 0.67;\n"
+"    }\n"
+"    return total;\n"
+"}\n"
+"\n"
+"void main() {\n"
+"    float alpha_threshold = 0.9;\n"
+"    vec2 uv = v_texcoord;\n"
+"    \n"
+"    // Sample original texture\n"
+"    vec4 tex_color = texture2D(texture_sampler_uniform, uv);\n"
+"    \n"
+"    // Preserve transparent areas\n"
+"    if(tex_color.a <= alpha_threshold) {\n"
+"        frag_color = vec4(0.0, 0.0, 0.0, 0.0).bgra;\n"
+"        return;\n"
+"    }\n"
+"    \n"
+"    // Normalize time\n"
+"    float iTime = mod(time, 100.0);\n"
+"    \n"
+"    // Color palette from Remix 2 with white\n"
+"    const vec3 c1 = vec3(0.5, 0.0, 0.1); // Red\n"
+"    const vec3 c2 = vec3(0.9, 0.1, 0.0); // Orange\n"
+"    const vec3 c3 = vec3(0.2, 0.1, 0.7); // Subtle blue\n"
+"    const vec3 c4 = vec3(1.0, 0.9, 0.1); // Yellow\n"
+"    const vec3 c7 = vec3(1.0, 1.0, 1.0); // White for highlights\n"
+"    \n"
+"    // Speed and shift\n"
+"    vec2 speed = vec2(0.1, 0.9);\n"
+"    float shift = 1.327 + sin(iTime * 2.0) / 2.4;\n"
+"    float dist = 3.5 - sin(iTime * 0.4) / 1.89;\n"
+"    \n"
+"    // Adjust UV to position flames (base at bottom, tips at top)\n"
+"    vec2 adjusted_uv = vec2(uv.x, 1.0 - uv.y * 1.2 + 0.2);\n"
+"    vec2 p = adjusted_uv * dist;\n"
+"    p += sin(p.yx * 4.0 + vec2(0.2, -0.3) * iTime) * 0.04;\n"
+"    p += sin(p.yx * 8.0 + vec2(0.6, 0.1) * iTime) * 0.01;\n"
+"    p.x -= iTime / 1.1;\n"
+"    \n"
+"    // Multiple FBM layers for base flames\n"
+"    float q = fbm(p - iTime * 0.3 + 1.0 * sin(iTime + 0.5) / 2.0);\n"
+"    float qb = fbm(p - iTime * 0.4 + 0.1 * cos(iTime) / 2.0);\n"
+"    float q2 = fbm(p - iTime * 0.44 - 5.0 * cos(iTime) / 2.0) - 6.0;\n"
+"    float q3 = fbm(p - iTime * 0.9 - 10.0 * cos(iTime) / 15.0) - 4.0;\n"
+"    float q4 = fbm(p - iTime * 1.4 - 20.0 * sin(iTime) / 14.0) + 2.0;\n"
+"    q = (q + qb - 0.4 * q2 - 2.0 * q3 + 0.6 * q4) / 3.8;\n"
+"    \n"
+"    // Top flame layer for taller flames\n"
+"    vec2 top_flame_p = vec2(adjusted_uv.x * 5.0 + sin(iTime * 0.8) * 0.2, (adjusted_uv.y + iTime * 1.2) * 16.0);\n"
+"    float top_flame_q = fbm(top_flame_p - iTime * 0.3 + 1.0 * sin(iTime + 0.5) / 2.0);\n"
+"    float top_flame_qb = fbm(top_flame_p - iTime * 0.4 + 0.1 * cos(iTime) / 2.0);\n"
+"    float top_flame_q2 = fbm(top_flame_p - iTime * 0.44 - 5.0 * cos(iTime) / 2.0) - 6.0;\n"
+"    float top_flame_q3 = fbm(top_flame_p - iTime * 0.9 - 10.0 * cos(iTime) / 15.0) - 4.0;\n"
+"    float top_flame_q4 = fbm(top_flame_p - iTime * 1.4 - 20.0 * sin(iTime) / 14.0) + 2.0;\n"
+"    float top_flame_noise = (top_flame_q + top_flame_qb - 0.4 * top_flame_q2 - 2.0 * top_flame_q3 + 0.6 * top_flame_q4) / 3.8;\n"
+"    top_flame_noise = clamp(top_flame_noise * 1.2, 0.0, 1.0);\n"
+"    \n"
+"    // Flame shapes\n"
+"    float dist_from_fire_line = adjusted_uv.y;\n"
+"    float flame_shape = smoothstep(0.0, 0.3, dist_from_fire_line);\n"
+"    float top_flame_shape = smoothstep(0.0, 1.0, dist_from_fire_line);\n"
+"    \n"
+"    // Flame intensities\n"
+"    vec2 r = vec2(fbm(p + q / 2.0 + iTime * speed.x - p.x - p.y), fbm(p + q - iTime * speed.y));\n"
+"    float flame_intensity = q * flame_shape;\n"
+"    float flame_intensity_smooth = smoothstep(0.1, 0.95, flame_intensity);\n"
+"    float top_flame_intensity = top_flame_noise * top_flame_shape;\n"
+"    top_flame_intensity *= (1.0 + sin(iTime * 2.0 + adjusted_uv.x * 5.0) * 0.3);\n"
+"    float top_flame_intensity_smooth = smoothstep(0.15, 0.95, top_flame_intensity);\n"
+"    \n"
+"    // Color blending\n"
+"    vec3 fire_color = mix(c1, c2, fbm(p + r));\n"
+"    fire_color = mix(c3, c4, r.x);\n"
+"    fire_color = vec3(1.0 / pow(fire_color + 1.61, vec3(4.0)));\n"
+"    fire_color = mix(fire_color, c7, pow(flame_intensity, 2.0) * 0.1);\n"
+"    fire_color = vec3(1.0, 0.2, 0.05) / pow((r.y + r.y) * max(0.0, adjusted_uv.y) + 0.1, 4.0);\n"
+"    fire_color += tex_color.xyz * 0.01 * pow((r.y + r.y) * 0.65, 5.0) * mix(vec3(0.9, 0.4, 0.3), vec3(0.7, 0.5, 0.2), adjusted_uv.y);\n"
+"    fire_color = fire_color / (10.0 + max(vec3(0.0), fire_color));\n"
+"    \n"
+"    // Top flame color\n"
+"    vec2 top_r = vec2(fbm(top_flame_p + top_flame_q / 2.0 + iTime * speed.x - top_flame_p.x - top_flame_p.y), fbm(top_flame_p + top_flame_q - iTime * speed.y));\n"
+"    vec3 top_fire_color = mix(c2, c4, fbm(top_flame_p + top_r));\n"
+"    top_fire_color += mix(c3, c4, top_r.x) * 0.5;\n"
+"    top_fire_color = vec3(1.0 / pow(top_fire_color + 1.61, vec3(4.0)));\n"
+"    top_fire_color = mix(top_fire_color, c7, pow(top_flame_intensity, 2.0) * 0.95);\n"
+"    top_fire_color = top_fire_color / (1.0 + max(vec3(0.0), top_fire_color));\n"
+"    \n"
+"    // Flickering\n"
+"    float flicker = fbm(vec2(iTime * 10.0 + adjusted_uv.x * 8.0, iTime * 7.0)) * 0.4 + 0.6;\n"
+"    \n"
+"    // Blend with background\n"
+"    vec3 final_color = mix(vec3(0.0), fire_color, flame_intensity_smooth);\n"
+"    final_color = mix(final_color, top_fire_color, top_flame_intensity_smooth * 0.01);\n"
+"    float final_alpha = max(flame_intensity_smooth, top_flame_intensity_smooth);\n"
+"    \n"
+"    // Apply texture overlay at 60% opacity\n"
+"    final_color = mix(final_color, tex_color.xyz, 0.2);\n"
+"    \n"
+"    // Make low-intensity areas transparent\n"
+"    if(final_alpha < 0.1) {\n"
+"        frag_color = vec4(0.0, 0.0, 0.0, 0.0).bgra;\n"
+"        return;\n"
+"    }\n"
+"    \n"
+"    frag_color = vec4(final_color*4.0, final_alpha).bgra;\n"
+"}";   
+
+
+
+// Vertex shader for simple colored rectangles
+static const char *panel_vertex_shader_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2 position;      // Vertex positions (0 to 1 for unit quad)\n"
+    "in vec2 texcoord;      // Vertex texture/local coordinates (also 0 to 1 if VAO is set up for it)\n"
+    "out vec2 v_texcoord;   // Pass local quad coordinates to fragment shader (for vignette)\n"
+    "uniform mat3 mvp;\n"
+    "void main() {\n"
+    "    vec3 pos_transformed = mvp * vec3(position, 1.0);\n"
+    "    gl_Position = vec4(pos_transformed.xy, 0.0, 1.0);\n"
+    "    v_texcoord = texcoord; // Pass the VAO's texcoord attribute\n"
+    "}\n";
+
+static const char *panel_fragment_shader_src = 
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "\n"
+    "in vec2 v_texcoord; // Normalized UV for the panel quad itself (0,0 to 1,1)\n"
+    "out vec4 frag_color;\n"
+    "\n"
+    "// Time and resolution uniforms for octgrams animation\n"
+    "uniform float time;\n"
+    "uniform vec2 iResolution;\n"
+    "\n"
+    "// Uniforms for the preview functionality\n"
+    "uniform sampler2D u_previewTexture;     // The window texture for the preview\n"
+    "uniform bool u_isPreviewActive;         // Flag: is there a preview to draw?\n"
+    "uniform vec4 u_previewRect;           // Preview position and size on panel: x, y, w, h (normalized 0-1 relative to panel's own UVs)\n"
+    "uniform mat3 u_previewTexTransform;   // Transform for sampling the preview texture\n"
+    "\n"
+    "// Octgrams animation variables and functions\n"
+    "float gTime = 0.0;\n"
+    "const float REPEAT = 5.0;\n"
+    "\n"
+    "mat2 rot(float a) {\n"
+    "    float c = cos(a), s = sin(a);\n"
+    "    return mat2(c,s,-s,c);\n"
+    "}\n"
+    "\n"
+    "float sdBox( vec3 p, vec3 b ) {\n"
+    "    vec3 q = abs(p) - b;\n"
+    "    return length(max(q,0.0)) + min(max(q.x,max(q.y,q.z)),0.0);\n"
+    "}\n"
+    "\n"
+    "float box(vec3 pos, float scale) {\n"
+    "    pos *= scale;\n"
+    "    float base = sdBox(pos, vec3(.4,.4,.1)) /1.5;\n"
+    "    pos.xy *= 5.0;\n"
+    "    pos.y -= 3.5;\n"
+    "    pos.xy *= rot(.75);\n"
+    "    float result = -base;\n"
+    "    return result;\n"
+    "}\n"
+    "\n"
+    "float box_set(vec3 pos, float iTime) {\n"
+    "    vec3 pos_origin = pos;\n"
+    "    pos = pos_origin;\n"
+    "    pos.y += sin(gTime * 0.4) * 2.5;\n"
+    "    pos.xy *= rot(.8);\n"
+    "    float box1 = box(pos,2.0 - abs(sin(gTime * 0.4)) * 1.5);\n"
+    "    pos = pos_origin;\n"
+    "    pos.y -=sin(gTime * 0.4) * 2.5;\n"
+    "    pos.xy *= rot(.8);\n"
+    "    float box2 = box(pos,2.0 - abs(sin(gTime * 0.4)) * 1.5);\n"
+    "    pos = pos_origin;\n"
+    "    pos.x +=sin(gTime * 0.4) * 2.5;\n"
+    "    pos.xy *= rot(.8);\n"
+    "    float box3 = box(pos,2.0 - abs(sin(gTime * 0.4)) * 1.5);\n"
+    "    pos = pos_origin;\n"
+    "    pos.x -=sin(gTime * 0.4) * 2.5;\n"
+    "    pos.xy *= rot(.8);\n"
+    "    float box4 = box(pos,2.0 - abs(sin(gTime * 0.4)) * 1.5);\n"
+    "    pos = pos_origin;\n"
+    "    pos.xy *= rot(.8);\n"
+    "    float box5 = box(pos,.5) * 6.0;\n"
+    "    pos = pos_origin;\n"
+    "    float box6 = box(pos,.5) * 6.0;\n"
+    "    float result = max(max(max(max(max(box1,box2),box3),box4),box5),box6);\n"
+    "    return result;\n"
+    "}\n"
+    "\n"
+    "float map(vec3 pos, float iTime) {\n"
+    "    vec3 pos_origin = pos;\n"
+    "    float box_set1 = box_set(pos, iTime);\n"
+    "    return box_set1;\n"
+    "}\n"
+    "\n"
+    "vec4 getOctgramsColor() {\n"
+    "    vec2 fragCoord = gl_FragCoord.xy;\n"
+    "    float iTime = time;\n"
+    "    \n"
+    "    vec2 p = (fragCoord.xy * 2.0 - iResolution.xy) / min(iResolution.x, iResolution.y);\n"
+    "    vec3 ro = vec3(0.0, -0.2, iTime * 4.0);\n"
+    "    vec3 ray = normalize(vec3(p, 1.5));\n"
+    "    ray.xy = ray.xy * rot(sin(iTime * .03) * 5.0);\n"
+    "    ray.yz = ray.yz * rot(sin(iTime * .05) * .2);\n"
+    "    float t = 0.1;\n"
+    "    vec3 col = vec3(0.0);\n"
+    "    float ac = 0.0;\n"
+    "    \n"
+    "    for (int i = 0; i < 99; i++){\n"
+    "        vec3 pos = ro + ray * t;\n"
+    "        pos = mod(pos-2.0, 4.0) -2.0;\n"
+    "        gTime = iTime -float(i) * 0.01;\n"
+    "        \n"
+    "        float d = map(pos, iTime);\n"
+    "        d = max(abs(d), 0.01);\n"
+    "        ac += exp(-d*23.0);\n"
+    "        t += d* 0.55;\n"
+    "    }\n"
+    "    \n"
+    "    col = vec3(ac * 0.02);\n"
+    "    col +=vec3(0.0,0.2 * abs(sin(iTime)),0.5 + sin(iTime) * 0.2);\n"
+    "    \n"
+    "    return vec4(col, 0.6);\n"
+    "}\n"
+    "\n"
+    "void main() {\n"
+    "    // Start with the octgrams animation as the background\n"
+    "    vec4 background_color = getOctgramsColor();\n"
+    "    vec4 final_pixel_color = background_color;\n"
+    "\n"
+    "    // Layer the preview on top if active\n"
+    "    if (u_isPreviewActive) {\n"
+    "        // Check if we're inside the preview rectangle\n"
+    "        bool is_inside_preview_x = (v_texcoord.x >= u_previewRect.x && v_texcoord.x < (u_previewRect.x + u_previewRect.z));\n"
+    "        bool is_inside_preview_y = (v_texcoord.y >= u_previewRect.y && v_texcoord.y < (u_previewRect.y + u_previewRect.w));\n"
+    "        \n"
+    "        if (is_inside_preview_x && is_inside_preview_y) {\n"
+    "            // We're inside the preview area - sample the preview texture\n"
+    "            vec3 transformed_uv_homogeneous = u_previewTexTransform * vec3(v_texcoord, 1.0);\n"
+    "            vec2 final_sample_uv = transformed_uv_homogeneous.xy;\n"
+    "            \n"
+    "            vec4 preview_sample = texture(u_previewTexture, final_sample_uv);\n"
+    "            \n"
+    "            if (preview_sample.a > 0.05) {\n"
+    "                // Blend the preview over the background\n"
+    "                final_pixel_color = mix(background_color, preview_sample, preview_sample.a);\n"
+    "            }\n"
+    "        }\n"
+    "    }\n"
+    "\n"
+    "    frag_color = final_pixel_color.bgra;\n"
+    "}";
+
+
     setenv("MESA_VK_VERSION_OVERRIDE", "1.2", 1);
     setenv("MESA_LOADER_DRIVER_OVERRIDE", "zink", 1);
    // setenv("GALLIUM_DRIVER", "zink", 1);
@@ -3604,25 +3921,88 @@ const char *vendor = (const char *)glGetString(GL_VENDOR);
 
     wlr_renderer_init_wl_display(server.renderer, server.wl_display);
 
- if (!create_shader_program(&server)) {
-        wlr_log(WLR_ERROR, "Failed to create shader program");
-        server_destroy(&server);
-        return 1;
+
+
+ // --- Create Flame Shader ---
+    struct shader_uniform_spec flame_uniforms[] = {
+        {"mvp", &server.flame_shader_mvp_loc},
+        {"texture_sampler_uniform", &server.flame_shader_tex_loc},
+        {"time", &server.flame_shader_time_loc},
+        {"iResolution", &server.flame_shader_res_loc}
+    };
+    if (!create_generic_shader_program(server.renderer, "FlameShader",
+                                     vertex_shader_src, fragment_shader_src, // Use your actual flame shader sources
+                                     &server.shader_program,
+                                     flame_uniforms, sizeof(flame_uniforms) / sizeof(flame_uniforms[0]))) {
+        wlr_log(WLR_ERROR, "Failed to create flame shader program.");
+        server_destroy(&server); return 1;
     }
 
- if (!create_rect_shader_program(&server)) { // Create the new rect shader
-        wlr_log(WLR_ERROR, "Failed to create rect shader program");
-        server_destroy(&server); // server_destroy should also clean up rect_shader_program if it was partially created
-        return 1;
-    }   
+    // --- Create "70s Melt" Rectangle Shader ---
+    struct shader_uniform_spec melt_rect_uniforms[] = {
+        {"mvp", &server.rect_shader_mvp_loc},
+        {"u_color", &server.rect_shader_color_loc},
+        {"time", &server.rect_shader_time_loc},
+        {"iResolution", &server.rect_shader_resolution_loc}
+    };
+    if (!create_generic_shader_program(server.renderer, "MeltRectShader",
+                                     rect_vertex_shader_src, // Your 70s melt VS
+                                     rect_fragment_shader_src, // Your 70s melt FS
+                                     &server.rect_shader_program,
+                                     melt_rect_uniforms, sizeof(melt_rect_uniforms) / sizeof(melt_rect_uniforms[0]))) {
+        wlr_log(WLR_ERROR, "Failed to create '70s Melt' rect shader program.");
+        server_destroy(&server); return 1;
+    }
 
+    // --- Create Panel Shader (Stripes) ---
+    struct shader_uniform_spec panel_uniforms[] = {
+        {"mvp", &server.panel_shader_mvp_loc},                       // For mat3
+        {"time", &server.panel_shader_time_loc},                     // For float
+        {"iResolution", &server.panel_shader_resolution_loc},        // For vec2
+        {"u_previewTexture", &server.panel_shader_preview_tex_loc},  // For sampler2D (int)
+        {"u_isPreviewActive", &server.panel_shader_is_preview_active_loc}, // For bool (int)
+        {"u_previewRect", &server.panel_shader_preview_rect_loc},          // For vec4
+        {"u_previewTexTransform", &server.panel_shader_preview_tex_transform_loc} // For mat3
+    };
+    if (!create_generic_shader_program(server.renderer, "PanelStripeShader",
+                                     panel_vertex_shader_src, panel_fragment_shader_src,
+                                     &server.panel_shader_program,
+                                     panel_uniforms, sizeof(panel_uniforms) / sizeof(panel_uniforms[0]))) {
+        wlr_log(WLR_ERROR, "Failed to create panel stripe shader program.");
+        server_destroy(&server); return 1;
+    }
 
-   // In main(), after create_shader_program() and before wlr_allocator_autocreate()
-
- // Inside main()
-    // ... (after wlr_renderer_init_wl_display and successful create_shader_program)
-
+    // --- VAO Setup ---
+    // Ensure EGL context is current for VAO operations.
+    // create_generic_shader_program restores the context, so make it current again.
     struct wlr_egl *egl_main = wlr_gles2_renderer_get_egl(server.renderer);
+    if (wlr_egl_make_current(egl_main, NULL)) {
+        // Your existing VAO setup code...
+        // When setting attribute pointers, you need a program active that uses those attributes
+        // OR use layout(location=N) in GLSL and fixed locations in glVertexAttribPointer.
+        // Since you get locations by name, make one program active:
+        glUseProgram(server.shader_program); // or rect_shader_program, or panel_shader_program
+                                           // assuming "position" and "texcoord" are common attribute names.
+
+        GLint pos_loc = glGetAttribLocation(server.shader_program, "position");
+        if (pos_loc != -1) {
+            glBindBuffer(GL_ARRAY_BUFFER, server.quad_vbo);
+            glEnableVertexAttribArray(pos_loc);
+            glVertexAttribPointer(pos_loc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)0);
+        }
+        GLint tex_loc = glGetAttribLocation(server.shader_program, "texcoord");
+        if (tex_loc != -1) {
+            glBindBuffer(GL_ARRAY_BUFFER, server.quad_vbo);
+            glEnableVertexAttribArray(tex_loc);
+            glVertexAttribPointer(tex_loc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)(2 * sizeof(GLfloat)));
+        }
+        glUseProgram(0);
+        glBindVertexArray(0);
+        wlr_egl_unset_current(egl_main);
+    } else {
+         wlr_log(WLR_ERROR, "Failed to make EGL context current for VAO setup.");
+         server_destroy(&server); return 1;
+    }
     GLenum err_main;
     if (wlr_egl_make_current(egl_main, NULL)) {
         while ((err_main = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error main A (after make_current): 0x%x", err_main); }
@@ -3683,7 +4063,7 @@ const char *vendor = (const char *)glGetString(GL_VENDOR);
         server_destroy(&server);
         // return 1; // Or handle error appropriately
     }
-    // ... rest of main
+    
 
     server.allocator = wlr_allocator_autocreate(server.backend, server.renderer);
     if (!server.allocator) {
@@ -3744,7 +4124,8 @@ const char *vendor = (const char *)glGetString(GL_VENDOR);
     wl_signal_add(&server.backend->events.new_input, &server.new_input);
  
 
-test_red_rectangle_alternative(&server);
+desktop_background(&server);
+desktop_panel(&server);
 
     const char *socket = wl_display_add_socket_auto(server.wl_display);
     if (!socket) {
