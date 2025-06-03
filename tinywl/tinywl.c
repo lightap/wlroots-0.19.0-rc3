@@ -11,6 +11,9 @@
 #include <wlr/backend/RDP.h>
 #include <wlr/types/wlr_xdg_shell.h>
 
+#include <wlr/types/wlr_xdg_decoration_v1.h>
+
+
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_compositor.h>
@@ -58,9 +61,21 @@
 #include <wlr/render/pass.h>        // For wlr_render_pass API
 #include <GLES3/gl31.h>
 #include <time.h>
-
-#ifndef RENDER_EGL_H
-#define RENDER_EGL_H
+#include <string.h> // For memcpy
+#include <math.h>   // For round
+#include <wlr/types/wlr_matrix.h>
+// Helper (ensure it's defined or declared before these functions)
+// static float get_monotonic_time_seconds_as_float() { /* ... */ }
+#include <GLES2/gl2.h>
+#include <wlr/render/gles2.h>
+#include <wlr/types/wlr_matrix.h>
+#include <wlr/types/wlr_output.h>
+#include <wlr/types/wlr_scene.h>
+#include <wlr/types/wlr_xdg_shell.h>
+#include <wlr/types/wlr_compositor.h>
+#include <wlr/util/log.h>
+#include <string.h>
+#include <stdlib.h>
 
 #include <wlr/render/egl.h>
 
@@ -68,6 +83,36 @@
       // For wlr_matrix_project_box
 #include <wlr/types/wlr_scene.h>    // For scene graph functions
 #include <GLES3/gl31.h>             // For OpenGL ES 3.1
+
+// Ensure you have these includes (or equivalent for your project structure)
+#include <time.h>
+#include <wlr/types/wlr_compositor.h> // For wlr_surface_send_frame_done
+#include <wlr/types/wlr_output_damage.h> // For wlr_output_damage_add_whole (optional but good)
+
+
+#include <wlr/types/wlr_xdg_shell.h>
+#include <wlr/util/box.h>
+#include <wlr/util/transform.h>
+#include <wlr/util/log.h>
+#include <wlr/render/wlr_renderer.h>
+
+
+#include <pixman.h>
+#include <time.h>
+#include <pthread.h>
+#include <wlr/types/wlr_scene.h>
+#include <wlr/types/wlr_output.h>
+#include <wlr/types/wlr_matrix.h> 
+#include <wlr/types/wlr_matrix.h>
+
+#define PROTOCOL_DECORATION_MODE_NONE 0
+#define PROTOCOL_DECORATION_MODE_SERVER_SIDE 1
+#define PROTOCOL_DECORATION_MODE_CLIENT_SIDE 2
+
+
+#ifndef RENDER_EGL_H
+#define RENDER_EGL_H
+
 
 struct wlr_egl {
     EGLDisplay display;
@@ -220,6 +265,17 @@ enum tinywl_cursor_mode {
 
 
 
+struct render_data {
+    struct wlr_render_pass *pass;
+    struct wlr_renderer *renderer;
+    GLuint shader_program;
+       GLint scale_uniform_loc; // Renamed to avoid conflict
+    struct tinywl_server *server;
+    struct wlr_output *output; // Add output for projection matrix
+};
+
+
+
 struct tinywl_server {
     struct wl_display *wl_display;
     struct wlr_backend *backend;
@@ -278,6 +334,7 @@ struct wl_listener pointer_motion;
     GLint rect_shader_color_loc;
     GLint rect_shader_time_loc;
     GLint rect_shader_resolution_loc; // New: for iResolution
+    GLint rect_shader_rect_res_loc;  
 
     // New: Panel Shader
     GLuint panel_shader_program;
@@ -286,11 +343,28 @@ struct wl_listener pointer_motion;
     GLint panel_shader_base_color_loc; // u_panel_base_color
     GLint panel_shader_resolution_loc;
 
-     // ADD THESE UNIFORM LOCATIONS FOR THE PANEL PREVIEW
+
+ // ADD THESE UNIFORM LOCATIONS FOR THE PANEL PREVIEW
     GLint panel_shader_preview_tex_loc;
     GLint panel_shader_is_preview_active_loc;
     GLint panel_shader_preview_rect_loc;
     GLint panel_shader_preview_tex_transform_loc;
+
+
+// NEW: Shader for SSDs
+    GLuint ssd_shader_program;
+    GLint ssd_shader_mvp_loc;
+    GLint ssd_shader_color_loc;
+
+    struct wlr_scene_node *main_background_node;
+
+    GLuint back_shader_program;
+    GLint back_shader_mvp_loc;
+    GLint back_shader_time_loc;
+    GLint back_shader_base_color_loc; // u_panel_base_color
+    GLint back_shader_resolution_loc;
+    GLint back_shader_tex_loc ;
+    GLint back_shader_res_loc;
 
     // Pointer to the top panel's scene node for easy identification
     struct wlr_scene_node *top_panel_node;
@@ -303,7 +377,11 @@ struct wl_listener pointer_motion;
     GLuint quad_vbo;
     GLuint quad_ibo;
 
-  
+
+ 
+
+    struct wlr_xdg_decoration_manager_v1 *xdg_decoration_manager;
+struct wl_listener xdg_decoration_new;
 };
 
 /* Updated tinywl_output struct to store timer */
@@ -324,6 +402,21 @@ enum tinywl_toplevel_type {
     TINYWL_TOPLEVEL_XDG,
     TINYWL_TOPLEVEL_CUSTOM,
 };
+
+struct tinywl_decoration { // Your struct for SSD scene rects
+    struct tinywl_toplevel *toplevel;
+    struct wlr_scene_rect *title_bar;
+    struct wlr_scene_rect *border_top;
+     bool enabled;
+ 
+        struct wlr_scene_rect *border_left;
+        struct wlr_scene_rect *border_right;
+        struct wlr_scene_rect *border_bottom;
+
+};
+
+#define TITLE_BAR_HEIGHT 30
+#define BORDER_WIDTH 4
 
 struct tinywl_toplevel {
     struct wl_list link;
@@ -362,6 +455,19 @@ bool mapped;
     float animation_duration; // Duration in seconds (e.g., 0.3 for 300ms)
  bool pending_destroy;
 enum tinywl_toplevel_type type;
+
+struct wlr_xdg_toplevel_decoration_v1 *decoration;
+    struct wl_listener decoration_destroy;
+    struct wl_listener decoration_request_mode;
+
+     struct tinywl_decoration ssd; 
+
+     struct wl_listener decoration_destroy_listener;
+     struct wl_listener decoration_request_mode_listener;
+
+     // Decoration fields
+     bool ssd_pending_enable;
+    
 };
 
 
@@ -428,7 +534,12 @@ void desktop_background(struct tinywl_server *server) ;
  float get_monotonic_time_seconds_as_float(void) ;
 static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer, int sx, int sy, void *user_data); // If not already declared
 
-
+// Forward declarations (ensure these are before server_new_xdg_decoration)
+static void decoration_handle_destroy(struct wl_listener *listener, void *data);
+static void decoration_handle_request_mode(struct wl_listener *listener, void *data);
+// Helper function to update decoration geometry
+static void update_decoration_geometry(struct tinywl_toplevel *toplevel);
+ void ensure_ssd_enabled(struct tinywl_toplevel *toplevel);
 
 // Function to compile a shader
 static GLuint compile_shader(GLenum type, const char *source) {
@@ -966,7 +1077,7 @@ static void server_new_keyboard(struct tinywl_server *server, struct wlr_input_d
 }
 
 static void server_pointer_motion(struct wl_listener *listener, void *data) {
-    struct tinywl_server *server = wl_container_of(listener, server, pointer_motion);
+    struct tinywl_server *server = wl_container_of(listener, server, pointer_motion); 
     struct wlr_pointer_motion_event *event = data;
 
     if (!server->cursor || !server->output_layout) {
@@ -984,20 +1095,30 @@ static void server_new_pointer(struct tinywl_server *server, struct wlr_input_de
         wlr_log(WLR_ERROR, "Device %p is not a pointer", device);
         return;
     }
-    wlr_cursor_attach_input_device(server->cursor, device);
+    wlr_cursor_attach_input_device(server->cursor, device); // This is good, adds device to cursor
+
+    // The wlr_cursor itself will emit motion events that aggregate all attached inputs.
+    // You are already listening to server->cursor->events.motion in main().
+    // So, you might not even need to listen to individual pointer->events.motion here.
+
+    // If you *do* want to listen to individual raw pointer events:
     struct wlr_pointer *pointer = wlr_pointer_from_input_device(device);
     if (pointer) {
-        static struct wl_listener pointer_motion_listener;
-        pointer_motion_listener.notify = server_pointer_motion;
-        wl_signal_add(&pointer->events.motion, &pointer_motion_listener);
-        wlr_log(WLR_DEBUG, "Attached motion listener for pointer %p", pointer);
-        // Set default cursor image
-        wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
-        wlr_log(WLR_INFO, "Set default cursor image for device %p", device);
+        // If you absolutely need a per-device listener that calls server_pointer_motion,
+        // then server_pointer_motion CANNOT use wl_container_of with server.pointer_motion.
+        // It would need a different way to get the 'server' instance.
+
+        // For now, let's assume the listener on server.cursor->events.motion in main()
+        // is sufficient for cursor movement. We can remove the direct listener on
+        // pointer->events.motion to avoid the conflict if server.cursor handles aggregation.
+
+        wlr_log(WLR_DEBUG, "Pointer device %p attached to cursor. Cursor will aggregate its events.", device);
+        wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default"); // Set cursor image for this device if needed
     } else {
         wlr_log(WLR_ERROR, "Failed to get wlr_pointer from device %p", device);
     }
 }
+
 
 static void server_new_input(struct wl_listener *listener, void *data) {
     struct tinywl_server *server = wl_container_of(listener, server, new_input);
@@ -1035,6 +1156,35 @@ static void seat_request_set_selection(struct wl_listener *listener, void *data)
 }
 
 
+// You can replace or augment desktop_toplevel_at.
+// This new function tries to find the toplevel owner of any scene node.
+static struct tinywl_toplevel *get_toplevel_from_scene_node(struct wlr_scene_node *node) {
+    if (!node) {
+        return NULL;
+    }
+    // Traverse up the scene graph to find a node that has a tinywl_toplevel in its data field
+    // and ensure that node is the toplevel->scene_tree.
+    struct wlr_scene_tree *tree = node->parent;
+    while (tree != NULL) {
+        if (tree->node.data != NULL) {
+            struct tinywl_toplevel *toplevel_candidate = tree->node.data;
+            // Verify this is indeed the main scene_tree of the toplevel
+            if (toplevel_candidate->scene_tree == tree) {
+                return toplevel_candidate;
+            }
+        }
+        tree = tree->node.parent;
+    }
+    // If the node itself is a toplevel's scene_tree
+    if (node->type == WLR_SCENE_NODE_TREE && node->data != NULL) {
+        struct tinywl_toplevel *toplevel_candidate = node->data;
+        if (toplevel_candidate->scene_tree == (struct wlr_scene_tree *)node) {
+            return toplevel_candidate;
+        }
+    }
+    return NULL;
+}
+
 
 static struct tinywl_toplevel *desktop_toplevel_at(
         struct tinywl_server *server, double lx, double ly,
@@ -1067,10 +1217,16 @@ static struct tinywl_toplevel *desktop_toplevel_at(
 ///////////////////////////////////////////////////
 
 
-static void process_cursor_move(struct tinywl_server *server) {
+static void process_cursor_move(struct tinywl_server *server) { // This is called when server->cursor_mode == TINYWL_CURSOR_MOVE
     struct tinywl_toplevel *toplevel = server->grabbed_toplevel;
-    wlr_scene_node_set_position(&toplevel->scene_tree->node,
-        server->cursor->x - server->grab_x, server->cursor->y - server->grab_y);
+    if (!toplevel) return; // Should not happen in move mode
+
+    // New position for the toplevel's scene_tree
+    int new_x = server->cursor->x - server->grab_x;
+    int new_y = server->cursor->y - server->grab_y;
+
+    wlr_scene_node_set_position(&toplevel->scene_tree->node, new_x, new_y);
+    wlr_log(WLR_DEBUG, "Moving toplevel to (%d, %d)", new_x, new_y);
 }
 
 static void process_cursor_resize(struct tinywl_server *server) {
@@ -1172,9 +1328,15 @@ static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
 
 
 static void server_cursor_motion(struct wl_listener *listener, void *data) {
-    struct tinywl_server *server = wl_container_of(listener, server, cursor_motion);
+    // THIS listener *IS* server.cursor_motion from the struct tinywl_server
+    struct tinywl_server *server = wl_container_of(listener, server, cursor_motion); // Correct use of server.cursor_motion
     struct wlr_pointer_motion_event *event = data;
-    wlr_cursor_move(server->cursor, &event->pointer->base, event->delta_x, event->delta_y);
+
+    // The 'dev' field in wlr_pointer_motion_event from wlr_cursor might be NULL
+    // if the motion was synthetic (e.g. warp). Use server->cursor->active_pointer_device if needed.
+    // For wlr_cursor_move, the device argument is optional if you just want to move based on deltas.
+    wlr_cursor_move(server->cursor, NULL /* or &event->pointer->base if from a specific device */,
+                    event->delta_x, event->delta_y);
     process_cursor_motion(server, event->time_msec);
 }
 
@@ -1190,131 +1352,90 @@ static void server_cursor_motion_absolute(struct wl_listener *listener, void *da
 static void server_cursor_button(struct wl_listener *listener, void *data) {
     struct tinywl_server *server = wl_container_of(listener, server, cursor_button);
     struct wlr_pointer_button_event *event = data;
+    struct wlr_seat *seat = server->seat;
 
-    // Log event for debugging
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    uint64_t now_ms = now.tv_sec * 1000 + now.tv_nsec / 1000000;
-    wlr_log(WLR_DEBUG, "Button: button=%u, state=%s, event_time=%u, now=%lu, cursor_mode=%d",
+    wlr_log(WLR_DEBUG, "Button: button=%u, state=%s, time=%u, cursor_mode=%d",
             event->button, event->state == WL_POINTER_BUTTON_STATE_PRESSED ? "pressed" : "released",
-            event->time_msec, now_ms, server->cursor_mode);
+            event->time_msec, server->cursor_mode);
 
-    // Find surface under cursor
     double sx, sy;
-    struct wlr_surface *surface = NULL;
-    struct tinywl_toplevel *toplevel = desktop_toplevel_at(server,
-            server->cursor->x, server->cursor->y, &surface, &sx, &sy);
+    struct wlr_scene_node *scene_node_at_cursor = wlr_scene_node_at(
+        &server->scene->tree.node, server->cursor->x, server->cursor->y, &sx, &sy);
 
-    // Update pointer focus
-    if (surface) {
-        wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
-        wlr_seat_pointer_notify_motion(server->seat, event->time_msec, sx, sy);
-    } else {
-        wlr_seat_pointer_clear_focus(server->seat);
+    struct tinywl_toplevel *toplevel = NULL;
+    if (scene_node_at_cursor) {
+        toplevel = get_toplevel_from_scene_node(scene_node_at_cursor);
     }
 
-    // Notify button event to clients
-    wlr_seat_pointer_notify_button(server->seat, event->time_msec, event->button, event->state);
-
-    // Handle button press
-    if (event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
-        if (toplevel && surface && toplevel->xdg_toplevel) {
-            bool is_popup_surface = false;
-            struct wlr_xdg_surface *xdg_surface = wlr_xdg_surface_try_from_wlr_surface(surface);
-            if (xdg_surface && xdg_surface->role == WLR_XDG_SURFACE_ROLE_POPUP) {
-                is_popup_surface = true;
-            }
-            if (!is_popup_surface && server->cursor_mode == TINYWL_CURSOR_PASSTHROUGH) {
-                focus_toplevel(toplevel);
-
-                // Initiate drag or resize based on keyboard modifiers
-                bool alt_pressed = wlr_keyboard_get_modifiers(server->seat->keyboard_state.keyboard) & WLR_MODIFIER_ALT;
-                bool ctrl_pressed = wlr_keyboard_get_modifiers(server->seat->keyboard_state.keyboard) & WLR_MODIFIER_CTRL;
-                if (event->button == BTN_LEFT && alt_pressed) {
-                    server->cursor_mode = TINYWL_CURSOR_MOVE;
-                    server->grabbed_toplevel = toplevel;
-                    server->grab_x = server->cursor->x;
-                    server->grab_y = server->cursor->y;
-                    // Initialize grab_geobox with cursor position and surface dimensions
-                    int width = 800, height = 600; // Default size
-                    if (surface && surface->current.width > 0 && surface->current.height > 0) {
-                        width = surface->current.width;
-                        height = surface->current.height;
-                    }
-                    server->grab_geobox = (struct wlr_box){
-                        .x = (int)server->cursor->x,
-                        .y = (int)server->cursor->y,
-                        .width = width,
-                        .height = height
-                    };
-                    wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "grab");
-                    wlr_log(WLR_DEBUG, "Started window move: toplevel=%p, geobox=[%d,%d,%d,%d]",
-                            toplevel, server->grab_geobox.x, server->grab_geobox.y,
-                            server->grab_geobox.width, server->grab_geobox.height);
-                } else if (event->button == BTN_LEFT && ctrl_pressed) {
-                    server->cursor_mode = TINYWL_CURSOR_RESIZE;
-                    server->grabbed_toplevel = toplevel;
-                    server->grab_x = server->cursor->x;
-                    server->grab_y = server->cursor->y;
-                    // Initialize grab_geobox with cursor position and surface dimensions
-                    int width = 800, height = 600; // Default size
-                    if (surface && surface->current.width > 0 && surface->current.height > 0) {
-                        width = surface->current.width;
-                        height = surface->current.height;
-                    }
-                    server->grab_geobox = (struct wlr_box){
-                        .x = (int)server->cursor->x,
-                        .y = (int)server->cursor->y,
-                        .width = width,
-                        .height = height
-                    };
-                    server->resize_edges = WLR_EDGE_BOTTOM | WLR_EDGE_RIGHT;
-                    wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "resize");
-                    wlr_log(WLR_DEBUG, "Started window resize: toplevel=%p, geobox=[%d,%d,%d,%d], edges=%u",
-                            toplevel, server->grab_geobox.x, server->grab_geobox.y,
-                            server->grab_geobox.width, server->grab_geobox.height, server->resize_edges);
-                }
-            }
-        }
-    }
-    // Handle button release
-    else if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
-        // Reset cursor mode and grab state
+    if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
         if (server->cursor_mode == TINYWL_CURSOR_MOVE || server->cursor_mode == TINYWL_CURSOR_RESIZE) {
             server->cursor_mode = TINYWL_CURSOR_PASSTHROUGH;
             server->grabbed_toplevel = NULL;
-            server->grab_x = 0;
-            server->grab_y = 0;
-            server->grab_geobox = (struct wlr_box){0};
-            server->resize_edges = 0;
-            wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
-            wlr_log(WLR_DEBUG, "Reset cursor mode to PASSTHROUGH on button release");
+            wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default"); // Reset cursor
+            wlr_log(WLR_DEBUG, "Ended interactive move/resize.");
         }
-    }
+        // Notify client of button release, even if we handled the press
+        wlr_seat_pointer_notify_button(seat, event->time_msec, event->button, event->state);
+    } else if (event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
+        bool button_handled_by_compositor = false;
 
-    // Handle popup surface frame updates
-    if (surface) {
-        struct wlr_xdg_surface *xdg_surface = wlr_xdg_surface_try_from_wlr_surface(surface);
-        if (xdg_surface && xdg_surface->role == WLR_XDG_SURFACE_ROLE_POPUP) {
-            struct tinywl_output *output;
-            wl_list_for_each(output, &server->outputs, link) {
-                if (output->wlr_output && output->wlr_output->enabled) {
-                    wlr_output_schedule_frame(output->wlr_output);
+        if (toplevel && toplevel->xdg_toplevel && toplevel->ssd.enabled) {
+            // Check if the click is on our SSD title bar
+            if (scene_node_at_cursor == &toplevel->ssd.title_bar->node) {
+                if (event->button == BTN_LEFT) {
+                    wlr_log(WLR_INFO, "Grabbed toplevel '%s' by title bar for MOVE.",
+                            toplevel->xdg_toplevel->title ? toplevel->xdg_toplevel->title : "N/A");
+
+                    // Bring to front and focus
+                    focus_toplevel(toplevel); // focus_toplevel also raises to top
+
+                    server->cursor_mode = TINYWL_CURSOR_MOVE;
+                    server->grabbed_toplevel = toplevel;
+                    // Grab coordinates are relative to the toplevel's scene_tree origin
+                    server->grab_x = server->cursor->x - toplevel->scene_tree->node.x;
+                    server->grab_y = server->cursor->y - toplevel->scene_tree->node.y;
+                    wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "grabbing"); // Or "move"
+                    button_handled_by_compositor = true;
                 }
             }
-            if (xdg_surface->surface && !xdg_surface->surface->current.buffer) {
-                struct timespec now;
-                clock_gettime(CLOCK_MONOTONIC, &now);
-                wlr_surface_send_frame_done(xdg_surface->surface, &now);
+            // TODO: Add similar checks here for border scene_nodes if you want to implement resize by dragging borders.
+            // else if (scene_node_at_cursor == &toplevel->ssd.border_left->node && ...) { server->cursor_mode = TINYWL_CURSOR_RESIZE; ... }
+        }
+
+        // If not handled by compositor SSD interaction, pass to client or handle default focus.
+        if (!button_handled_by_compositor) {
+            struct wlr_surface *surface_under_cursor = NULL;
+            if (scene_node_at_cursor && scene_node_at_cursor->type == WLR_SCENE_NODE_BUFFER) {
+                struct wlr_scene_buffer *sbuf = wlr_scene_buffer_from_node(scene_node_at_cursor);
+                struct wlr_scene_surface *ssurf = wlr_scene_surface_try_from_buffer(sbuf);
+                if (ssurf) {
+                    surface_under_cursor = ssurf->surface;
+                }
+            }
+
+            if (surface_under_cursor) {
+                // Focus the toplevel if the click was on its content or a non-interactive part of SSD
+                if (toplevel) {
+                    focus_toplevel(toplevel);
+                }
+                wlr_seat_pointer_notify_enter(seat, surface_under_cursor, sx, sy);
+                wlr_seat_pointer_notify_button(seat, event->time_msec, event->button, event->state);
+            } else {
+                // Clicked on empty space or non-surface scene node
+                wlr_seat_pointer_clear_focus(seat);
+                // Potentially unfocus keyboard as well, or focus a background surface if you have one.
+                 if (seat->keyboard_state.focused_surface) {
+                     wlr_seat_keyboard_clear_focus(seat);
+                 }
             }
         }
     }
 
-    // Schedule frame for all outputs
-    struct tinywl_output *output;
-    wl_list_for_each(output, &server->outputs, link) {
-        if (output->wlr_output && output->wlr_output->enabled) {
-            wlr_output_schedule_frame(output->wlr_output);
+    // Schedule frame for all outputs if something might have changed visually
+    struct tinywl_output *output_iter;
+    wl_list_for_each(output_iter, &server->outputs, link) {
+        if (output_iter->wlr_output && output_iter->wlr_output->enabled) {
+            wlr_output_schedule_frame(output_iter->wlr_output);
         }
     }
 }
@@ -1464,71 +1585,11 @@ static void popup_commit(struct wl_listener *listener, void *data) {
 }
 
 
-// Ensure you have these includes (or equivalent for your project structure)
-#include <time.h>
-#include <wlr/types/wlr_compositor.h> // For wlr_surface_send_frame_done
-#include <wlr/types/wlr_output_damage.h> // For wlr_output_damage_add_whole (optional but good)
 
 
-#include <wlr/types/wlr_xdg_shell.h>
-#include <wlr/util/box.h>
-#include <wlr/util/transform.h>
-#include <wlr/util/log.h>
-#include <wlr/render/wlr_renderer.h>
 
 
-#include <pixman.h>
-#include <time.h>
-#include <pthread.h>
-#include <wlr/types/wlr_scene.h>
-#include <wlr/types/wlr_output.h>
-#include <wlr/types/wlr_matrix.h> 
-#include <wlr/types/wlr_matrix.h>
 
-
-struct render_data {
-    struct wlr_render_pass *pass;
-    struct wlr_renderer *renderer;
-    GLuint shader_program;
-       GLint scale_uniform_loc; // Renamed to avoid conflict
-    struct tinywl_server *server;
-    struct wlr_output *output; // Add output for projection matrix
-};
-
-#include <wlr/types/wlr_matrix.h>
-
-// ... (struct render_data definition) ...
-
-#include <string.h> // For memcpy
-#include <math.h>   // For round
-#include <wlr/types/wlr_matrix.h>
-// Ensure other necessary includes are present at the top of your file
-
-// struct render_data should be defined as before:
-/*
-struct render_data {
-    struct wlr_render_pass *pass;
-    struct wlr_renderer *renderer;
-    GLuint shader_program;
-    // GLint scale_uniform_loc; // If you had a separate scale uniform in shader
-    struct tinywl_server *server;
-    struct wlr_output *output;
-};
-*/
-#include <string.h> // For memcpy
-#include <math.h>   // For round
-#include <wlr/types/wlr_matrix.h>
-
-// struct render_data definition...
-
-#include <string.h> // For memcpy
-#include <math.h>   // For round
-#include <wlr/types/wlr_matrix.h>
-
-
-#include <string.h> // For memcpy
-#include <math.h>   // For round, fmaxf, fminf
-#include <time.h>   // For clock_gettime
 
 float get_monotonic_time_seconds_as_float(void) {
     struct timespec ts;
@@ -1539,23 +1600,6 @@ float get_monotonic_time_seconds_as_float(void) {
     return (float)ts.tv_sec + (float)ts.tv_nsec / 1e9f;
 }
 
-#include <string.h> // For memcpy
-#include <math.h>   // For round, fmaxf, fminf
-#include <time.h>   // For clock_gettime
-
-
-// Helper (ensure it's defined or declared before these functions)
-// static float get_monotonic_time_seconds_as_float() { /* ... */ }
-#include <GLES2/gl2.h>
-#include <wlr/render/gles2.h>
-#include <wlr/types/wlr_matrix.h>
-#include <wlr/types/wlr_output.h>
-#include <wlr/types/wlr_scene.h>
-#include <wlr/types/wlr_xdg_shell.h>
-#include <wlr/types/wlr_compositor.h>
-#include <wlr/util/log.h>
-#include <string.h>
-#include <stdlib.h>
 
 
 
@@ -1564,22 +1608,21 @@ float get_monotonic_time_seconds_as_float(void) {
 
 
 
-// STEP 5: Alternative test - Create rectangle differently
+
+
 void desktop_background(struct tinywl_server *server) {
-    wlr_log(WLR_INFO, "=== ALTERNATIVE RECTANGLE TEST ===");
-    
-    // Method 1: Direct color array
-    float red_color[4] = {1.0f, 0.0f, 0.0f, 1.0f};
-    struct wlr_scene_rect *rect1 = wlr_scene_rect_create(&server->scene->tree, 1024, 768, red_color);
-    if (rect1) {
-        wlr_scene_node_set_position(&rect1->node, 0, 0);
-        wlr_scene_node_set_enabled(&rect1->node, true);
-        wlr_log(WLR_INFO, "Alternative rect 1 created at (0,0)");
+    wlr_log(WLR_INFO, "=== DESKTOP BACKGROUND (MELT SHADER) ===");
+    float bg_color[4] = {1.0f, 0.0f, 0.0f, 1.0f}; // Base color for the Melt shader
+    struct wlr_scene_rect *bg_rect = wlr_scene_rect_create(&server->scene->tree, 1024, 768, bg_color);
+    if (bg_rect) {
+        server->main_background_node = &bg_rect->node; // Store the pointer
+        wlr_scene_node_set_position(&bg_rect->node, 0, 0);
+        wlr_scene_node_set_enabled(&bg_rect->node, true);
+        wlr_log(WLR_INFO, "Main background rect created at (0,0), node: %p", (void*)server->main_background_node);
+    } else {
+        server->main_background_node = NULL;
+        wlr_log(WLR_ERROR, "Failed to create main background rect.");
     }
-    
-    
-    
-    
 }
 
 
@@ -1654,6 +1697,209 @@ void debug_scene_tree(struct wlr_scene *scene, struct wlr_output *output) {
     wlr_log(WLR_INFO, "[DEBUG] Total nodes: %d", node_count);
 }
 
+// scene_buffer_iterator for MAIN WINDOWS ONLY (using windowback Shader)
+static void scene_buffer_iterator_main_window_only(
+        struct wlr_scene_buffer *scene_buffer,
+        int sx, int sy,
+        void *user_data) {
+
+    struct render_data *rdata = user_data;
+    struct wlr_renderer *renderer = rdata->renderer;
+    struct wlr_output *output = rdata->output;
+    struct tinywl_server *server = rdata->server;
+    struct wlr_gles2_texture_attribs tex_attribs;
+    const char *output_name_log = output ? output->name : "UNKNOWN_OUTPUT_MAIN_ITER";
+
+    // --- Basic Validation ---
+    if (!rdata || !server || !renderer || !output) {
+        wlr_log(WLR_ERROR, "[SITER_MAIN_ONLY:%s] Invalid render_data, server, renderer, or output.", output_name_log);
+        return;
+    }
+    if (!scene_buffer) {
+        wlr_log(WLR_ERROR, "[SITER_MAIN_ONLY:%s] scene_buffer is NULL.", output_name_log);
+        return;
+    }
+    if (!scene_buffer->node.enabled) {
+        // This buffer node is part of the scene but currently disabled, skip rendering.
+        // This is normal, e.g., for an unmapped window.
+        return;
+    }
+    if (output->width == 0 || output->height == 0) {
+        wlr_log(WLR_ERROR, "[SITER_MAIN_ONLY:%s] Output has zero width/height.", output_name_log);
+        return;
+    }
+    if (!scene_buffer->buffer) {
+        wlr_log(WLR_DEBUG, "[SITER_MAIN_ONLY:%s] scene_buffer %p has NULL wlr_buffer, skipping.", output_name_log, (void*)scene_buffer);
+        return;
+    }
+
+    // --- Find Associated Toplevel for Animation ---
+    struct tinywl_toplevel *toplevel_for_anim = NULL;
+    struct wlr_scene_node *current_node_for_owner_search = &scene_buffer->node;
+    int depth = 0;
+    while(current_node_for_owner_search && depth < 10) { // Depth limit for safety
+        if (current_node_for_owner_search->data != NULL) {
+            struct tinywl_toplevel *potential_tl = current_node_for_owner_search->data;
+            struct tinywl_toplevel *check_tl_in_list;
+            bool is_known_and_correct_toplevel = false;
+            wl_list_for_each(check_tl_in_list, &server->toplevels, link) {
+                if (check_tl_in_list == potential_tl) {
+                    // Check if this is the toplevel's main scene tree node
+                    if (potential_tl->scene_tree == (struct wlr_scene_tree*)current_node_for_owner_search) {
+                        is_known_and_correct_toplevel = true;
+                        break;
+                    }
+                }
+            }
+            if (is_known_and_correct_toplevel) {
+                toplevel_for_anim = potential_tl;
+                break;
+            }
+        }
+        if (!current_node_for_owner_search->parent) break;
+        current_node_for_owner_search = &current_node_for_owner_search->parent->node;
+        depth++;
+    }
+
+    const char* tl_title_for_log = "UNKNOWN/NON-TOPLEVEL";
+    if (toplevel_for_anim && toplevel_for_anim->xdg_toplevel && toplevel_for_anim->xdg_toplevel->title) {
+        tl_title_for_log = toplevel_for_anim->xdg_toplevel->title;
+    } else if (toplevel_for_anim) {
+        tl_title_for_log = "TOPLEVEL_NO_TITLE";
+    }
+    wlr_log(WLR_DEBUG, "[SITER_MAIN_ONLY:%s] Processing buffer for '%s' (toplevel_for_anim: %p)",
+            output_name_log, tl_title_for_log, (void*)toplevel_for_anim);
+
+
+    // --- Animation Scaling ---
+    float anim_scale_factor = 1.0f;
+    if (toplevel_for_anim) {
+        if (toplevel_for_anim->is_animating) {
+            struct timespec now_anim;
+            clock_gettime(CLOCK_MONOTONIC, &now_anim);
+            float current_time_anim = now_anim.tv_sec + now_anim.tv_nsec / 1e9f;
+            float elapsed = current_time_anim - toplevel_for_anim->animation_start;
+            if (elapsed < 0.0f) elapsed = 0.0f;
+            float t = 0.0f;
+            if (toplevel_for_anim->animation_duration > 1e-5f) {
+                t = elapsed / toplevel_for_anim->animation_duration;
+            } else if (elapsed > 0) { t = 1.0f; }
+
+            if (t >= 1.0f) {
+                t = 1.0f;
+                anim_scale_factor = toplevel_for_anim->target_scale;
+                if (toplevel_for_anim->target_scale == 0.0f && !toplevel_for_anim->pending_destroy) {
+                    toplevel_for_anim->scale = 0.0f;
+                    wlr_output_schedule_frame(output);
+                } else {
+                    toplevel_for_anim->is_animating = false;
+                    toplevel_for_anim->scale = toplevel_for_anim->target_scale;
+                }
+            } else {
+                anim_scale_factor = toplevel_for_anim->scale + (toplevel_for_anim->target_scale - toplevel_for_anim->scale) * t;
+            }
+            if (toplevel_for_anim->is_animating) {
+                wlr_output_schedule_frame(output);
+            }
+        } else {
+            anim_scale_factor = toplevel_for_anim->scale;
+            if (toplevel_for_anim->target_scale == 0.0f && toplevel_for_anim->scale <= 0.001f && !toplevel_for_anim->pending_destroy) {
+                wlr_output_schedule_frame(output);
+            }
+        }
+        // wlr_log(WLR_DEBUG, "[SITER_MAIN_ONLY:%s] TL '%s' anim_scale_factor: %.3f", output_name_log, tl_title_for_log, anim_scale_factor);
+    }
+    if (anim_scale_factor < 0.001f && !(toplevel_for_anim && toplevel_for_anim->target_scale == 0.0f && !toplevel_for_anim->pending_destroy)) {
+        anim_scale_factor = 0.001f; // Prevent fully zero scale unless intended for minimize
+    }
+
+
+    // --- Main Window Rendering ---
+    struct wlr_texture *texture = wlr_texture_from_buffer(renderer, scene_buffer->buffer);
+    if (!texture) {
+        wlr_log(WLR_ERROR, "[SITER_MAIN_ONLY:%s] Failed to create wlr_texture from buffer %p for '%s'.",
+                output_name_log, (void*)scene_buffer->buffer, tl_title_for_log);
+        return;
+    }
+    wlr_gles2_texture_get_attribs(texture, &tex_attribs);
+
+    struct wlr_box main_render_box = {
+        .x = (int)round((double)sx + (double)texture->width * (1.0 - (double)anim_scale_factor) / 2.0),
+        .y = (int)round((double)sy + (double)texture->height * (1.0 - (double)anim_scale_factor) / 2.0),
+        .width = (int)round((double)texture->width * (double)anim_scale_factor),
+        .height = (int)round((double)texture->height * (double)anim_scale_factor),
+    };
+
+    if (main_render_box.width <= 0 || main_render_box.height <= 0) {
+        if (toplevel_for_anim && !toplevel_for_anim->pending_destroy && toplevel_for_anim->target_scale == 0.0f) {
+            // This is fine for a minimized window.
+        } else {
+            wlr_log(WLR_DEBUG, "[SITER_MAIN_ONLY:%s] Scaled dimensions for '%s' are zero/negative (%dx%d) with scale %.2f. Skipping draw.",
+                   output_name_log, tl_title_for_log, main_render_box.width, main_render_box.height, anim_scale_factor);
+        }
+        wlr_texture_destroy(texture);
+        return;
+    }
+
+    // Calculate MVP matrix exactly like first version
+    float main_mvp[9];
+    wlr_matrix_identity(main_mvp);
+    float box_scale_x = (float)main_render_box.width * (2.0f / output->width);
+    float box_scale_y = (float)main_render_box.height * (-2.0f / output->height);
+    float box_translate_x = ((float)main_render_box.x / output->width) * 2.0f - 1.0f;
+    float box_translate_y = ((float)main_render_box.y / output->height) * -2.0f + 1.0f;
+
+    // Handle output transforms like first version
+    if (output->transform == WL_OUTPUT_TRANSFORM_FLIPPED_180) {
+        main_mvp[0] = -box_scale_x; main_mvp[4] = -box_scale_y; main_mvp[6] = -box_translate_x; main_mvp[7] = -box_translate_y;
+        main_mvp[1] = main_mvp[2] = main_mvp[3] = main_mvp[5] = 0.0f; main_mvp[8] = 1.0f;
+    } else if (output->transform == WL_OUTPUT_TRANSFORM_NORMAL) {
+        main_mvp[0] = box_scale_x; main_mvp[4] = box_scale_y; main_mvp[6] = box_translate_x; main_mvp[7] = box_translate_y;
+        main_mvp[1] = main_mvp[2] = main_mvp[3] = main_mvp[5] = 0.0f; main_mvp[8] = 1.0f;
+    } else {
+        float temp_mvp[9] = {box_scale_x, 0.0f, 0.0f, 0.0f, box_scale_y, 0.0f, box_translate_x, box_translate_y, 1.0f};
+        float transform_matrix[9];
+        wlr_matrix_transform(transform_matrix, output->transform);
+        wlr_matrix_multiply(main_mvp, transform_matrix, temp_mvp);
+    }
+
+    // Handle buffer transforms like first version
+    if (scene_buffer->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+        float temp_mvp_buffer[9];
+        memcpy(temp_mvp_buffer, main_mvp, sizeof(main_mvp));
+        float buffer_matrix[9];
+        wlr_matrix_transform(buffer_matrix, scene_buffer->transform);
+        wlr_matrix_multiply(main_mvp, temp_mvp_buffer, buffer_matrix);
+    }
+
+   if (server->back_shader_mvp_loc != -1) { // Use windowback's MVP location
+        glUniformMatrix3fv(server->back_shader_mvp_loc, 1, GL_FALSE, main_mvp);
+    }
+    if (server->back_shader_tex_loc != -1) { // Use windowback's texture sampler location
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(tex_attribs.target, tex_attribs.tex);
+        glTexParameteri(tex_attribs.target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(tex_attribs.target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(tex_attribs.target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(tex_attribs.target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glUniform1i(server->back_shader_tex_loc, 0);
+    }
+    if (server->back_shader_time_loc != -1) { // Use windowback's time location
+        glUniform1f(server->back_shader_time_loc, get_monotonic_time_seconds_as_float());
+    }
+    if (server->back_shader_res_loc != -1) { // Use windowback's iResolution location
+        float res_array[2] = {(float)main_render_box.width, (float)main_render_box.height};
+        glUniform2fv(server->back_shader_res_loc, 1, res_array);
+    }
+    // Draw the main window content
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+    wlr_log(WLR_DEBUG, "[SITER_MAIN_ONLY:%s] Drew main window for '%s'", output_name_log, tl_title_for_log);
+
+    // Cleanup for this iteration
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(tex_attribs.target, 0);
+    wlr_texture_destroy(texture);
+}
 // scene_buffer_iterator with preview rendering logic and detailed logging
 static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
                                  int sx, int sy,
@@ -1844,6 +2090,8 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
         glUniform1i(tex_loc, 0);
     }
 
+   
+
     // Set time uniform like second version
     struct timespec now_shader_time_iter_draw;
     clock_gettime(CLOCK_MONOTONIC, &now_shader_time_iter_draw);
@@ -1859,7 +2107,7 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
     wlr_log(WLR_DEBUG, "[SCENE_ITERATOR:%s] Drew main window for '%s'", output_name_log, tl_title_for_log);
 
-    // --- Preview Rendering (kept from first version) ---
+
     // --- Preview Rendering (modified for sequential positioning) ---
 if (toplevel && server->top_panel_node && server->top_panel_node->enabled &&
     texture) { // Ensure texture is still valid
@@ -1928,6 +2176,8 @@ if (toplevel && server->top_panel_node && server->top_panel_node->enabled &&
                     wlr_matrix_multiply(preview_mvp, output_transform_matrix, temp_preview_mvp);
                 }
 
+
+
                 // Re-set uniforms for the preview draw call
                 GLint preview_mvp_loc = glGetUniformLocation(server->shader_program, "mvp");
                 if (preview_mvp_loc != -1) glUniformMatrix3fv(preview_mvp_loc, 1, GL_FALSE, preview_mvp);
@@ -1972,9 +2222,7 @@ if (toplevel && server->top_panel_node && server->top_panel_node->enabled &&
     wlr_texture_destroy(texture);
 }
 
-#include <pthread.h>
-#include <pixman.h>
-#include <string.h>
+
 
 static pthread_mutex_t rdp_transmit_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -1986,9 +2234,6 @@ struct scene_diagnostics_data {
 
 
 
-#include <pthread.h>
-#include <pixman.h>
-#include <string.h> // For memcpy if you use it, not directly in this function now
 
 
 
@@ -2043,7 +2288,7 @@ void check_scene_bypass_issue(struct wlr_scene_output *scene_output, struct wlr_
 }
 
 static void render_rect_node(struct wlr_scene_node *node, void *user_data) {
-     struct render_data *rdata = user_data; // rdata still useful for output, server
+    struct render_data *rdata = user_data;
     struct wlr_output *output = rdata->output;
     struct tinywl_server *server = rdata->server;
 
@@ -2052,30 +2297,57 @@ static void render_rect_node(struct wlr_scene_node *node, void *user_data) {
     }
     struct wlr_scene_rect *scene_rect = wlr_scene_rect_from_node(node);
 
-    int sx = node->x; // Assuming these are layout coordinates for the current output
-    int sy = node->y;
+    // Use the node's x and y directly. These are relative to its parent.
+    // If this node is a direct child of the scene root (like the background),
+    // these are effectively layout coordinates.
+    // If this node is an SSD (child of toplevel->scene_tree), then these
+    // are relative to the toplevel->scene_tree. The toplevel->scene_tree
+    // itself is positioned on the layout. The MVP will be correct if the
+    // GL matrices are set up to reflect the current transform to output space.
+    // The scene graph usually handles this accumulation.
+    // For custom rendering, we rely on the `sx, sy` from an iterator like
+    // `wlr_scene_node_for_each_buffer` or manually constructing the full transform.
+    // Since render_data provides output, MVP is relative to output.
+    // The sx, sy passed in the for_each_rect callback (not used here) are output-local.
+    // Here, we are calculating MVP based on the current node's local coords AND output.
+    // This implies sx,sy must be the node's output-local coordinates.
+    // We will get these from wlr_scene_node_coords.
 
-    wlr_log(WLR_INFO, "[RECT_NODE_RENDER:%s] Rendering RECT %dx%d at layout_pos(%d,%d) with DEDICATED RECT SHADER. Color (%.2f, %.2f, %.2f, %.2f)",
-            output->name, scene_rect->width, scene_rect->height, sx, sy,
-            scene_rect->color[0], scene_rect->color[1], scene_rect->color[2], scene_rect->color[3]);
-
-    if (output->width == 0 || output->height == 0) return;
-    if (server->rect_shader_program == 0) {
-        wlr_log(WLR_ERROR, "Rect shader program is 0, cannot render rect.");
-        return;
+    int render_sx, render_sy;
+    if (!wlr_scene_node_coords(node, &render_sx, &render_sy)) {
+        wlr_log(WLR_DEBUG, "[RENDER_RECT_NODE:%s] wlr_scene_node_coords failed for node %p", output->name, (void*)node);
+        return; // Cannot determine layout position, cannot render
     }
 
-    // Activate the rectangle shader
-    glUseProgram(server->rect_shader_program);
-    // VAO (server->quad_vao) is assumed to be bound by output_frame
+    if (output->width == 0 || output->height == 0) return;
+
+    GLuint program_to_use;
+    GLint mvp_loc = -1, color_loc = -1, time_loc = -1, output_res_loc = -1, rect_dim_loc = -1;
+
+    bool is_main_background = (server->main_background_node == node);
+
+    if (is_main_background) {
+        program_to_use = server->rect_shader_program; // "Melt"
+        mvp_loc = server->rect_shader_mvp_loc;
+        color_loc = server->rect_shader_color_loc;
+        time_loc = server->rect_shader_time_loc;
+        output_res_loc = server->rect_shader_resolution_loc;
+        rect_dim_loc = server->rect_shader_rect_res_loc;
+    } else { // SSD
+        program_to_use = server->ssd_shader_program;
+        mvp_loc = server->ssd_shader_mvp_loc;
+        color_loc = server->ssd_shader_color_loc;
+    }
+
+    if (program_to_use == 0) return;
+    glUseProgram(program_to_use);
 
     float mvp[9];
     wlr_matrix_identity(mvp);
-
     float box_scale_x = (float)scene_rect->width * (2.0f / output->width);
     float box_scale_y = (float)scene_rect->height * (-2.0f / output->height);
-    float box_translate_x = ((float)sx / output->width) * 2.0f - 1.0f;
-    float box_translate_y = ((float)sy / output->height) * -2.0f + 1.0f;
+    float box_translate_x = ((float)render_sx / output->width) * 2.0f - 1.0f;
+    float box_translate_y = ((float)render_sy / output->height) * -2.0f + 1.0f;
 
     float base_mvp[9] = {
         box_scale_x, 0.0f, 0.0f,
@@ -2092,55 +2364,19 @@ static void render_rect_node(struct wlr_scene_node *node, void *user_data) {
         memcpy(mvp, base_mvp, sizeof(base_mvp));
     }
 
-    // Set uniforms for the RECT shader
-    if (server->rect_shader_mvp_loc != -1) {
-        glUniformMatrix3fv(server->rect_shader_mvp_loc, 1, GL_FALSE, mvp);
-    } else {
-        wlr_log(WLR_ERROR, "Rect shader MVP uniform location is -1!");
+    if (mvp_loc != -1) glUniformMatrix3fv(mvp_loc, 1, GL_FALSE, mvp);
+    if (color_loc != -1) glUniform4fv(color_loc, 1, scene_rect->color);
+    if (time_loc != -1) glUniform1f(time_loc, get_monotonic_time_seconds_as_float());
+    if (output_res_loc != -1) {
+        float res_vec[2] = {(float)output->width, (float)output->height};
+        glUniform2fv(output_res_loc, 1, res_vec);
     }
-
-    if (server->rect_shader_color_loc != -1) {
-        // scene_rect->color is float[4] {r,g,b,a}
-        glUniform4fv(server->rect_shader_color_loc, 1, scene_rect->color);
-    } else {
-        wlr_log(WLR_ERROR, "Rect shader color uniform location is -1!");
-    }
-
-     if (server->rect_shader_time_loc != -1) {
-        struct timespec current_render_time_spec;
-        clock_gettime(CLOCK_MONOTONIC, &current_render_time_spec);
-        float time_value_sec = (float)current_render_time_spec.tv_sec +
-                               (float)current_render_time_spec.tv_nsec / 1e9f;
-
-        // Optional: Log the time value being set, less frequently
-        static float last_logged_rect_time_val = 0.0f; // Static to persist across calls
-        if (fabs(time_value_sec - last_logged_rect_time_val) > 0.5f || last_logged_rect_time_val == 0.0f) {
-            wlr_log(WLR_INFO, "[render_rect_node] Setting 'time' (loc %d) to %.3f for rect on output %s",
-                server->rect_shader_time_loc, time_value_sec, output->name);
-            last_logged_rect_time_val = time_value_sec;
-        }
-
-        glUniform1f(server->rect_shader_time_loc, time_value_sec); // *** THIS IS THE ACTUAL SETTING OF THE UNIFORM ***
-        GLenum err_after_time_uniform = glGetError();
-        if (err_after_time_uniform != GL_NO_ERROR) {
-            wlr_log(WLR_ERROR, "[render_rect_node] GL error AFTER glUniform1f(time): 0x%x", err_after_time_uniform);
-        }
-    } else {
-        // This log is correct: if rect_shader_time_loc is -1, we can't set it.
-        // This indicates an issue in create_rect_shader_program or the shader source.
-        wlr_log(WLR_ERROR, "[render_rect_node] Rect shader 'time' uniform location is -1! Cannot set time.");
-    }
-
-    if (server->rect_shader_resolution_loc != -1) {
-        float resolution_vec[2] = {(float)output->width, (float)output->height};
-        glUniform2fv(server->rect_shader_resolution_loc, 1, resolution_vec);
-    } else {
-        // Log error if you haven't already in create_rect_shader_program
+    if (rect_dim_loc != -1) { // If Melt shader uses u_rectResolution
+        float current_rect_dim_vec[2] = {(float)scene_rect->width, (float)scene_rect->height};
+        glUniform2fv(rect_dim_loc, 1, current_rect_dim_vec);
     }
 
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
-
-    // Do NOT call glUseProgram(0) here; output_frame will switch or unbind later.
 }
 
 static void render_panel_node(struct wlr_scene_node *node, void *user_data) {
@@ -2378,6 +2614,8 @@ static void render_panel_node(struct wlr_scene_node *node, void *user_data) {
     }
 }
 
+
+
 static void output_frame(struct wl_listener *listener, void *data) {
     struct tinywl_output *output_wrapper = wl_container_of(listener, output_wrapper, frame);
     struct wlr_output *wlr_output = output_wrapper->wlr_output;
@@ -2399,7 +2637,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
         return;
     }
 
-    debug_scene_rendering(scene, wlr_output);
+    // debug_scene_rendering(scene, wlr_output); // Keep for debugging if needed
 
     struct wlr_output_state state;
     wlr_output_state_init(&state);
@@ -2433,10 +2671,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
     glScissor(0, 0, wlr_output->width, wlr_output->height);
     glEnable(GL_SCISSOR_TEST);
     glEnable(GL_BLEND);
-    // Important: Choose the correct blend func. If your shaders output PREMULTIPLIED ALPHA:
-    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-    // If your shaders output STRAIGHT (NON-PREMULTIPLIED) ALPHA:
-    // glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDisable(GL_CULL_FACE);
     glDisable(GL_DEPTH_TEST);
 
@@ -2449,100 +2684,82 @@ static void output_frame(struct wl_listener *listener, void *data) {
             .renderer = server->renderer,
             .server = server,
             .output = wlr_output,
-            .pass = pass // Though pass is not directly used by custom GL calls in iterators
+            .pass = pass
         };
 
-       
-
-        // --- Render Generic Rectangles (middle layer) ---
-        wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Iterating scene children for custom rects (non-panel).", wlr_output->name);
-        struct wlr_scene_node *child_node;
-        wl_list_for_each(child_node, &scene->tree.children, link) {
-            if (!child_node->enabled) {
+        // --- Render Background, SSDs, and Panel Rects ---
+        // This simplified loop iterates all rects. render_rect_node differentiates.
+        // The panel is handled separately by render_panel_node.
+        wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Iterating for ALL RECTS (background, SSDs).", wlr_output->name);
+        struct wlr_scene_node *iter_node_lvl1; // Nodes directly under scene root
+        wl_list_for_each(iter_node_lvl1, &scene->tree.children, link) {
+            if (!iter_node_lvl1->enabled) {
                 continue;
             }
 
-            // Skip panel nodes in this pass - we'll render them later
-            if (child_node == server->top_panel_node) {
+            if (iter_node_lvl1 == server->top_panel_node) {
+                // Skip panel here, render it specifically later
                 continue;
             }
 
-            if (child_node->type == WLR_SCENE_NODE_RECT) {
-                if (server->rect_shader_program != 0) {
-                    wlr_log(WLR_DEBUG, "[OUTPUT_FRAME] Rendering generic RECT node %p with rect_shader (Melt, ID: %u).", child_node, server->rect_shader_program);
-                    render_rect_node(child_node, &rdata);
-                } else {
-                    wlr_log(WLR_ERROR, "[OUTPUT_FRAME] server->rect_shader_program is 0, cannot render generic rect.");
-                }
-            } else if (child_node->type == WLR_SCENE_NODE_TREE && child_node->enabled) {
-                struct wlr_scene_node *sub_child_node;
-                struct wlr_scene_tree *sub_tree = wlr_scene_tree_from_node(child_node);
-                wl_list_for_each(sub_child_node, &sub_tree->children, link) {
-                    if (!sub_child_node->enabled) continue;
-                    
-                    // Skip panel nodes in subtrees too
-                    if (sub_child_node == server->top_panel_node) {
-                        continue;
-                    }
-                    
-                    if (sub_child_node->type == WLR_SCENE_NODE_RECT) {
-                        if (server->rect_shader_program != 0) {
-                            wlr_log(WLR_DEBUG, "[OUTPUT_FRAME] Rendering generic RECT node %p (in subtree) with rect_shader (Melt, ID: %u).", sub_child_node, server->rect_shader_program);
-                            render_rect_node(sub_child_node, &rdata);
-                        } else {
-                            wlr_log(WLR_ERROR, "[OUTPUT_FRAME] server->rect_shader_program is 0 for generic rect in subtree!");
+            if (iter_node_lvl1->type == WLR_SCENE_NODE_RECT) {
+                // This is the main background or other top-level rects
+                render_rect_node(iter_node_lvl1, &rdata);
+            } else if (iter_node_lvl1->type == WLR_SCENE_NODE_TREE) {
+                // This is a toplevel's scene_tree. Iterate its children for SSD rects.
+                struct tinywl_toplevel *toplevel_ptr = iter_node_lvl1->data;
+                if (toplevel_ptr && toplevel_ptr->ssd.enabled) {
+                    struct wlr_scene_tree *toplevel_s_tree = wlr_scene_tree_from_node(iter_node_lvl1);
+                    struct wlr_scene_node *ssd_node_candidate;
+                    wl_list_for_each(ssd_node_candidate, &toplevel_s_tree->children, link) {
+                        if (ssd_node_candidate->enabled && ssd_node_candidate->type == WLR_SCENE_NODE_RECT) {
+                            // Check if this node is one of the SSD parts
+                            // This check is important to not accidentally re-render client content area if it was a rect
+                            if ( (toplevel_ptr->ssd.title_bar && ssd_node_candidate == &toplevel_ptr->ssd.title_bar->node) ||
+                                 (toplevel_ptr->ssd.border_left && ssd_node_candidate == &toplevel_ptr->ssd.border_left->node) ||
+                                 (toplevel_ptr->ssd.border_right && ssd_node_candidate == &toplevel_ptr->ssd.border_right->node) ||
+                                 (toplevel_ptr->ssd.border_bottom && ssd_node_candidate == &toplevel_ptr->ssd.border_bottom->node) ) {
+                                render_rect_node(ssd_node_candidate, &rdata);
+                            }
                         }
                     }
                 }
             }
         }
 
-      
-
-        // --- Render Panel Nodes LAST (foreground layer) ---
-        wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Rendering panel nodes on top.", wlr_output->name);
-        wl_list_for_each(child_node, &scene->tree.children, link) {
-            if (!child_node->enabled) {
-                continue;
-            }
-
-            if (child_node == server->top_panel_node) {
-                if (server->panel_shader_program != 0) {
-                    wlr_log(WLR_DEBUG, "[OUTPUT_FRAME] Rendering TOP PANEL node %p with panel_shader (ID: %u) ON TOP.", child_node, server->panel_shader_program);
-                    render_panel_node(child_node, &rdata);
-                } else {
-                    wlr_log(WLR_ERROR, "[OUTPUT_FRAME] server->panel_shader_program is 0, cannot render top panel.");
-                }
-            } else if (child_node->type == WLR_SCENE_NODE_TREE && child_node->enabled) {
-                struct wlr_scene_node *sub_child_node;
-                struct wlr_scene_tree *sub_tree = wlr_scene_tree_from_node(child_node);
-                wl_list_for_each(sub_child_node, &sub_tree->children, link) {
-                    if (!sub_child_node->enabled) continue;
-                    if (sub_child_node == server->top_panel_node) {
-                         if (server->panel_shader_program != 0) {
-                            wlr_log(WLR_DEBUG, "[OUTPUT_FRAME] Rendering TOP PANEL node %p (in subtree) with panel_shader (ID: %u) ON TOP.", sub_child_node, server->panel_shader_program);
-                            render_panel_node(sub_child_node, &rdata);
-                        } else {
-                             wlr_log(WLR_ERROR, "[OUTPUT_FRAME] server->panel_shader_program is 0 for top_panel_node in subtree!");
-                        }
-                    }
-                }
+        // --- Render Panel Node ---
+        if (server->top_panel_node && server->top_panel_node->enabled) {
+            if (server->panel_shader_program != 0) {
+                wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Rendering TOP PANEL node %p with panel_shader (ID: %u).",
+                        wlr_output->name, (void*)server->top_panel_node, server->panel_shader_program);
+                render_panel_node(server->top_panel_node, &rdata);
+            } else {
+                wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Panel shader program is 0, cannot render panel.", wlr_output->name);
             }
         }
 
-           // --- Render Client Window Buffers FIRST (background layer) ---
-        if (server->shader_program != 0) { // This is the flame shader for client windows
-            glUseProgram(server->shader_program); // Ensure flame shader is active
+        // --- Render Client Window Buffers (using back_shader_program for background effect) ---
+        if (server->back_shader_program != 0) {
+            glUseProgram(server->back_shader_program);
+            wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Iterating for BUFFERS (client content with back_shader ID %u)",
+                    wlr_output->name, server->back_shader_program);
+            wlr_scene_node_for_each_buffer(&scene->tree.node, scene_buffer_iterator_main_window_only, &rdata);
+        } else {
+            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Client background effect shader (back_shader_program) is 0.", wlr_output->name);
+        }
 
-            wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Iterating for BUFFERS (client windows, using flame shader ID %u)",
+        // --- Render Client Window Buffers (using main shader_program for foreground effect like "Flame") ---
+        if (server->shader_program != 0) {
+            glUseProgram(server->shader_program);
+            wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Iterating for BUFFERS (client content with flame_shader ID %u)",
                     wlr_output->name, server->shader_program);
             wlr_scene_node_for_each_buffer(&scene->tree.node, scene_buffer_iterator, &rdata);
         } else {
-            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Flame shader program (server->shader_program) is 0, skipping buffer rendering.", wlr_output->name);
+            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Client flame shader (shader_program) is 0.", wlr_output->name);
         }
 
         glBindVertexArray(0);
-        glUseProgram(0);
+        glUseProgram(0); // Unbind any active program
     }
 
     glDisable(GL_SCISSOR_TEST);
@@ -2573,15 +2790,6 @@ static void output_frame(struct wl_listener *listener, void *data) {
 
     wlr_output_state_finish(&state);
     wlr_scene_output_send_frame_done(scene_output, &now);
-
-    // // TEMPORARY: Force continuous rendering for animation debugging
-    // if (wlr_output && wlr_output->enabled &&
-    //     ( (server->panel_shader_program != 0 && server->panel_shader_time_loc != -1) ||
-    //       (server->rect_shader_program != 0 && server->rect_shader_time_loc != -1) ||
-    //       (server->shader_program != 0 && server->flame_shader_time_loc != -1) ) ) {
-    //      wlr_log(WLR_DEBUG, "[OUTPUT_FRAME %s] Scheduling next frame due to active shader animation.", wlr_output->name);
-    //      wlr_output_schedule_frame(wlr_output);
-    // }
 }
 static void output_request_state(struct wl_listener *listener, void *data) {
     struct tinywl_output *output = wl_container_of(listener, output, request_state);
@@ -2598,8 +2806,132 @@ static void output_destroy(struct wl_listener *listener, void *data) {
     free(output);
 }
 
+// Helper function to disable/destroy SSDs
+static void ensure_ssd_disabled(struct tinywl_toplevel *toplevel) {
+    const char *title = (toplevel->xdg_toplevel && toplevel->xdg_toplevel->title) ? toplevel->xdg_toplevel->title : "N/A";
+    wlr_log(WLR_INFO, "[SSD_HELPER] Enter ensure_ssd_disabled for toplevel %s. Current ssd.enabled: %d",
+            title, toplevel->ssd.enabled);
+
+    if (!toplevel->ssd.enabled) {
+        wlr_log(WLR_DEBUG, "[SSD_HELPER] SSDs already disabled for %s", title);
+        return;
+    }
+    wlr_log(WLR_INFO, "[SSD_HELPER] Disabling and destroying SSDs for %s.", title);
+
+    if (toplevel->ssd.title_bar) { wlr_scene_node_destroy(&toplevel->ssd.title_bar->node); toplevel->ssd.title_bar = NULL; }
+    if (toplevel->ssd.border_left) { wlr_scene_node_destroy(&toplevel->ssd.border_left->node); toplevel->ssd.border_left = NULL; }
+    if (toplevel->ssd.border_right) { wlr_scene_node_destroy(&toplevel->ssd.border_right->node); toplevel->ssd.border_right = NULL; }
+    if (toplevel->ssd.border_bottom) { wlr_scene_node_destroy(&toplevel->ssd.border_bottom->node); toplevel->ssd.border_bottom = NULL; }
+    
+    toplevel->ssd.enabled = false;
+
+    if (toplevel->client_xdg_scene_tree) {
+        wlr_log(WLR_INFO, "[SSD_HELPER] Resetting client_xdg_scene_tree position for %s to (0,0).", title);
+        wlr_scene_node_set_position(&toplevel->client_xdg_scene_tree->node, 0, 0);
+    }
+}
+
+static void update_decoration_geometry(struct tinywl_toplevel *toplevel) {
+    const char *title = (toplevel && toplevel->xdg_toplevel && toplevel->xdg_toplevel->title) ?
+                        toplevel->xdg_toplevel->title : "N/A";
+
+    if (!toplevel || !toplevel->client_xdg_scene_tree ||
+        !toplevel->xdg_toplevel || !toplevel->xdg_toplevel->base ||
+        !toplevel->xdg_toplevel->base->surface) {
+        wlr_log(WLR_DEBUG, "[UPDATE_DECO:%s] Pre-conditions not met.", title);
+        return;
+    }
+
+    if (!toplevel->ssd.enabled) {
+        wlr_log(WLR_DEBUG, "[UPDATE_DECO:%s] SSDs not enabled. Client content at (0,0).", title);
+        wlr_scene_node_set_position(&toplevel->client_xdg_scene_tree->node, 0, 0);
+        if (toplevel->ssd.title_bar) wlr_scene_node_set_enabled(&toplevel->ssd.title_bar->node, false);
+        if (toplevel->ssd.border_left) wlr_scene_node_set_enabled(&toplevel->ssd.border_left->node, false);
+        if (toplevel->ssd.border_right) wlr_scene_node_set_enabled(&toplevel->ssd.border_right->node, false);
+        if (toplevel->ssd.border_bottom) wlr_scene_node_set_enabled(&toplevel->ssd.border_bottom->node, false);
+        return;
+    }
+
+    struct wlr_xdg_toplevel *xdg_toplevel = toplevel->xdg_toplevel;
+    struct wlr_scene_node *client_content_node = &toplevel->client_xdg_scene_tree->node;
+
+    // Get the actual dimensions of the client's content scene node.
+    // This usually comes from the wlr_scene_buffer associated with the client's surface.
+    int actual_content_width = 0;
+    int actual_content_height = 0;
+
+    // The client_xdg_scene_tree is a wlr_scene_surface. Its first child should be the wlr_scene_buffer.
+    if (!wl_list_empty(&client_content_node->parent->children)) { // client_content_node is the wlr_scene_xdg_surface tree
+        struct wlr_scene_node *buffer_node_candidate = wl_container_of(toplevel->client_xdg_scene_tree->children.next, buffer_node_candidate, link);
+
+        if (buffer_node_candidate && buffer_node_candidate->type == WLR_SCENE_NODE_BUFFER) {
+            struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(buffer_node_candidate);
+            if (scene_buffer && scene_buffer->buffer) {
+                actual_content_width = scene_buffer->buffer->width;
+                actual_content_height = scene_buffer->buffer->height;
+                 wlr_log(WLR_DEBUG, "[UPDATE_DECO:%s] Using scene_buffer dimensions: %dx%d", title, actual_content_width, actual_content_height);
+            } else if (scene_buffer && scene_buffer->dst_width > 0 && scene_buffer->dst_height > 0) {
+                // Fallback if buffer isn't present yet but dst dimensions are set
+                actual_content_width = scene_buffer->dst_width;
+                actual_content_height = scene_buffer->dst_height;
+                wlr_log(WLR_DEBUG, "[UPDATE_DECO:%s] Using scene_buffer->dst_width/height: %dx%d", title, actual_content_width, actual_content_height);
+            }
+        }
+    }
+
+    // Fallback to xdg_toplevel->current if scene buffer dimensions are not available/valid
+    if (actual_content_width <= 0 || actual_content_height <= 0) {
+        wlr_log(WLR_DEBUG, "[UPDATE_DECO:%s] Scene buffer dimensions not available or zero, falling back to xdg_toplevel->current (%dx%d).",
+                title, xdg_toplevel->current.width, xdg_toplevel->current.height);
+        actual_content_width = xdg_toplevel->current.width;
+        actual_content_height = xdg_toplevel->current.height;
+    }
 
 
+    if (actual_content_width <= 0 || actual_content_height <= 0) {
+        wlr_log(WLR_DEBUG, "[UPDATE_DECO:%s] Final effective content size is %dx%d. Hiding SSDs. Client at (0,0).",
+                title, actual_content_width, actual_content_height);
+        if (toplevel->ssd.title_bar) wlr_scene_node_set_enabled(&toplevel->ssd.title_bar->node, false);
+        if (toplevel->ssd.border_left) wlr_scene_node_set_enabled(&toplevel->ssd.border_left->node, false);
+        if (toplevel->ssd.border_right) wlr_scene_node_set_enabled(&toplevel->ssd.border_right->node, false);
+        if (toplevel->ssd.border_bottom) wlr_scene_node_set_enabled(&toplevel->ssd.border_bottom->node, false);
+        wlr_scene_node_set_position(&toplevel->client_xdg_scene_tree->node, 0, 0);
+        return;
+    }
+
+    wlr_log(WLR_INFO, "[UPDATE_DECO:%s] Effective content geometry for SSD sizing: %dx%d (from scene/current)",
+            title, actual_content_width, actual_content_height);
+
+    if (!toplevel->ssd.title_bar || !toplevel->ssd.border_left ||
+        !toplevel->ssd.border_right || !toplevel->ssd.border_bottom) {
+        wlr_log(WLR_ERROR, "[UPDATE_DECO:%s] SSD rects NULL. Re-enabling.", title);
+        ensure_ssd_enabled(toplevel); // This will call update_decoration_geometry again
+        return; // Avoid continuing if re-enable is needed, it will recall this func.
+    }
+    
+    wlr_scene_node_set_enabled(&toplevel->ssd.title_bar->node, true);
+    wlr_scene_node_set_enabled(&toplevel->ssd.border_left->node, true);
+    wlr_scene_node_set_enabled(&toplevel->ssd.border_right->node, true);
+    wlr_scene_node_set_enabled(&toplevel->ssd.border_bottom->node, true);
+
+    int ssd_total_width = actual_content_width + 2 * BORDER_WIDTH;
+
+    wlr_scene_rect_set_size(toplevel->ssd.title_bar, ssd_total_width, TITLE_BAR_HEIGHT);
+    wlr_scene_node_set_position(&toplevel->ssd.title_bar->node, 0, 0);
+
+    wlr_scene_rect_set_size(toplevel->ssd.border_left, BORDER_WIDTH, actual_content_height);
+    wlr_scene_node_set_position(&toplevel->ssd.border_left->node, 0, TITLE_BAR_HEIGHT);
+
+    wlr_scene_rect_set_size(toplevel->ssd.border_right, BORDER_WIDTH, actual_content_height);
+    wlr_scene_node_set_position(&toplevel->ssd.border_right->node, BORDER_WIDTH + actual_content_width, TITLE_BAR_HEIGHT);
+
+    wlr_scene_rect_set_size(toplevel->ssd.border_bottom, ssd_total_width, BORDER_WIDTH);
+    wlr_scene_node_set_position(&toplevel->ssd.border_bottom->node, 0, TITLE_BAR_HEIGHT + actual_content_height);
+
+    wlr_log(WLR_INFO, "[UPDATE_DECO:%s] Positioning client_xdg_scene_tree at (%d, %d).",
+            title, BORDER_WIDTH, TITLE_BAR_HEIGHT);
+    wlr_scene_node_set_position(&toplevel->client_xdg_scene_tree->node, BORDER_WIDTH, TITLE_BAR_HEIGHT);
+}
 /* Updated server_new_output without damage */
 
 static void server_new_output(struct wl_listener *listener, void *data) {
@@ -2697,196 +3029,81 @@ static void server_new_output(struct wl_listener *listener, void *data) {
     wlr_output_schedule_frame(output->wlr_output);
 }
 
+
 static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
     struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, map);
-    wlr_log(WLR_ERROR, "!!!!!!!!!! XDG_TOPLEVEL_MAP CALLED (CUSTOM PATH ACTIVE) for toplevel %p (xdg: %p, title: '%s') !!!!!!!!!!",
-            (void*)toplevel,
-            (void*)toplevel->xdg_toplevel,
-            toplevel->xdg_toplevel && toplevel->xdg_toplevel->title ? toplevel->xdg_toplevel->title : "N/A");
+    struct wlr_xdg_toplevel *xdg_toplevel = toplevel->xdg_toplevel;
+    struct wlr_xdg_surface *xdg_surface_for_toplevel = xdg_toplevel->base; // Alias for clarity
+    const char *title = (xdg_toplevel->title) ? xdg_toplevel->title : "N/A";
 
-    if (!toplevel || !toplevel->xdg_toplevel) {
-        wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Invalid toplevel=%p or xdg_toplevel=%p",
-                toplevel, toplevel ? toplevel->xdg_toplevel : NULL);
-        return;
+    wlr_log(WLR_INFO, "[MAP:%s] Mapped. Current XDG configured content size: %dx%d",
+            title, xdg_toplevel->current.width, xdg_toplevel->current.height);
+    toplevel->mapped = true;
+
+    int target_content_width = 800;
+    int target_content_height = 600;
+    bool size_from_client_geom = false;
+
+    struct wlr_box client_geom = xdg_surface_for_toplevel->geometry;
+    wlr_log(WLR_DEBUG, "[MAP:%s] Client's current xdg_surface->geometry: %dx%d at %d,%d",
+            title, client_geom.width, client_geom.height, client_geom.x, client_geom.y);
+
+    if (client_geom.width > 0 && client_geom.height > 0) {
+        target_content_width = client_geom.width;
+        target_content_height = client_geom.height;
+        size_from_client_geom = true;
     }
 
-    wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Checkpoint 1");
-
-    if (toplevel->scene_tree) {
-        wlr_scene_node_set_enabled(&toplevel->scene_tree->node, true);
-        wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Toplevel %p scene_tree node enabled.", toplevel);
+    bool intend_server_decorations = false;
+    if (toplevel->decoration) {
+        if (toplevel->decoration->current.mode == WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE ||
+            toplevel->decoration->pending.mode == WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE) {
+            intend_server_decorations = true;
+        }
     } else {
-        wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Toplevel %p has NO scene_tree!", toplevel);
+        intend_server_decorations = true;
     }
 
-    wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Checkpoint 2");
+    if (size_from_client_geom && intend_server_decorations) {
+        int derived_content_width = client_geom.width - (2 * BORDER_WIDTH);
+        int derived_content_height = client_geom.height - TITLE_BAR_HEIGHT - BORDER_WIDTH;
 
-    toplevel->is_animating = true;
-    toplevel->scale = 0.0f;
-    toplevel->target_scale = 1.0f;
-    toplevel->animation_duration = 0.3f;
-
-    struct timespec now_map_time;
-    if (clock_gettime(CLOCK_MONOTONIC, &now_map_time) == -1) {
-        wlr_log_errno(WLR_ERROR, "XDG_TOPLEVEL_MAP: clock_gettime failed");
-    }
-
-    toplevel->animation_start = now_map_time.tv_sec + now_map_time.tv_nsec / 1e9f;
-
-    wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Checkpoint 9 (animation_start set to %f)", toplevel->animation_start);
-
-    // Remove and insert into toplevels list
-    wl_list_remove(&toplevel->link);
-    wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Checkpoint 10 (after wl_list_remove)");
-
-    wl_list_insert(&toplevel->server->toplevels, &toplevel->link);
-    wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Checkpoint 11 (after wl_list_insert)");
-    // Skip wl_list_length for now, or add defensive check
-    if (toplevel->server->toplevels.next && toplevel->server->toplevels.prev) {
-        wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Toplevel %p added to server->toplevels.", toplevel);
+        if (derived_content_width >= 50 && derived_content_height >= 50) {
+            target_content_width = derived_content_width;
+            target_content_height = derived_content_height;
+            wlr_log(WLR_INFO, "[MAP:%s] Client suggested total %dx%d. Server intends SSDs. Derived target CONTENT size: %dx%d.",
+                    title, client_geom.width, client_geom.height, target_content_width, target_content_height);
+        } else {
+            wlr_log(WLR_INFO, "[MAP:%s] Client suggested total %dx%d. Derived SSD content size %dx%d too small. Using client's suggestion as content or default.",
+                    title, client_geom.width, client_geom.height, derived_content_width, derived_content_height);
+            // If derived is too small, we either use client_geom directly as content or a larger default
+            // For now, if derived is too small, let's revert to client_geom as content, assuming client might not want SSDs yet.
+            target_content_width = client_geom.width; // Revert
+            target_content_height = client_geom.height; // Revert
+        }
+    } else if (size_from_client_geom) {
+         wlr_log(WLR_INFO, "[MAP:%s] Using client-suggested geometry directly as content (no SSDs intended yet): %dx%d",
+                title, target_content_width, target_content_height);
     } else {
-        wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: server->toplevels appears uninitialized!");
+        wlr_log(WLR_INFO, "[MAP:%s] No valid client geometry, using default content size: %dx%d.",
+                title, target_content_width, target_content_height);
+    }
+    
+    if ((xdg_toplevel->current.width == 0 && xdg_toplevel->current.height == 0) ||
+        xdg_toplevel->current.width != target_content_width ||
+        xdg_toplevel->current.height != target_content_height) {
+        wlr_log(WLR_INFO, "[MAP:%s] Setting XDG toplevel CONTENT size to %dx%d.", title, target_content_width, target_content_height);
+        wlr_xdg_toplevel_set_size(xdg_toplevel, target_content_width, target_content_height);
+    } else {
+        wlr_log(WLR_INFO, "[MAP:%s] XDG toplevel content size already %dx%d, not re-setting.", title, xdg_toplevel->current.width, xdg_toplevel->current.height);
+        if (toplevel->ssd_pending_enable && xdg_surface_for_toplevel->initialized) {
+             wlr_log(WLR_DEBUG, "[MAP:%s] Size matches but ssd_pending_enable, scheduling configure.", title);
+            wlr_xdg_surface_schedule_configure(xdg_surface_for_toplevel);
+        }
     }
 
     focus_toplevel(toplevel);
-    wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Checkpoint 12 (after focus_toplevel)");
-
-    if (toplevel->xdg_toplevel && toplevel->xdg_toplevel->base) {
-        wlr_log(WLR_ERROR, "!!!!!!!!!! XDG_TOPLEVEL_MAP: Scheduling configure for xdg_surface %p (configured: %d) !!!!!!!!!!",
-                (void*)toplevel->xdg_toplevel->base, toplevel->xdg_toplevel->base->configured);
-        wlr_xdg_surface_schedule_configure(toplevel->xdg_toplevel->base);
-    }
-
-    struct wlr_surface *surface = toplevel->xdg_toplevel && toplevel->xdg_toplevel->base ?
-                                 toplevel->xdg_toplevel->base->surface : NULL;
-
-    if (surface && surface->mapped) {
-        struct timespec frame_done_now;
-        clock_gettime(CLOCK_MONOTONIC, &frame_done_now);
-        wlr_surface_send_frame_done(surface, &frame_done_now);
-
-        struct tinywl_output *output;
-        wl_list_for_each(output, &toplevel->server->outputs, link) {
-            if (output->wlr_output && output->wlr_output->enabled) {
-                wlr_output_schedule_frame(output->wlr_output);
-            }
-        }
-    } else {
-        wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Surface not mapped or no surface: %p", (void*)surface);
-    }
-
-    wlr_log(WLR_ERROR, "!!!!!!!!!! XDG_TOPLEVEL_MAP FINISHED for toplevel %p !!!!!!!!!!", (void*)toplevel);
 }
-/*
-static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
-    struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, map);
-    wlr_log(WLR_ERROR, "!!!!!!!!!! XDG_TOPLEVEL_MAP CALLED (CUSTOM PATH ACTIVE) for toplevel %p (xdg: %p, title: '%s') !!!!!!!!!!",
-            (void*)toplevel,
-            (void*)toplevel->xdg_toplevel,
-            (toplevel->xdg_toplevel && toplevel->xdg_toplevel->title) ? toplevel->xdg_toplevel->title : "N/A");
-
-    if (!toplevel) { // Ultra defensive
-        wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: toplevel pointer is NULL at start!");
-        return;
-    }
-    if (!toplevel->xdg_toplevel) { // Ultra defensive
-        wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: toplevel->xdg_toplevel is NULL!");
-        return;
-    }
-
-
-    wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Checkpoint 1"); // CHECKPOINT 1
-
-    if (toplevel->scene_tree) {
-        wlr_scene_node_set_enabled(&toplevel->scene_tree->node, true);
-        wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Toplevel %p scene_tree node explicitly enabled on map.", toplevel); // This was your line 2025
-    } else {
-        wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Toplevel %p has NO scene_tree on map!", toplevel);
-    }
-
-    wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Checkpoint 2 (after scene_tree enable)");
-
-    toplevel->is_animating = true;
-    wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Checkpoint 3 (is_animating set)");
-
-    toplevel->scale = 0.0f;
-    wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Checkpoint 4 (scale set)");
-
-    toplevel->target_scale = 1.0f;
-    wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Checkpoint 5 (target_scale set)");
-
-    toplevel->animation_duration = 0.3f;
-    wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Checkpoint 6 (animation_duration set)");
-
-    struct timespec now_map_time; // Renamed to avoid any conflict if 'now' is global somewhere (unlikely)
-    wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Checkpoint 7 (before clock_gettime)");
-
-    if (clock_gettime(CLOCK_MONOTONIC, &now_map_time) == -1) {
-        wlr_log_errno(WLR_ERROR, "XDG_TOPLEVEL_MAP: clock_gettime failed");
-        // Decide how to handle, maybe don't start animation or use a fallback
-    }
-    wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Checkpoint 8 (after clock_gettime)");
-
-    toplevel->animation_start = now_map_time.tv_sec + now_map_time.tv_nsec / 1e9f; // Added 'f' for float division
-    wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Checkpoint 9 (animation_start set to %f)", toplevel->animation_start);
-
-    wl_list_remove(&toplevel->link);
-    wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Checkpoint 10 (after wl_list_remove)");
-
-    wl_list_insert(&toplevel->server->toplevels, &toplevel->link);
-    wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Toplevel %p ADDED to server->toplevels list (CUSTOM PATH ACTIVE). List length: %d",
-            toplevel, wl_list_length(&toplevel->server->toplevels));
-    wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Checkpoint 11 (after wl_list_insert)");
-
-    focus_toplevel(toplevel);
-    wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Checkpoint 12 (after focus_toplevel)");
-
-    if (toplevel->xdg_toplevel && toplevel->xdg_toplevel->base) {
-        wlr_log(WLR_ERROR, "!!!!!!!!!! XDG_TOPLEVEL_MAP: Explicitly scheduling configure for xdg_surface %p (configured: %d) !!!!!!!!!!",
-                (void*)toplevel->xdg_toplevel->base,
-                toplevel->xdg_toplevel->base->configured);
-        wlr_xdg_surface_schedule_configure(toplevel->xdg_toplevel->base);
-    }
-    wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Checkpoint 13 (after schedule_configure block)");
-
-
-    struct wlr_surface *surface = NULL;
-    if (toplevel->xdg_toplevel && toplevel->xdg_toplevel->base) {
-        surface = toplevel->xdg_toplevel->base->surface;
-    }
-    wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Checkpoint 14 (surface pointer set)");
-
-
-    if (surface && surface->mapped) {
-        struct timespec frame_done_now_map; // Renamed
-        clock_gettime(CLOCK_MONOTONIC, &frame_done_now_map);
-        wlr_surface_send_frame_done(surface, &frame_done_now_map);
-        wlr_log(WLR_DEBUG, "XDG_TOPLEVEL_MAP: Sent frame_done for surface %p", (void*)surface);
-
-        struct tinywl_output *output;
-        wl_list_for_each(output, &toplevel->server->outputs, link) {
-            if (output->wlr_output && output->wlr_output->enabled) {
-                wlr_output_schedule_frame(output->wlr_output);
-                wlr_log(WLR_DEBUG, "XDG_TOPLEVEL_MAP: Scheduled frame for output %s", output->wlr_output->name);
-            }
-        }
-    } else {
-        wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Toplevel %p underlying surface not mapped or no surface after map logic (surface ptr: %p)",
-                toplevel, (void*)surface);
-    }
-    wlr_log(WLR_ERROR, "XDG_TOPLEVEL_MAP: Checkpoint 15 (before final log)");
-    wlr_log(WLR_ERROR, "!!!!!!!!!! XDG_TOPLEVEL_MAP FINISHED (CUSTOM PATH ACTIVE) for toplevel %p !!!!!!!!!!", (void*)toplevel);
-}*/
-
-#include <time.h> // For clock_gettime, ensure this is included
-
-
-
-#include <time.h> // For clock_gettime, ensure this is included
-#include <math.h>   // For fmaxf, fminf
-
-
-
 
 
 static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
@@ -2907,78 +3124,145 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
     wl_list_for_each(out, &toplevel_wrapper->server->outputs, link) { wlr_output_schedule_frame(out->wlr_output); }
 }
 
+
+
+
+
+// Helper function to create a scene rect
+static struct wlr_scene_rect *create_decoration_rect(
+    struct wlr_scene_tree *parent,
+    int width, int height, int x, int y, float color[4]) {
+    struct wlr_scene_rect *rect = wlr_scene_rect_create(parent, width, height, color);
+    if (rect) {
+        wlr_scene_node_set_position(&rect->node, x, y);
+        wlr_scene_node_set_enabled(&rect->node, true); // Initially enabled
+    } else {
+        wlr_log(WLR_ERROR, "Failed to create decoration rect");
+    }
+    return rect;
+}
+
+
+
+
+
+
+
 static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
     struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, commit);
-    struct wlr_surface *surface = toplevel->xdg_toplevel->base->surface;
+    struct wlr_xdg_toplevel *xdg_toplevel = toplevel->xdg_toplevel;
+    struct wlr_xdg_surface *xdg_surface = xdg_toplevel->base;
+    struct wlr_surface *surface = xdg_surface->surface;
     struct tinywl_server *server = toplevel->server;
-    const char *title = (toplevel->xdg_toplevel && toplevel->xdg_toplevel->title) ? toplevel->xdg_toplevel->title : "N/A";
+    const char *title = (xdg_toplevel->title) ? xdg_toplevel->title : "N/A";
 
     if (!surface) {
         wlr_log(WLR_ERROR, "[COMMIT:%s] Surface pointer was NULL!", title);
         return;
     }
 
-    wlr_log(WLR_INFO, "[COMMIT:%s] Surface %p (mapped: %d) commit event. Current buffer: %p (size %dx%d), Seq: %u. Cached tex before: %p, Last cached seq: %u",
-            title, (void*)surface, surface->mapped,
-            (void*)surface->current.buffer,
-            surface->current.buffer ? surface->current.buffer->width : 0,
-            surface->current.buffer ? surface->current.buffer->height : 0,
-            surface->current.seq,
-            (void*)toplevel->cached_texture,
-            toplevel->last_commit_seq);
+    enum wlr_xdg_toplevel_decoration_v1_mode mode_at_commit_entry = WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_NONE;
+    if (toplevel->decoration) {
+        mode_at_commit_entry = toplevel->decoration->current.mode;
+    }
+
+    wlr_log(WLR_INFO, "[COMMIT:%s] START - Mapped:%d, Init:%d, XDGConf:%d, SSD_EN:%d, SSD_PEND:%d. DecoCurr:%d, DecoPend:%d. Buf:%p(%dx%d), Seq:%u. XDGCurrentSize:%dx%d",
+            title, surface->mapped, xdg_surface->initialized, xdg_surface->configured,
+            toplevel->ssd.enabled, toplevel->ssd_pending_enable,
+            mode_at_commit_entry,
+            toplevel->decoration ? toplevel->decoration->pending.mode : -1,
+            (void*)surface->current.buffer, surface->current.buffer ? surface->current.buffer->width : 0, surface->current.buffer ? surface->current.buffer->height : 0,
+            surface->current.seq, xdg_toplevel->current.width, xdg_toplevel->current.height);
 
     if (surface->current.buffer) {
-        // A buffer is present in the current state of the surface for this commit.
-        // Let's try to cache/update the texture.
-        if (toplevel->cached_texture && toplevel->last_commit_seq == surface->current.seq) {
-            // Buffer is current, and seq matches our cached texture's seq. Assume texture is still valid.
-            wlr_log(WLR_DEBUG, "[COMMIT:%s] Current buffer %p and seq %u match cached. No texture update.",
-                title, (void*)surface->current.buffer, surface->current.seq);
-        } else {
-            // Either no cached texture, or sequence number changed, indicating new content.
+        if (!(toplevel->cached_texture && toplevel->last_commit_seq == surface->current.seq)) {
             if (toplevel->cached_texture) {
-                wlr_log(WLR_DEBUG, "[COMMIT:%s] Destroying old cached_texture %p (old seq %u, new seq %u).",
-                        title, (void*)toplevel->cached_texture, toplevel->last_commit_seq, surface->current.seq);
                 wlr_texture_destroy(toplevel->cached_texture);
-                toplevel->cached_texture = NULL;
             }
-
-            wlr_log(WLR_INFO, "[COMMIT:%s] Attempting to create new cached_texture from current.buffer %p.",
-                    title, (void*)surface->current.buffer);
             toplevel->cached_texture = wlr_texture_from_buffer(server->renderer, surface->current.buffer);
-
-            if (toplevel->cached_texture) {
-                wlr_log(WLR_INFO, "[COMMIT:%s] Successfully cached new texture %p (from buffer %p, size %dx%d). New last_commit_seq: %u",
-                        title, (void*)toplevel->cached_texture, (void*)surface->current.buffer,
-                        toplevel->cached_texture->width, toplevel->cached_texture->height, surface->current.seq);
-                toplevel->last_commit_seq = surface->current.seq;
-            } else {
-                wlr_log(WLR_ERROR, "[COMMIT:%s] Failed to create texture from current.buffer %p for caching. last_commit_seq remains %u.",
-                        title, (void*)surface->current.buffer, toplevel->last_commit_seq);
-                // Consider what last_commit_seq should be if caching fails. Keeping old might be misleading.
-                // Perhaps set to a value indicating failure or current seq anyway.
-                toplevel->last_commit_seq = surface->current.seq; // Update seq even on failure to prevent retrying this exact failed buffer.
-            }
+            toplevel->last_commit_seq = surface->current.seq;
         }
     } else {
-        // surface->current.buffer is NULL for this commit.
-        // This means the client committed without a buffer, or detached its buffer.
         if (toplevel->cached_texture) {
-            wlr_log(WLR_INFO, "[COMMIT:%s] Current buffer is NULL. Destroying stale cached_texture %p (was for seq %u).",
-                    title, (void*)toplevel->cached_texture, toplevel->last_commit_seq);
             wlr_texture_destroy(toplevel->cached_texture);
             toplevel->cached_texture = NULL;
         }
-        toplevel->last_commit_seq = surface->current.seq; // Update seq to reflect this bufferless state.
+        toplevel->last_commit_seq = surface->current.seq;
     }
 
-    // Handle initial commit and configuration
-    if (toplevel->xdg_toplevel->base->initial_commit) {
-        wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel, 0, 0);
-        if (!toplevel->xdg_toplevel->base->configured) {
-             wlr_xdg_surface_schedule_configure(toplevel->xdg_toplevel->base);
-             wlr_log(WLR_DEBUG, "[COMMIT:%s] Scheduled configure for initial commit.", title);
+    bool needs_surface_configure = false;
+    enum wlr_xdg_toplevel_decoration_v1_mode server_preferred_mode = WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE;
+
+    if (xdg_surface->initial_commit) {
+        needs_surface_configure = true;
+        if (xdg_toplevel->current.width == 0 && xdg_toplevel->current.height == 0) {
+            wlr_xdg_toplevel_set_size(xdg_toplevel, 0, 0);
         }
+    }
+
+    if (toplevel->decoration && toplevel->ssd_pending_enable) {
+        if (xdg_surface->initialized || xdg_surface->initial_commit) {
+            enum wlr_xdg_toplevel_decoration_v1_mode current_actual_mode = toplevel->decoration->current.mode;
+            enum wlr_xdg_toplevel_decoration_v1_mode pending_protocol_mode = toplevel->decoration->pending.mode;
+
+            if (current_actual_mode != server_preferred_mode ||
+                (pending_protocol_mode != WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_NONE && pending_protocol_mode != server_preferred_mode)) {
+                wlr_log(WLR_INFO, "[COMMIT:%s] ssd_pending_enable=true. Current deco mode: %d, Pending deco mode: %d. Server setting preferred mode: %d.",
+                        title, current_actual_mode, pending_protocol_mode, server_preferred_mode);
+                wlr_xdg_toplevel_decoration_v1_set_mode(toplevel->decoration, server_preferred_mode);
+                needs_surface_configure = true;
+            }
+            toplevel->ssd_pending_enable = false;
+        } else {
+            wlr_log(WLR_INFO, "[COMMIT:%s] ssd_pending_enable=true, but surface not initialized and not initial_commit. Deferring mode set logic.", title);
+        }
+    }
+
+    int content_width = xdg_toplevel->current.width;
+    int content_height = xdg_toplevel->current.height;
+
+    enum wlr_xdg_toplevel_decoration_v1_mode effective_mode_for_decision = WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_NONE;
+    if (toplevel->decoration) {
+        effective_mode_for_decision = (toplevel->decoration->pending.mode != WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_NONE) ?
+                                      toplevel->decoration->pending.mode : toplevel->decoration->current.mode;
+    }
+
+    if (effective_mode_for_decision == server_preferred_mode) {
+        if (content_width > 0 && content_height > 0) {
+            if (!toplevel->ssd.enabled) {
+                wlr_log(WLR_INFO, "[COMMIT:%s] Effective mode is SERVER_SIDE (%d) & content %dx%d. Enabling SSDs.",
+                        title, effective_mode_for_decision, content_width, content_height);
+                ensure_ssd_enabled(toplevel);
+                if (toplevel->ssd.enabled) {
+                    needs_surface_configure = true;
+                }
+            }
+        } else {
+            if (toplevel->ssd.enabled) {
+                wlr_log(WLR_INFO, "[COMMIT:%s] Effective mode is SERVER_SIDE (%d), but content size %dx%d is 0. Disabling SSDs.",
+                        title, effective_mode_for_decision, content_width, content_height);
+                ensure_ssd_disabled(toplevel);
+                needs_surface_configure = true;
+            }
+        }
+    } else {
+        if (toplevel->ssd.enabled) {
+            wlr_log(WLR_INFO, "[COMMIT:%s] Effective mode is %d (NOT SERVER_SIDE). Disabling SSDs.",
+                    title, effective_mode_for_decision);
+            ensure_ssd_disabled(toplevel);
+            needs_surface_configure = true;
+        }
+    }
+
+    if (toplevel->ssd.enabled) {
+        update_decoration_geometry(toplevel);
+    }
+
+    if (needs_surface_configure || (xdg_surface->initialized && !xdg_surface->configured) ) {
+        wlr_log(WLR_INFO, "[COMMIT:%s] Scheduling configure for xdg_surface. NeedsConfFlag:%d, InitAndNotYetXDGConfigured:%d",
+                title, needs_surface_configure, (xdg_surface->initialized && !xdg_surface->configured));
+        uint32_t serial = wlr_xdg_surface_schedule_configure(xdg_surface);
+        wlr_log(WLR_DEBUG, "[COMMIT:%s] Scheduled xdg_surface configure with serial %u.", title, serial);
     }
 
     if (surface->mapped) {
@@ -2989,97 +3273,94 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
             }
         }
     }
+
+    enum wlr_xdg_toplevel_decoration_v1_mode mode_at_commit_exit = WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_NONE;
+    if (toplevel->decoration) {
+        mode_at_commit_exit = toplevel->decoration->current.mode;
+    }
+
+    wlr_log(WLR_INFO, "[COMMIT:%s] END - Mapped:%d, Init:%d, Conf:%d, SSD_EN:%d, DECO_CURR_MODE_EXIT:%d, Seq:%u. XDG_Size(current):%dx%d. Surface Buffer: %p (%dx%d)",
+            title, surface->mapped, xdg_surface->initialized, xdg_surface->configured,
+            toplevel->ssd.enabled, mode_at_commit_exit, surface->current.seq,
+            xdg_toplevel->current.width, xdg_toplevel->current.height,
+            (void*)surface->current.buffer,
+            surface->current.buffer ? surface->current.buffer->width : 0,
+            surface->current.buffer ? surface->current.buffer->height : 0);
 }
 
 
+static void decoration_handle_destroy(struct wl_listener *listener, void *data) {
+    struct tinywl_toplevel *toplevel =
+        wl_container_of(listener, toplevel, decoration_destroy_listener);
 
+    if (!toplevel) return;
+    struct wlr_xdg_toplevel *xdg_toplevel = toplevel->xdg_toplevel;
 
+    wlr_log(WLR_INFO, "[DECO_OBJ_DESTROY] For toplevel %s, decoration %p is being destroyed.",
+            xdg_toplevel->title ? xdg_toplevel->title : "N/A",
+            (void*)toplevel->decoration);
 
+    wl_list_remove(&toplevel->decoration_destroy_listener.link);
+    if (toplevel->decoration_request_mode_listener.link.next) {
+        wl_list_remove(&toplevel->decoration_request_mode_listener.link);
+    }
+    toplevel->decoration = NULL;
+    toplevel->ssd_pending_enable = false;
 
+    ensure_ssd_disabled(toplevel);
+
+    if (xdg_toplevel->base->initialized) {
+        wlr_log(WLR_INFO, "[DECO_OBJ_DESTROY] Toplevel %s: Scheduling configure for main xdg_surface.",
+                xdg_toplevel->title);
+        wlr_xdg_surface_schedule_configure(xdg_toplevel->base);
+    }
+}
+
+// Modified xdg_toplevel_destroy to clean up SSD
 static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
-    struct tinywl_toplevel *toplevel_wrapper = wl_container_of(listener, toplevel_wrapper, destroy);
-    struct wlr_xdg_toplevel *wlroots_xdg_toplevel = toplevel_wrapper ? toplevel_wrapper->xdg_toplevel : NULL;
-    const char *title_for_log = "N/A_DESTROY";
-    if (wlroots_xdg_toplevel && wlroots_xdg_toplevel->title) {
-        title_for_log = wlroots_xdg_toplevel->title;
-    } else if (toplevel_wrapper) {
-        // If title isn't available, use pointer for logging
-        char ptr_buf[32];
-        snprintf(ptr_buf, sizeof(ptr_buf), "TL_WRAPPER:%p", (void*)toplevel_wrapper);
-        title_for_log = ptr_buf; // Not ideal but better than N/A if title is gone
+    struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, destroy);
+    const char *title = toplevel->xdg_toplevel && toplevel->xdg_toplevel->title ? toplevel->xdg_toplevel->title : "N/A";
+
+    wlr_log(WLR_INFO, "[DESTROY:%s] Destroying toplevel %p", title, (void*)toplevel);
+
+    // Clean up cached texture
+    if (toplevel->cached_texture) {
+        wlr_texture_destroy(toplevel->cached_texture);
+        toplevel->cached_texture = NULL;
     }
 
-
-    wlr_log(WLR_INFO, "[DESTROY:%s] Listener called. Wrapper Ptr:%p.", title_for_log, (void*)toplevel_wrapper);
-
-    if (!toplevel_wrapper) {
-        // ... (existing early exit for null wrapper) ...
-        return;
+    // Clean up decoration listeners
+    if (toplevel->decoration) {
+        wl_list_remove(&toplevel->decoration_destroy_listener.link);
+        wl_list_remove(&toplevel->decoration_request_mode_listener.link);
+        toplevel->decoration = NULL;
     }
 
-    // Destroy cached_texture FIRST, as it might be tied to the surface/renderer
-    if (toplevel_wrapper->cached_texture) {
-        wlr_log(WLR_INFO, "[DESTROY:%s] Destroying cached_texture %p.",
-                title_for_log, (void*)toplevel_wrapper->cached_texture);
-        wlr_texture_destroy(toplevel_wrapper->cached_texture);
-        toplevel_wrapper->cached_texture = NULL;
+    // Remove other listeners
+    wl_list_remove(&toplevel->map.link);
+    wl_list_remove(&toplevel->unmap.link);
+    wl_list_remove(&toplevel->commit.link);
+    wl_list_remove(&toplevel->destroy.link);
+    wl_list_remove(&toplevel->request_move.link);
+    wl_list_remove(&toplevel->request_resize.link);
+    wl_list_remove(&toplevel->request_maximize.link);
+    wl_list_remove(&toplevel->request_fullscreen.link);
+
+    // Destroy scene tree (includes SSD elements)
+    if (toplevel->scene_tree) {
+        wlr_scene_node_destroy(&toplevel->scene_tree->node);
+        toplevel->scene_tree = NULL;
+        toplevel->client_xdg_scene_tree = NULL;
+        toplevel->ssd.title_bar = NULL;
+        toplevel->ssd.border_left = NULL;
+        toplevel->ssd.border_right = NULL;
+        toplevel->ssd.border_bottom = NULL;
     }
 
-    // Remove listeners from the wlroots XDG toplevel resource if it still exists
-    if (wlroots_xdg_toplevel) { // Check if xdg_toplevel pointer in wrapper is still valid
-        wlr_log(WLR_DEBUG, "[DESTROY:%s] Removing listeners from wlr_xdg_toplevel %p.", title_for_log, (void*)wlroots_xdg_toplevel);
-        wl_list_remove(&toplevel_wrapper->map.link);
-        wl_list_remove(&toplevel_wrapper->unmap.link);
-        wl_list_remove(&toplevel_wrapper->commit.link);
-        // Ensure this destroy listener itself is removed
-        // This check is important: only remove if 'listener' is indeed our 'destroy' member
-        if (listener == &toplevel_wrapper->destroy) {
-             wl_list_remove(&toplevel_wrapper->destroy.link);
-        } else {
-             // If somehow another listener triggered this, still remove the official one
-             wl_list_remove(&toplevel_wrapper->destroy.link);
-             wlr_log(WLR_ERROR, "[DESTROY:%s] Called from unexpected listener, but removed destroy listener anyway.", title_for_log);
-        }
-        wl_list_remove(&toplevel_wrapper->request_move.link);
-        wl_list_remove(&toplevel_wrapper->request_resize.link);
-        wl_list_remove(&toplevel_wrapper->request_maximize.link);
-        wl_list_remove(&toplevel_wrapper->request_fullscreen.link);
-    } else {
-         wlr_log(WLR_INFO, "[DESTROY:%s] Wrapper's xdg_toplevel was already NULL. Listeners might have been removed prior.", title_for_log);
-         // Still ensure this listener's link is cleaned if it's the one being called
-         if (listener == &toplevel_wrapper->destroy) {
-              wl_list_remove(&toplevel_wrapper->destroy.link);
-         }
-    }
-
-
-    // Scene node destruction
-    if (toplevel_wrapper->scene_tree) {
-        wlr_log(WLR_DEBUG, "[DESTROY:%s] Destroying scene_tree node %p.", title_for_log, (void*)&toplevel_wrapper->scene_tree->node);
-        wlr_scene_node_destroy(&toplevel_wrapper->scene_tree->node); // This also destroys client_xdg_scene_tree if it's a child
-        toplevel_wrapper->scene_tree = NULL;
-        toplevel_wrapper->client_xdg_scene_tree = NULL; // It's destroyed as part of scene_tree
-    }
-
-    // Remove from server's list
-    wl_list_remove(&toplevel_wrapper->link);
-    wlr_log(WLR_DEBUG, "[DESTROY:%s] Removed toplevel wrapper from server list.", title_for_log);
-
-
-    // If this destroy is called directly (e.g. from server_destroy), we'd free here.
-    // If it's from the xdg_toplevel->events.destroy signal, wlroots handles the xdg_toplevel.
-    // The wrapper struct should be freed.
-    // The KEEP_ALIVE logic made this complicated. For a normal destroy:
-    // free(toplevel_wrapper);
-    // toplevel_wrapper = NULL; // Good practice if pointer is reused, though not here.
-    // For your KEEP_ALIVE debug, you skip the free.
-    // For now, let's assume the "KEEP_ALIVE" implies you are not freeing toplevel_wrapper here.
-
-    wlr_log(WLR_INFO, "[DESTROY:%s] Finished processing destroy for wrapper %p.", title_for_log, (void*)toplevel_wrapper);
-    // Nullify the xdg_toplevel pointer in the wrapper, as the wlroots resource is gone (or going).
-    // This prevents use-after-free if the wrapper struct persists.
-    toplevel_wrapper->xdg_toplevel = NULL;
+    wl_list_remove(&toplevel->link);
+    free(toplevel);
 }
+
 static void begin_interactive(struct tinywl_toplevel *toplevel, enum tinywl_cursor_mode mode, uint32_t edges) {
     struct tinywl_server *server = toplevel->server;
     server->grabbed_toplevel = toplevel;
@@ -3127,47 +3408,70 @@ static void xdg_toplevel_request_fullscreen(struct wl_listener *listener, void *
         wlr_xdg_surface_schedule_configure(toplevel->xdg_toplevel->base);
     }
 }
-/*
+
+
+
 static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
     struct tinywl_server *server = wl_container_of(listener, server, new_xdg_toplevel);
     struct wlr_xdg_toplevel *xdg_toplevel = data;
-    wlr_log(WLR_ERROR, "!!!!!!!!!! SERVER_NEW_XDG_TOPLEVEL CALLED for xdg_toplevel %p (app_id: %s, title: %s) !!!!!!!!!!",
-            (void*)xdg_toplevel,
-            xdg_toplevel->app_id ? xdg_toplevel->app_id : "N/A",
-            xdg_toplevel->title ? xdg_toplevel->title : "N/A");
 
-    struct tinywl_toplevel *toplevel = calloc(1, sizeof(*toplevel));
-    if (!toplevel) {
-        wlr_log(WLR_ERROR, "SERVER_NEW_XDG_TOPLEVEL: Failed to allocate tinywl_toplevel");
-        return; // Early exit
+    wlr_log(WLR_INFO, "New XDG Toplevel (app_id: %s, title: %s): %p",
+            xdg_toplevel->app_id ? xdg_toplevel->app_id : "N/A",
+            xdg_toplevel->title ? xdg_toplevel->title : "N/A",
+            (void*)xdg_toplevel);
+
+    if (!xdg_toplevel || !xdg_toplevel->base || !xdg_toplevel->base->surface) {
+        wlr_log(WLR_ERROR, "server_new_xdg_toplevel: Invalid xdg_toplevel or base components.");
+        if (xdg_toplevel && xdg_toplevel->resource) {
+            wl_resource_post_no_memory(xdg_toplevel->resource);
+        }
+        return;
     }
-    wl_list_init(&toplevel->link); 
+
+    struct tinywl_toplevel *toplevel = calloc(1, sizeof(struct tinywl_toplevel));
+    if (!toplevel) {
+        wlr_log(WLR_ERROR, "server_new_xdg_toplevel: Failed to allocate tinywl_toplevel");
+        wl_resource_post_no_memory(xdg_toplevel->resource);
+        return;
+    }
+
     toplevel->server = server;
     toplevel->xdg_toplevel = xdg_toplevel;
-    toplevel->scale = 1.0f; // Default scale
+    wl_list_init(&toplevel->link);
+    toplevel->scale = 1.0f;
     toplevel->target_scale = 1.0f;
     toplevel->is_animating = false;
 
-wl_signal_init(&xdg_toplevel->resource->destroy_signal);
+    toplevel->decoration = NULL;
+    toplevel->ssd.enabled = false;
+    toplevel->ssd_pending_enable = false; // Initialize to false
+    toplevel->ssd.title_bar = NULL;
+    toplevel->ssd.border_left = NULL;
+    toplevel->ssd.border_right = NULL;
+    toplevel->ssd.border_bottom = NULL;
+
+    xdg_toplevel->base->data = toplevel;
 
     toplevel->scene_tree = wlr_scene_tree_create(&server->scene->tree);
     if (!toplevel->scene_tree) {
-        wlr_log(WLR_ERROR, "SERVER_NEW_XDG_TOPLEVEL: Failed to create scene_tree (frame) for toplevel");
+        wlr_log(WLR_ERROR, "Failed to create scene_tree for %p", (void*)xdg_toplevel);
         free(toplevel);
-        return; // Early exit
+        xdg_toplevel->base->data = NULL;
+        wl_resource_post_no_memory(xdg_toplevel->resource);
+        return;
     }
     toplevel->scene_tree->node.data = toplevel;
-    xdg_toplevel->base->data = toplevel;
 
-    toplevel->client_xdg_scene_tree = wlr_scene_xdg_surface_create(toplevel->scene_tree, xdg_toplevel->base);
+    toplevel->client_xdg_scene_tree = wlr_scene_xdg_surface_create(
+        toplevel->scene_tree, xdg_toplevel->base);
     if (!toplevel->client_xdg_scene_tree) {
-        wlr_log(WLR_ERROR, "SERVER_NEW_XDG_TOPLEVEL: Failed to create client_xdg_scene_tree for toplevel");
+        wlr_log(WLR_ERROR, "Failed to create client_xdg_scene_tree for %p", (void*)xdg_toplevel);
         wlr_scene_node_destroy(&toplevel->scene_tree->node);
         free(toplevel);
-        return; // Early exit
+        xdg_toplevel->base->data = NULL;
+        wl_resource_post_no_memory(xdg_toplevel->resource);
+        return;
     }
-
-    wlr_scene_node_set_position(&toplevel->client_xdg_scene_tree->node, 0, 0);
 
     toplevel->map.notify = xdg_toplevel_map;
     wl_signal_add(&xdg_toplevel->base->surface->events.map, &toplevel->map);
@@ -3186,94 +3490,11 @@ wl_signal_init(&xdg_toplevel->resource->destroy_signal);
     toplevel->request_fullscreen.notify = xdg_toplevel_request_fullscreen;
     wl_signal_add(&xdg_toplevel->events.request_fullscreen, &toplevel->request_fullscreen);
 
-    // Crucially, the toplevel is added to the list *in xdg_toplevel_map*
-    // This is generally okay, but let's confirm map is called.
-    wlr_log(WLR_ERROR, "!!!!!!!!!! SERVER_NEW_XDG_TOPLEVEL FINISHED SUCCESSFULLY for xdg_toplevel %p. Toplevel struct %p created. WAITING FOR MAP. !!!!!!!!!!", (void*)xdg_toplevel, (void*)toplevel);
-}*/
+    wl_list_init(&toplevel->decoration_destroy_listener.link);
+    wl_list_init(&toplevel->decoration_request_mode_listener.link);
 
-static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
-    struct tinywl_server *server = wl_container_of(listener, server, new_xdg_toplevel);
-    struct wlr_xdg_toplevel *xdg_toplevel = data;
-    wlr_log(WLR_ERROR, "!!!!!!!!!! SERVER_NEW_XDG_TOPLEVEL CALLED for xdg_toplevel %p (app_id: %s, title: %s) !!!!!!!!!!",
-            (void*)xdg_toplevel,
-            xdg_toplevel->app_id ? xdg_toplevel->app_id : "N/A",
-            xdg_toplevel->title ? xdg_toplevel->title : "N/A");
-
-    // Validate input to prevent null pointer dereferences
-    if (!server || !xdg_toplevel || !xdg_toplevel->base || !xdg_toplevel->base->surface) {
-        wlr_log(WLR_ERROR, "SERVER_NEW_XDG_TOPLEVEL: Invalid server or xdg_toplevel");
-        return;
-    }
-
-    // Allocate toplevel with zero-initialized memory
-    struct tinywl_toplevel *toplevel = calloc(1, sizeof(*toplevel));
-    if (!toplevel) {
-        wlr_log(WLR_ERROR, "SERVER_NEW_XDG_TOPLEVEL: Failed to allocate tinywl_toplevel");
-        wl_resource_post_no_memory(xdg_toplevel->resource);
-        return;
-    }
-
-    // Initialize toplevel fields
-    toplevel->server = server;
-    toplevel->xdg_toplevel = xdg_toplevel;
-    wl_list_init(&toplevel->link); // Initialize list link for server->toplevels
-    toplevel->scale = 1.0f; // Default scale
-    toplevel->target_scale = 1.0f;
-    toplevel->is_animating = false;
-    wlr_log(WLR_DEBUG, "SERVER_NEW_XDG_TOPLEVEL: Toplevel %p allocated", toplevel);
-
-    // Create scene tree for the toplevel
-    toplevel->scene_tree = wlr_scene_tree_create(&server->scene->tree);
-    if (!toplevel->scene_tree) {
-        wlr_log(WLR_ERROR, "SERVER_NEW_XDG_TOPLEVEL: Failed to create scene_tree for toplevel");
-        free(toplevel);
-        wl_resource_post_no_memory(xdg_toplevel->resource);
-        return;
-    }
-    toplevel->scene_tree->node.data = toplevel;
-    xdg_toplevel->base->data = toplevel;
-    wlr_log(WLR_DEBUG, "SERVER_NEW_XDG_TOPLEVEL: Scene tree %p created", toplevel->scene_tree);
-
-    // Create client XDG surface scene node
-    toplevel->client_xdg_scene_tree = wlr_scene_xdg_surface_create(toplevel->scene_tree, xdg_toplevel->base);
-    if (!toplevel->client_xdg_scene_tree) {
-        toplevel->client_xdg_scene_tree->node.data = toplevel; 
-        wlr_log(WLR_ERROR, "SERVER_NEW_XDG_TOPLEVEL: Failed to create client_xdg_scene_tree");
-        wlr_scene_node_destroy(&toplevel->scene_tree->node);
-        free(toplevel);
-        wl_resource_post_no_memory(xdg_toplevel->resource);
-        return;
-    }
-    wlr_scene_node_set_position(&toplevel->client_xdg_scene_tree->node, 0, 0);
-    wlr_log(WLR_DEBUG, "SERVER_NEW_XDG_TOPLEVEL: Client XDG scene tree %p created", toplevel->client_xdg_scene_tree);
-
-    // Initialize listener structures
-    toplevel->map = (struct wl_listener){ .notify = xdg_toplevel_map };
-    toplevel->unmap = (struct wl_listener){ .notify = xdg_toplevel_unmap };
-    toplevel->commit = (struct wl_listener){ .notify = xdg_toplevel_commit };
-    toplevel->destroy = (struct wl_listener){ .notify = xdg_toplevel_destroy };
-    toplevel->request_move = (struct wl_listener){ .notify = xdg_toplevel_request_move };
-    toplevel->request_resize = (struct wl_listener){ .notify = xdg_toplevel_request_resize };
-    toplevel->request_maximize = (struct wl_listener){ .notify = xdg_toplevel_request_maximize };
-    toplevel->request_fullscreen = (struct wl_listener){ .notify = xdg_toplevel_request_fullscreen };
-
-    // Add listeners safely
-    wl_signal_add(&xdg_toplevel->base->surface->events.map, &toplevel->map);
-    wl_signal_add(&xdg_toplevel->base->surface->events.unmap, &toplevel->unmap);
-    wl_signal_add(&xdg_toplevel->base->surface->events.commit, &toplevel->commit);
-    wl_signal_add(&xdg_toplevel->events.destroy, &toplevel->destroy);
-    wl_signal_add(&xdg_toplevel->events.request_move, &toplevel->request_move);
-    wl_signal_add(&xdg_toplevel->events.request_resize, &toplevel->request_resize);
-    wl_signal_add(&xdg_toplevel->events.request_maximize, &toplevel->request_maximize);
-    wl_signal_add(&xdg_toplevel->events.request_fullscreen, &toplevel->request_fullscreen);
-    wlr_log(WLR_DEBUG, "SERVER_NEW_XDG_TOPLEVEL: Listeners added for toplevel %p", toplevel);
-
-    // Do not reinitialize xdg_toplevel->resource->destroy_signal; it's already initialized by wlroots
-    // Adding the destroy listener is sufficient
-
-    // Log completion; toplevel is added to server->toplevels in xdg_toplevel_map
-    wlr_log(WLR_ERROR, "!!!!!!!!!! SERVER_NEW_XDG_TOPLEVEL FINISHED SUCCESSFULLY for xdg_toplevel %p. Toplevel struct %p created. WAITING FOR MAP. !!!!!!!!!!",
-            (void*)xdg_toplevel, (void*)toplevel);
+    wlr_log(WLR_INFO, "Toplevel %p (title: %s) wrapper created. SSDs NOT enabled. Waiting for xdg-decoration.",
+            (void*)toplevel, xdg_toplevel->title ? xdg_toplevel->title : "N/A");
 }
 
 
@@ -3416,6 +3637,141 @@ void cleanup_egl(struct tinywl_server *server) {
 }
 
 
+ void ensure_ssd_enabled(struct tinywl_toplevel *toplevel) {
+    const char *title = (toplevel->xdg_toplevel && toplevel->xdg_toplevel->title) ? toplevel->xdg_toplevel->title : "N/A";
+    wlr_log(WLR_INFO, "[SSD_HELPER] Enter ensure_ssd_enabled for toplevel %s. Current ssd.enabled: %d",
+            title, toplevel->ssd.enabled);
+
+    if (toplevel->ssd.enabled) {
+        wlr_log(WLR_DEBUG, "[SSD_HELPER] SSDs already enabled for toplevel %s. Ensuring geometry update.", title);
+        update_decoration_geometry(toplevel);
+        return;
+    }
+
+    wlr_log(WLR_INFO, "[SSD_HELPER] Enabling SSDs and creating decoration rects for toplevel %s.", title);
+
+    toplevel->ssd.title_bar = NULL;
+    toplevel->ssd.border_left = NULL;
+    toplevel->ssd.border_right = NULL;
+    toplevel->ssd.border_bottom = NULL;
+
+    float title_bar_color[4] = {0.0f, 0.0f, 0.8f, 1.0f};
+    float border_color[4]    = {0.1f, 0.1f, 0.1f, 1.0f};
+
+    // Create SSDs as children of the main scene_tree. update_decoration_geometry will size/position them.
+    toplevel->ssd.title_bar = create_decoration_rect(toplevel->scene_tree, 0, 0, 0, 0, title_bar_color);
+    toplevel->ssd.border_left   = create_decoration_rect(toplevel->scene_tree, 0, 0, 0, 0, border_color);
+    toplevel->ssd.border_right  = create_decoration_rect(toplevel->scene_tree, 0, 0, 0, 0, border_color);
+    toplevel->ssd.border_bottom = create_decoration_rect(toplevel->scene_tree, 0, 0, 0, 0, border_color);
+
+    if (!toplevel->ssd.title_bar || !toplevel->ssd.border_left ||
+        !toplevel->ssd.border_right || !toplevel->ssd.border_bottom) {
+        wlr_log(WLR_ERROR, "[SSD_HELPER] FAILED TO CREATE SOME SSD ELEMENTS for %s", title);
+        if (toplevel->ssd.title_bar) { wlr_scene_node_destroy(&toplevel->ssd.title_bar->node); toplevel->ssd.title_bar = NULL; }
+        if (toplevel->ssd.border_left) { wlr_scene_node_destroy(&toplevel->ssd.border_left->node); toplevel->ssd.border_left = NULL; }
+        if (toplevel->ssd.border_right) { wlr_scene_node_destroy(&toplevel->ssd.border_right->node); toplevel->ssd.border_right = NULL; }
+        if (toplevel->ssd.border_bottom) { wlr_scene_node_destroy(&toplevel->ssd.border_bottom->node); toplevel->ssd.border_bottom = NULL; }
+        toplevel->ssd.enabled = false;
+    } else {
+        toplevel->ssd.enabled = true;
+        wlr_log(WLR_INFO, "[SSD_HELPER] SSDs successfully created for %s. title_bar: %p", title, (void*)toplevel->ssd.title_bar);
+        if (toplevel->client_xdg_scene_tree) {
+            wlr_log(WLR_INFO, "[SSD_HELPER] Repositioning client_xdg_scene_tree for %s to (%d, %d).", title, BORDER_WIDTH, TITLE_BAR_HEIGHT);
+            wlr_scene_node_set_position(&toplevel->client_xdg_scene_tree->node, BORDER_WIDTH, TITLE_BAR_HEIGHT);
+        }
+        update_decoration_geometry(toplevel);
+    }
+}
+
+
+
+
+
+static void server_new_xdg_decoration(struct wl_listener *listener, void *data) {
+    struct tinywl_server *server = wl_container_of(listener, server, xdg_decoration_new);
+    struct wlr_xdg_toplevel_decoration_v1 *decoration = data;
+    struct wlr_xdg_toplevel *xdg_toplevel = decoration->toplevel;
+    struct tinywl_toplevel *toplevel = xdg_toplevel->base->data; // xdg_surface is xdg_toplevel->base
+
+    const char *title_for_log = xdg_toplevel->title ? xdg_toplevel->title : "N/A";
+
+    wlr_log(WLR_INFO, "[DECO_MGR] New decoration object %p for toplevel '%s'. Initial client requested mode: %d",
+            (void*)decoration, title_for_log, decoration->requested_mode);
+
+    if (!toplevel) {
+        wlr_log(WLR_ERROR, "[DECO_MGR] No tinywl_toplevel for new decoration on '%s'.", title_for_log);
+        return;
+    }
+
+    if (toplevel->decoration && toplevel->decoration != decoration) {
+        wlr_log(WLR_INFO, "[DECO_MGR] Replacing old decoration for toplevel '%s'", title_for_log);
+        wl_list_remove(&toplevel->decoration_destroy_listener.link);
+        wl_list_remove(&toplevel->decoration_request_mode_listener.link);
+    }
+
+    toplevel->decoration = decoration;
+    toplevel->decoration_destroy_listener.notify = decoration_handle_destroy;
+    wl_signal_add(&decoration->events.destroy, &toplevel->decoration_destroy_listener);
+    toplevel->decoration_request_mode_listener.notify = decoration_handle_request_mode;
+    wl_signal_add(&decoration->events.request_mode, &toplevel->decoration_request_mode_listener);
+
+    // CRITICAL CHANGE: Do NOT call wlr_xdg_toplevel_decoration_v1_set_mode() here.
+    // Only set the flag. The commit handler will call set_mode when the surface is initialized.
+    toplevel->ssd_pending_enable = true;
+    wlr_log(WLR_INFO, "[DECO_MGR] Toplevel '%s': Associated decoration. Marked ssd_pending_enable = true. Actual mode set and surface configure will occur on commit.", title_for_log);
+
+    // If the main xdg_surface IS ALREADY initialized, we can schedule a configure for it.
+    // This helps if the decoration is created *after* the surface's initial commit.
+    // The commit handler will then see ssd_pending_enable and call set_mode.
+    if (xdg_toplevel->base->initialized) {
+        wlr_log(WLR_DEBUG, "[DECO_MGR] Toplevel '%s' xdg_surface is already initialized. Scheduling configure for xdg_surface to process pending decoration.", title_for_log);
+        wlr_xdg_surface_schedule_configure(xdg_toplevel->base);
+    }
+}
+
+static void decoration_handle_request_mode(struct wl_listener *listener, void *data) {
+    struct tinywl_toplevel *toplevel =
+        wl_container_of(listener, toplevel, decoration_request_mode_listener);
+    struct wlr_xdg_toplevel_decoration_v1 *decoration = data;
+    struct wlr_xdg_toplevel *xdg_toplevel = toplevel->xdg_toplevel;
+    struct wlr_xdg_surface *xdg_surface = xdg_toplevel->base;
+
+    const char *title = (xdg_toplevel && xdg_toplevel->title) ?
+                        xdg_toplevel->title : "N/A";
+
+    wlr_log(WLR_INFO, "[DECO_REQUEST_MODE:%s] Client requested mode: %d. Surface initialized: %d",
+            title, decoration->requested_mode, xdg_surface->initialized);
+
+    // CRITICAL CHANGE: Do NOT call wlr_xdg_toplevel_decoration_v1_set_mode() here directly
+    // if the surface might not be initialized.
+    // Set the flag, and let the commit handler call set_mode.
+    toplevel->ssd_pending_enable = true;
+    wlr_log(WLR_INFO, "[DECO_REQUEST_MODE:%s] Marked ssd_pending_enable = true. Mode set will be handled in commit.", title);
+
+    // If the surface IS ALREADY initialized, schedule a configure for it.
+    // The commit handler will then see ssd_pending_enable and call set_mode.
+    if (xdg_surface->initialized) {
+        wlr_log(WLR_DEBUG, "[DECO_REQUEST_MODE:%s] Surface is initialized. Scheduling configure for xdg_surface to process pending decoration.", title);
+        wlr_xdg_surface_schedule_configure(xdg_surface);
+    }
+}
+
+
+
+
+
+
+
+
+static void handle_xdg_decoration_new(struct wl_listener *listener, void *data) {
+    struct tinywl_server *server = wl_container_of(listener, server, xdg_decoration_new);
+    struct wlr_xdg_toplevel_decoration_v1 *decoration = data;
+    
+    // Force client-side decorations (no server decorations)
+    wlr_xdg_toplevel_decoration_v1_set_mode(decoration, 
+        WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
+}
+
 /* Updated main function */
 int main(int argc, char *argv[]) {
     
@@ -3518,7 +3874,6 @@ static const char *rect_fragment_shader_src =
     "    \n"
     "    frag_color = vec4(col, u_color.a).bgra;\n"
     "}\n";
-
 
 const char *vertex_shader_src =
     "#version 300 es\n"
@@ -3814,6 +4169,186 @@ static const char *panel_fragment_shader_src =
     "}";
 
 
+
+
+
+const char *back_vertex_shader_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2 position;\n"
+    "in vec2 texcoord;\n" 
+    "out vec2 v_texcoord;\n" 
+    "uniform mat3 mvp;\n"
+    "void main() {\n"
+    "    vec3 pos_transformed = mvp * vec3(position, 1.0);\n"
+    "    gl_Position = vec4(pos_transformed.xy, 0.0, 1.0);\n"
+    "    v_texcoord = position;\n" 
+    "}\n";
+
+const char *back_fragment_shader_src =   
+    "/* Octgrams shader converted to panel format, with curved corners using v_texcoord */\n"
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "\n"
+    "in vec2 v_texcoord; // IMPORTANT: This MUST be correctly supplied for the panel's quad\n"
+    "out vec4 frag_color;\n"
+    "\n"
+    "uniform float time;\n"
+    "uniform vec2 iResolution; // Resolution of the viewport/target this shader draws to\n"
+    "\n"
+    "float gTime = 0.0;\n"
+    "const float REPEAT = 5.0;\n"
+    "\n"
+    "mat2 rot(float a) {\n"
+    "    float c = cos(a), s = sin(a);\n"
+    "    return mat2(c,s,-s,c);\n"
+    "}\n"
+    "\n"
+    "float sdBox( vec3 p, vec3 b ) {\n"
+    "    vec3 q = abs(p) - b;\n"
+    "    return length(max(q,0.0)) + min(max(q.x,max(q.y,q.z)),0.0);\n"
+    "}\n"
+    "\n"
+    "// Helper function for Signed Distance to a 2D Rounded Box\n"
+    "// p: point to sample in pixel coordinates\n"
+    "// b: half-extents of the box in pixel coordinates\n"
+    "// r: corner radius in pixels (constant regardless of aspect ratio)\n"
+    "float sdfRoundBox2D(vec2 p, vec2 b, float r) {\n"
+    "    r = min(r, min(b.x, b.y)); // Clamp radius\n"
+    "    vec2 q = abs(p) - b + r;\n"
+    "    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;\n"
+    "}\n"
+    "\n"
+    "float box(vec3 pos, float scale) {\n"
+    "    pos *= scale;\n"
+    "    float base = sdBox(pos, vec3(.4,.4,.1)) /1.5;\n"
+    "    pos.xy *= 5.0;\n"
+    "    pos.y -= 3.5;\n"
+    "    pos.xy *= rot(.75);\n"
+    "    float result = -base;\n"
+    "    return result;\n"
+    "}\n"
+    "\n"
+    "float box_set(vec3 pos, float iTime) {\n"
+    "    vec3 pos_origin = pos;\n"
+    "    pos = pos_origin;\n"
+    "    pos.y += sin(gTime * 0.4) * 2.5;\n"
+    "    pos.xy *= rot(.8);\n"
+    "    float box1 = box(pos,2.0 - abs(sin(gTime * 0.4)) * 1.5);\n"
+    "    pos = pos_origin;\n"
+    "    pos.y -=sin(gTime * 0.4) * 2.5;\n"
+    "    pos.xy *= rot(.8);\n"
+    "    float box2 = box(pos,2.0 - abs(sin(gTime * 0.4)) * 1.5);\n"
+    "    pos = pos_origin;\n"
+    "    pos.x +=sin(gTime * 0.4) * 2.5;\n"
+    "    pos.xy *= rot(.8);\n"
+    "    float box3 = box(pos,2.0 - abs(sin(gTime * 0.4)) * 1.5);\n"
+    "    pos = pos_origin;\n"
+    "    pos.x -=sin(gTime * 0.4) * 2.5;\n"
+    "    pos.xy *= rot(.8);\n"
+    "    float box4 = box(pos,2.0 - abs(sin(gTime * 0.4)) * 1.5);\n"
+    "    pos = pos_origin;\n"
+    "    pos.xy *= rot(.8);\n"
+    "    float box5 = box(pos,.5) * 6.0;\n"
+    "    pos = pos_origin;\n"
+    "    float box6 = box(pos,.5) * 6.0;\n"
+    "    float result = max(max(max(max(max(box1,box2),box3),box4),box5),box6);\n"
+    "    return result;\n"
+    "}\n"
+    "\n"
+    "float map(vec3 pos, float iTime) {\n"
+    "    vec3 pos_origin = pos;\n"
+    "    float box_set1 = box_set(pos, iTime);\n"
+    "    return box_set1;\n"
+    "}\n"
+    "\n"
+    "void main() {\n"
+    "    // Scene rendering part (uses gl_FragCoord to map to the effect space)\n"
+    "    vec2 fragCoord_for_scene = gl_FragCoord.xy;\n"
+    "    float iTime = time;\n"
+    "    \n"
+    "    vec2 p_scene = (fragCoord_for_scene * 2.0 - iResolution.xy) / min(iResolution.x, iResolution.y);\n"
+    "    vec3 ro = vec3(0.0, -0.2, iTime * 4.0);\n"
+    "    vec3 ray = normalize(vec3(p_scene, 1.5));\n"
+    "    ray.xy = ray.xy * rot(sin(iTime * .03) * 5.0);\n"
+    "    ray.yz = ray.yz * rot(sin(iTime * .05) * .2);\n"
+    "    float t = 0.1;\n"
+    "    vec3 col = vec3(0.0);\n"
+    "    float ac = 0.0;\n"
+    "    \n"
+    "    for (int i = 0; i < 99; i++){\n"
+    "        vec3 pos = ro + ray * t;\n"
+    "        pos = mod(pos-2.0, 4.0) -2.0;\n"
+    "        gTime = iTime -float(i) * 0.01;\n"
+    "        \n"
+    "        float d = map(pos, iTime);\n"
+    "        d = max(abs(d), 0.01);\n"
+    "        ac += exp(-d*23.0);\n"
+    "        t += d* 0.55;\n"
+    "    }\n"
+    "    \n"
+    "    col = vec3(ac * 0.02);\n"
+    "    col +=vec3(0.0,0.2 * abs(sin(iTime)),0.5 + sin(iTime) * 0.2);\n"
+    "    \n"
+    "    // --- Rounded Corners Masking using pixel-perfect dimensions ---\n"
+    "    // Convert v_texcoord [0,1] to pixel coordinates relative to center\n"
+    "    vec2 pixel_pos = (v_texcoord - 0.5) * iResolution;\n"
+    "\n"
+    "    // Half-extents of the rectangle in pixels\n"
+    "    vec2 box_half_extents_pixels = iResolution * 0.5;\n"
+    "    \n"
+    "    // Corner radius in pixels (constant circular radius regardless of aspect ratio)\n"
+    "    float corner_radius_pixels = 20.0; // Adjust this value for desired corner size\n"
+    "\n"
+    "    // Calculate signed distance to the rounded rectangle edge in pixels\n"
+    "    float dist_to_edge = sdfRoundBox2D(pixel_pos, box_half_extents_pixels, corner_radius_pixels);\n"
+    "\n"
+    "    // Antialiasing width in pixels (typically 1-2 pixels for smooth edges)\n"
+    "    float aa_pixels = 1.5;\n"
+    "    \n"
+    "    // Create alpha mask: 1.0 inside, 0.0 outside, smooth transition at the edge\n"
+    "    // Using step function to ensure corners are completely transparent\n"
+    "    float shape_alpha_mask;\n"
+    "    if (dist_to_edge > aa_pixels * 0.5) {\n"
+    "        shape_alpha_mask = 0.0; // Completely outside - fully transparent\n"
+    "    } else if (dist_to_edge < -aa_pixels * 0.5) {\n"
+    "        shape_alpha_mask = 1.0; // Completely inside - fully opaque\n"
+    "    } else {\n"
+    "        // Smooth transition zone\n"
+    "        shape_alpha_mask = 1.0 - smoothstep(-aa_pixels * 0.5, aa_pixels * 0.5, dist_to_edge);\n"
+    "    }\n"
+    "    \n"
+    "    shape_alpha_mask = clamp(shape_alpha_mask, 0.0, 1.0);\n"
+    "\n"
+    "    float original_alpha = 0.6; // Original alpha of the content\n"
+    "    float final_alpha = original_alpha * shape_alpha_mask;\n"
+    "    // --- End Rounded Corners Masking ---\n"
+    "\n"
+    "    frag_color = vec4(col, final_alpha).bgra;\n"
+    "}";
+
+// NEW: Vertex shader for SSDs (can be very simple)
+static const char *ssd_vertex_shader_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2 position;\n" // Vertices of the quad (0,0 to 1,1)
+    "uniform mat3 mvp;\n"
+    "void main() {\n"
+    "    vec3 pos_transformed = mvp * vec3(position, 1.0);\n"
+    "    gl_Position = vec4(pos_transformed.xy, 0.0, 1.0);\n"
+    "}\n";
+
+// NEW: Fragment shader for SSDs (simple color)
+static const char *ssd_fragment_shader_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "uniform vec4 u_color;\n" // Color for the SSD part
+    "out vec4 frag_color;\n"
+    "void main() {\n"
+    "    frag_color = u_color.bgra;\n" // Output the color directly (BGRA for RDP)
+    "}\n";
+
+
     setenv("MESA_VK_VERSION_OVERRIDE", "1.2", 1);
     setenv("MESA_LOADER_DRIVER_OVERRIDE", "zink", 1);
    // setenv("GALLIUM_DRIVER", "zink", 1);
@@ -3952,14 +4487,15 @@ const char *vendor = (const char *)glGetString(GL_VENDOR);
         {"mvp", &server.rect_shader_mvp_loc},
         {"u_color", &server.rect_shader_color_loc},
         {"time", &server.rect_shader_time_loc},
-        {"iResolution", &server.rect_shader_resolution_loc}
+        {"iResolution", &server.rect_shader_resolution_loc},
+        {"u_rectResolution", &server.rect_shader_rect_res_loc} 
     };
-    if (!create_generic_shader_program(server.renderer, "MeltRectShader",
-                                     rect_vertex_shader_src, // Your 70s melt VS
-                                     rect_fragment_shader_src, // Your 70s melt FS
+     if (!create_generic_shader_program(server.renderer, "MeltRectShader",
+                                     rect_vertex_shader_src,
+                                     rect_fragment_shader_src, // Use the modified one from above
                                      &server.rect_shader_program,
                                      melt_rect_uniforms, sizeof(melt_rect_uniforms) / sizeof(melt_rect_uniforms[0]))) {
-        wlr_log(WLR_ERROR, "Failed to create '70s Melt' rect shader program.");
+        wlr_log(WLR_ERROR, "Failed to create 'Melt' rect shader program.");
         server_destroy(&server); return 1;
     }
 
@@ -3981,6 +4517,51 @@ const char *vendor = (const char *)glGetString(GL_VENDOR);
         server_destroy(&server); return 1;
     }
 
+  
+
+     struct shader_uniform_spec back_uniforms[] = {
+        {"mvp",                       &server.back_shader_mvp_loc},
+        {"texture_sampler_uniform",   &server.back_shader_tex_loc}, // If FS uses it
+        {"time",                      &server.back_shader_time_loc},      // If FS uses it
+        {"iResolution",               &server.back_shader_res_loc}       // If FS uses it
+        // Add any other uniforms your back_fragment_shader_src DEFINES
+        // e.g., {"u_some_color", &server.back_shader_some_other_uniform_loc}
+    };
+
+    if (!create_generic_shader_program(server.renderer, "backgroundShader", // Log name
+                                     back_vertex_shader_src,  // Your chosen VS for window backgrounds
+                                     back_fragment_shader_src, // Your chosen FS for window backgrounds
+                                     &server.back_shader_program, // Store program ID here
+                                     back_uniforms,
+                                     sizeof(back_uniforms) / sizeof(back_uniforms[0]))) {
+        wlr_log(WLR_ERROR, "Failed to create Window Background shader program.");
+        server_destroy(&server); return 1;
+    }
+
+
+    // --- Create SSD Shader (Simple Color) ---
+struct shader_uniform_spec ssd_shader_uniforms[] = {
+    {"mvp", &server.ssd_shader_mvp_loc},
+    {"u_color", &server.ssd_shader_color_loc}
+};
+if (!create_generic_shader_program(server.renderer, "SSDColorShader",
+                                 ssd_vertex_shader_src,   // Use the new simple vertex shader
+                                 ssd_fragment_shader_src, // Use the new simple fragment shader
+                                 &server.ssd_shader_program,
+                                 ssd_shader_uniforms,
+                                 sizeof(ssd_shader_uniforms) / sizeof(ssd_shader_uniforms[0]))) {
+    wlr_log(WLR_ERROR, "Failed to create SSD color shader program.");
+    server_destroy(&server); return 1;
+}
+wlr_log(WLR_INFO, "SSDColorShader created (ID: %u). MVP@%d, Color@%d",
+        server.ssd_shader_program, server.ssd_shader_mvp_loc, server.ssd_shader_color_loc);
+    // Add a log to confirm locations (optional but helpful)
+    wlr_log(WLR_INFO, "backgroundShader created (ID: %u). MVP@%d, Tex@%d, Time@%d, iRes@%d",
+            server.back_shader_program,
+            server.back_shader_mvp_loc,
+            server.back_shader_tex_loc,
+            server.back_shader_time_loc,
+            server.back_shader_res_loc);
     // --- VAO Setup ---
     // Ensure EGL context is current for VAO operations.
     // create_generic_shader_program restores the context, so make it current again.
@@ -4100,16 +4681,24 @@ const char *vendor = (const char *)glGetString(GL_VENDOR);
     wl_list_init(&server.toplevels);
     wl_list_init(&server.popups);
 
-    server.xdg_shell = wlr_xdg_shell_create(server.wl_display, 3);
-    server.new_xdg_toplevel.notify = server_new_xdg_toplevel;
-    wl_signal_add(&server.xdg_shell->events.new_toplevel, &server.new_xdg_toplevel);
-    server.new_xdg_popup.notify = server_new_xdg_popup;
-    wl_signal_add(&server.xdg_shell->events.new_popup, &server.new_xdg_popup);
+  // ...
+server.xdg_shell = wlr_xdg_shell_create(server.wl_display, 3);
+server.new_xdg_toplevel.notify = server_new_xdg_toplevel; // KEEP THIS
+wl_signal_add(&server.xdg_shell->events.new_toplevel, &server.new_xdg_toplevel);
+// ...
 
-
-
+server.xdg_decoration_manager = wlr_xdg_decoration_manager_v1_create(server.wl_display);
+if (!server.xdg_decoration_manager) {
+    wlr_log(WLR_ERROR, "Failed to create XDG decoration manager v1");
+    return 1;
+}
+server.xdg_decoration_new.notify = server_new_xdg_decoration; // Ensure this points to your callback
+wl_signal_add(&server.xdg_decoration_manager->events.new_toplevel_decoration,
+              &server.xdg_decoration_new); // Ensure this is the correct listener struct member
+wlr_log(WLR_ERROR, "!!!!!!!!!! XDG DECORATION LISTENER ADDED (main) for manager %p, listener %p, notify %p",
+    (void*)server.xdg_decoration_manager, (void*)&server.xdg_decoration_new, (void*)server_new_xdg_decoration);
+// ...
  
-
 
     server.cursor = wlr_cursor_create();
     wlr_cursor_attach_output_layout(server.cursor, server.output_layout);
