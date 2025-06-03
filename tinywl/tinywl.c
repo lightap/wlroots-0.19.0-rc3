@@ -415,6 +415,8 @@ struct tinywl_decoration { // Your struct for SSD scene rects
         struct wlr_scene_rect *border_right;
         struct wlr_scene_rect *border_bottom;
 
+
+
 };
 
 #define TITLE_BAR_HEIGHT 30
@@ -1231,45 +1233,70 @@ static void process_cursor_move(struct tinywl_server *server) { // This is calle
     wlr_log(WLR_DEBUG, "Moving toplevel to (%d, %d)", new_x, new_y);
 }
 
+// --- Modified process_cursor_resize ---
 static void process_cursor_resize(struct tinywl_server *server) {
     struct tinywl_toplevel *toplevel = server->grabbed_toplevel;
-    double border_x = server->cursor->x - server->grab_x;
-    double border_y = server->cursor->y - server->grab_y;
-    int new_left = server->grab_geobox.x;
-    int new_right = server->grab_geobox.x + server->grab_geobox.width;
-    int new_top = server->grab_geobox.y;
-    int new_bottom = server->grab_geobox.y + server->grab_geobox.height;
+    if (!toplevel || toplevel->type != TINYWL_TOPLEVEL_XDG || !toplevel->xdg_toplevel) {
+        return;
+    }
+
+    // border_x and border_y are the new target screen coordinates for the
+    // *content edges* being dragged, based on initial grab offset.
+    double border_x_target = server->cursor->x - server->grab_x;
+    double border_y_target = server->cursor->y - server->grab_y;
+
+    // Initialize new content dimensions/positions with the initial grab_geobox (content screen geo)
+    int new_content_left_screen = server->grab_geobox.x;
+    int new_content_top_screen = server->grab_geobox.y;
+    int new_content_width = server->grab_geobox.width;
+    int new_content_height = server->grab_geobox.height;
 
     if (server->resize_edges & WLR_EDGE_TOP) {
-        new_top = border_y;
-        if (new_top >= new_bottom) {
-            new_top = new_bottom - 1;
-        }
+        new_content_top_screen = border_y_target;
+        new_content_height = (server->grab_geobox.y + server->grab_geobox.height) - new_content_top_screen;
     } else if (server->resize_edges & WLR_EDGE_BOTTOM) {
-        new_bottom = border_y;
-        if (new_bottom <= new_top) {
-            new_bottom = new_top + 1;
-        }
+        new_content_height = border_y_target - new_content_top_screen;
     }
+
     if (server->resize_edges & WLR_EDGE_LEFT) {
-        new_left = border_x;
-        if (new_left >= new_right) {
-            new_left = new_right - 1;
-        }
+        new_content_left_screen = border_x_target;
+        new_content_width = (server->grab_geobox.x + server->grab_geobox.width) - new_content_left_screen;
     } else if (server->resize_edges & WLR_EDGE_RIGHT) {
-        new_right = border_x;
-        if (new_right <= new_left) {
-            new_right = new_left + 1;
-        }
+        new_content_width = border_x_target - new_content_left_screen;
     }
 
-    struct wlr_box *geo_box = &toplevel->xdg_toplevel->base->geometry;
-    wlr_scene_node_set_position(&toplevel->scene_tree->node,
-        new_left - geo_box->x, new_top - geo_box->y);
+    // Add minimum size constraints for content
+    int min_width = 50;  // Minimum content width
+    int min_height = 30; // Minimum content height
+    if (new_content_width < min_width) {
+        if (server->resize_edges & WLR_EDGE_LEFT) {
+            new_content_left_screen -= (min_width - new_content_width);
+        }
+        new_content_width = min_width;
+    }
+    if (new_content_height < min_height) {
+         if (server->resize_edges & WLR_EDGE_TOP) {
+            new_content_top_screen -= (min_height - new_content_height);
+        }
+        new_content_height = min_height;
+    }
 
-    int new_width = new_right - new_left;
-    int new_height = new_bottom - new_top;
-    wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel, new_width, new_height);
+    // Determine new position for the scene_tree (top-left of entire decorated window)
+    int scene_tree_new_x = new_content_left_screen;
+    int scene_tree_new_y = new_content_top_screen;
+
+    if (toplevel->ssd.enabled) {
+        scene_tree_new_x -= BORDER_WIDTH;
+        scene_tree_new_y -= TITLE_BAR_HEIGHT;
+    }
+    // else: scene_tree_new_x/y are already correct as content_left/top if no SSD
+
+    wlr_scene_node_set_position(&toplevel->scene_tree->node, scene_tree_new_x, scene_tree_new_y);
+    wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel, new_content_width, new_content_height);
+
+    // update_decoration_geometry will be called on the next commit from the client
+    // which will correctly size and position SSDs around the new content size,
+    // and position client_xdg_scene_tree within the main scene_tree.
 }
 
 
@@ -1351,6 +1378,7 @@ static void server_cursor_motion_absolute(struct wl_listener *listener, void *da
 
 
 
+// --- Modified server_cursor_button ---
 static void server_cursor_button(struct wl_listener *listener, void *data) {
     struct tinywl_server *server = wl_container_of(listener, server, cursor_button);
     struct wlr_pointer_button_event *event = data;
@@ -1360,9 +1388,9 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
             event->button, event->state == WL_POINTER_BUTTON_STATE_PRESSED ? "pressed" : "released",
             event->time_msec, server->cursor_mode);
 
-    double sx, sy;
+    double sx_at_node, sy_at_node; // Renamed to avoid conflict with sx, sy for surface
     struct wlr_scene_node *scene_node_at_cursor = wlr_scene_node_at(
-        &server->scene->tree.node, server->cursor->x, server->cursor->y, &sx, &sy);
+        &server->scene->tree.node, server->cursor->x, server->cursor->y, &sx_at_node, &sy_at_node);
 
     struct tinywl_toplevel *toplevel = NULL;
     if (scene_node_at_cursor) {
@@ -1373,59 +1401,105 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
         if (server->cursor_mode == TINYWL_CURSOR_MOVE || server->cursor_mode == TINYWL_CURSOR_RESIZE) {
             server->cursor_mode = TINYWL_CURSOR_PASSTHROUGH;
             server->grabbed_toplevel = NULL;
-            wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default"); // Reset cursor
+            wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
             wlr_log(WLR_DEBUG, "Ended interactive move/resize.");
         }
-        // Notify client of button release, even if we handled the press
         wlr_seat_pointer_notify_button(seat, event->time_msec, event->button, event->state);
     } else if (event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
         bool button_handled_by_compositor = false;
 
-        if (toplevel && toplevel->xdg_toplevel && toplevel->ssd.enabled) {
-            // Check if the click is on our SSD title bar
+        if (toplevel && toplevel->type == TINYWL_TOPLEVEL_XDG && toplevel->xdg_toplevel && toplevel->ssd.enabled && event->button == BTN_LEFT) {
+            uint32_t current_resize_edges = 0;
+            const char *cursor_to_set = NULL;
+
             if (scene_node_at_cursor == &toplevel->ssd.title_bar->node) {
-                if (event->button == BTN_LEFT) {
-                    wlr_log(WLR_INFO, "Grabbed toplevel '%s' by title bar for MOVE.",
-                            toplevel->xdg_toplevel->title ? toplevel->xdg_toplevel->title : "N/A");
-
-                    // Bring to front and focus
-                    focus_toplevel(toplevel); // focus_toplevel also raises to top
-
-                    server->cursor_mode = TINYWL_CURSOR_MOVE;
-                    server->grabbed_toplevel = toplevel;
-                    // Grab coordinates are relative to the toplevel's scene_tree origin
-                    server->grab_x = server->cursor->x - toplevel->scene_tree->node.x;
-                    server->grab_y = server->cursor->y - toplevel->scene_tree->node.y;
-                    wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "grabbing"); // Or "move"
-                    button_handled_by_compositor = true;
-                }
+                focus_toplevel(toplevel);
+                server->cursor_mode = TINYWL_CURSOR_MOVE;
+                server->grabbed_toplevel = toplevel;
+                server->grab_x = server->cursor->x - toplevel->scene_tree->node.x;
+                server->grab_y = server->cursor->y - toplevel->scene_tree->node.y;
+                wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "grabbing");
+                button_handled_by_compositor = true;
+            } else if (toplevel->ssd.border_left && scene_node_at_cursor == &toplevel->ssd.border_left->node) {
+                current_resize_edges = WLR_EDGE_LEFT;
+                cursor_to_set = "left_side";
+            } else if (toplevel->ssd.border_right && scene_node_at_cursor == &toplevel->ssd.border_right->node) {
+                current_resize_edges = WLR_EDGE_RIGHT;
+                cursor_to_set = "right_side";
+            } else if (toplevel->ssd.border_bottom && scene_node_at_cursor == &toplevel->ssd.border_bottom->node) {
+                current_resize_edges = WLR_EDGE_BOTTOM;
+                cursor_to_set = "bottom_side";
             }
-            // TODO: Add similar checks here for border scene_nodes if you want to implement resize by dragging borders.
-            // else if (scene_node_at_cursor == &toplevel->ssd.border_left->node && ...) { server->cursor_mode = TINYWL_CURSOR_RESIZE; ... }
+            // TODO: Add corner checks if desired, e.g.:
+            // else if (cursor near bottom-left corner of SSD) {
+            //    current_resize_edges = WLR_EDGE_BOTTOM | WLR_EDGE_LEFT;
+            //    cursor_to_set = "bottom_left_corner";
+            // }
+
+            if (current_resize_edges != 0) {
+                focus_toplevel(toplevel);
+                server->cursor_mode = TINYWL_CURSOR_RESIZE;
+                server->grabbed_toplevel = toplevel;
+                server->resize_edges = current_resize_edges;
+
+                // Store grab_geobox as the current *content* geometry in screen coordinates
+                struct wlr_box *client_geo = &toplevel->xdg_toplevel->base->geometry; // Usually 0,0 relative to its own surface
+                // Get scene_tree position (top-left of whole decorated window)
+                int scene_tree_x = toplevel->scene_tree->node.x;
+                int scene_tree_y = toplevel->scene_tree->node.y;
+
+                // Calculate content top-left in screen coordinates
+                server->grab_geobox.x = scene_tree_x + BORDER_WIDTH;
+                server->grab_geobox.y = scene_tree_y + TITLE_BAR_HEIGHT;
+                server->grab_geobox.width = toplevel->xdg_toplevel->current.width;  // Use current size
+                server->grab_geobox.height = toplevel->xdg_toplevel->current.height; // Use current size
+
+                // Store grab_x/y as offset from cursor to the *corresponding content edge*
+                if (current_resize_edges & WLR_EDGE_LEFT) {
+                    server->grab_x = server->cursor->x - server->grab_geobox.x;
+                }
+                if (current_resize_edges & WLR_EDGE_RIGHT) {
+                    server->grab_x = server->cursor->x - (server->grab_geobox.x + server->grab_geobox.width);
+                }
+                // No top edge SSD resize for now
+                if (current_resize_edges & WLR_EDGE_BOTTOM) {
+                    server->grab_y = server->cursor->y - (server->grab_geobox.y + server->grab_geobox.height);
+                }
+                
+                if (cursor_to_set) {
+                    wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, cursor_to_set);
+                }
+                wlr_log(WLR_INFO, "Grabbed toplevel '%s' for RESIZE (edges: %u). Grab box (content screen): %d,%d %dx%d. Grab offset x:%.1f y:%.1f",
+                    toplevel->xdg_toplevel->title ? toplevel->xdg_toplevel->title : "N/A",
+                    current_resize_edges, server->grab_geobox.x, server->grab_geobox.y,
+                    server->grab_geobox.width, server->grab_geobox.height, server->grab_x, server->grab_y);
+                button_handled_by_compositor = true;
+            }
         }
 
-        // If not handled by compositor SSD interaction, pass to client or handle default focus.
+
         if (!button_handled_by_compositor) {
             struct wlr_surface *surface_under_cursor = NULL;
+            double sx_surf, sy_surf; // For surface-local coordinates
             if (scene_node_at_cursor && scene_node_at_cursor->type == WLR_SCENE_NODE_BUFFER) {
                 struct wlr_scene_buffer *sbuf = wlr_scene_buffer_from_node(scene_node_at_cursor);
                 struct wlr_scene_surface *ssurf = wlr_scene_surface_try_from_buffer(sbuf);
                 if (ssurf) {
                     surface_under_cursor = ssurf->surface;
+                    // sx_at_node, sy_at_node are already surface-local from wlr_scene_node_at
+                    sx_surf = sx_at_node;
+                    sy_surf = sy_at_node;
                 }
             }
 
             if (surface_under_cursor) {
-                // Focus the toplevel if the click was on its content or a non-interactive part of SSD
                 if (toplevel) {
                     focus_toplevel(toplevel);
                 }
-                wlr_seat_pointer_notify_enter(seat, surface_under_cursor, sx, sy);
+                wlr_seat_pointer_notify_enter(seat, surface_under_cursor, sx_surf, sy_surf);
                 wlr_seat_pointer_notify_button(seat, event->time_msec, event->button, event->state);
             } else {
-                // Clicked on empty space or non-surface scene node
                 wlr_seat_pointer_clear_focus(seat);
-                // Potentially unfocus keyboard as well, or focus a background surface if you have one.
                  if (seat->keyboard_state.focused_surface) {
                      wlr_seat_keyboard_clear_focus(seat);
                  }
@@ -1433,7 +1507,6 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
         }
     }
 
-    // Schedule frame for all outputs if something might have changed visually
     struct tinywl_output *output_iter;
     wl_list_for_each(output_iter, &server->outputs, link) {
         if (output_iter->wlr_output && output_iter->wlr_output->enabled) {
@@ -3651,36 +3724,38 @@ void cleanup_egl(struct tinywl_server *server) {
 }
 
 
- void ensure_ssd_enabled(struct tinywl_toplevel *toplevel) {
+void ensure_ssd_enabled(struct tinywl_toplevel *toplevel) {
     const char *title = (toplevel->xdg_toplevel && toplevel->xdg_toplevel->title) ? toplevel->xdg_toplevel->title : "N/A";
     wlr_log(WLR_INFO, "[SSD_HELPER] Enter ensure_ssd_enabled for toplevel %s. Current ssd.enabled: %d",
             title, toplevel->ssd.enabled);
 
     if (toplevel->ssd.enabled) {
         wlr_log(WLR_DEBUG, "[SSD_HELPER] SSDs already enabled for toplevel %s. Ensuring geometry update.", title);
-        update_decoration_geometry(toplevel);
+        update_decoration_geometry(toplevel); // Call update to be sure
         return;
     }
 
     wlr_log(WLR_INFO, "[SSD_HELPER] Enabling SSDs and creating decoration rects for toplevel %s.", title);
 
-    toplevel->ssd.title_bar = NULL;
-    toplevel->ssd.border_left = NULL;
-    toplevel->ssd.border_right = NULL;
-    toplevel->ssd.border_bottom = NULL;
+    // Ensure old ones are cleared if somehow they exist while enabled is false
+    if (toplevel->ssd.title_bar) { wlr_scene_node_destroy(&toplevel->ssd.title_bar->node); toplevel->ssd.title_bar = NULL; }
+    if (toplevel->ssd.border_left) { wlr_scene_node_destroy(&toplevel->ssd.border_left->node); toplevel->ssd.border_left = NULL; }
+    if (toplevel->ssd.border_right) { wlr_scene_node_destroy(&toplevel->ssd.border_right->node); toplevel->ssd.border_right = NULL; }
+    if (toplevel->ssd.border_bottom) { wlr_scene_node_destroy(&toplevel->ssd.border_bottom->node); toplevel->ssd.border_bottom = NULL; }
 
-    float title_bar_color[4] = {0.0f, 0.0f, 0.8f, 1.0f};
-    float border_color[4]    = {0.1f, 0.1f, 0.1f, 1.0f};
 
-    // Create SSDs as children of the main scene_tree. update_decoration_geometry will size/position them.
-    toplevel->ssd.title_bar = create_decoration_rect(toplevel->scene_tree, 0, 0, 0, 0, title_bar_color);
-    toplevel->ssd.border_left   = create_decoration_rect(toplevel->scene_tree, 0, 0, 0, 0, border_color);
-    toplevel->ssd.border_right  = create_decoration_rect(toplevel->scene_tree, 0, 0, 0, 0, border_color);
-    toplevel->ssd.border_bottom = create_decoration_rect(toplevel->scene_tree, 0, 0, 0, 0, border_color);
+    float title_bar_color[4] = {0.0f, 0.0f, 0.8f, 0.7f}; // Slightly transparent
+    float border_color[4]    = {0.1f, 0.1f, 0.1f, 0.7f}; // Slightly transparent
+
+    toplevel->ssd.title_bar    = create_decoration_rect(toplevel->scene_tree, 0, 0, 0, 0, title_bar_color);
+    toplevel->ssd.border_left  = create_decoration_rect(toplevel->scene_tree, 0, 0, 0, 0, border_color);
+    toplevel->ssd.border_right = create_decoration_rect(toplevel->scene_tree, 0, 0, 0, 0, border_color);
+    toplevel->ssd.border_bottom= create_decoration_rect(toplevel->scene_tree, 0, 0, 0, 0, border_color);
 
     if (!toplevel->ssd.title_bar || !toplevel->ssd.border_left ||
         !toplevel->ssd.border_right || !toplevel->ssd.border_bottom) {
         wlr_log(WLR_ERROR, "[SSD_HELPER] FAILED TO CREATE SOME SSD ELEMENTS for %s", title);
+        // Clean up any successfully created ones
         if (toplevel->ssd.title_bar) { wlr_scene_node_destroy(&toplevel->ssd.title_bar->node); toplevel->ssd.title_bar = NULL; }
         if (toplevel->ssd.border_left) { wlr_scene_node_destroy(&toplevel->ssd.border_left->node); toplevel->ssd.border_left = NULL; }
         if (toplevel->ssd.border_right) { wlr_scene_node_destroy(&toplevel->ssd.border_right->node); toplevel->ssd.border_right = NULL; }
@@ -3688,12 +3763,17 @@ void cleanup_egl(struct tinywl_server *server) {
         toplevel->ssd.enabled = false;
     } else {
         toplevel->ssd.enabled = true;
-        wlr_log(WLR_INFO, "[SSD_HELPER] SSDs successfully created for %s. title_bar: %p", title, (void*)toplevel->ssd.title_bar);
+        wlr_log(WLR_INFO, "[SSD_HELPER] SSDs successfully created for %s. title_bar: %p, left: %p, right: %p, bottom: %p",
+                title, (void*)toplevel->ssd.title_bar, (void*)toplevel->ssd.border_left,
+                (void*)toplevel->ssd.border_right, (void*)toplevel->ssd.border_bottom);
+
+        // Initial positioning of client content within the scene_tree (which is the overall frame)
         if (toplevel->client_xdg_scene_tree) {
-            wlr_log(WLR_INFO, "[SSD_HELPER] Repositioning client_xdg_scene_tree for %s to (%d, %d).", title, BORDER_WIDTH, TITLE_BAR_HEIGHT);
+            wlr_log(WLR_INFO, "[SSD_HELPER] Positioning client_xdg_scene_tree for %s to (%d, %d) relative to scene_tree.",
+                    title, BORDER_WIDTH, TITLE_BAR_HEIGHT);
             wlr_scene_node_set_position(&toplevel->client_xdg_scene_tree->node, BORDER_WIDTH, TITLE_BAR_HEIGHT);
         }
-        update_decoration_geometry(toplevel);
+        update_decoration_geometry(toplevel); // This will size/position everything correctly
     }
 }
 
@@ -3962,8 +4042,8 @@ const char *fragment_shader_src =
 "    // Adjust UV to position flames (base at bottom, tips at top)\n"
 "    vec2 adjusted_uv = vec2(uv.x, 1.0 - uv.y * 1.2 + 0.3);\n"
 "    vec2 p = adjusted_uv * dist;\n"
-"    p += sin(p.yx * 4.0 + vec2(0.2, -0.3) * iTime) * 0.04;\n"
-"    p += sin(p.yx * 8.0 + vec2(0.6, 0.1) * iTime) * 0.01;\n"
+"    p += sin(p.yx * 8.0 + vec2(0.2, -0.3) * iTime) * 0.04;\n"
+"    p += sin(p.yx * 16.0 + vec2(0.6, 0.1) * iTime) * 0.01;\n"
 "    p.x -= iTime / 1.1;\n"
 "    \n"
 "    // Multiple FBM layers for base flames\n"
@@ -4470,7 +4550,7 @@ static const char *ssd_fragment_shader_src =
     "#if 0\n"
     "    // GPU derivatives - bad quality, but fast\n"
     "    // Uses iResolution.x and iResolution.y for scaling derivatives\n"
-    "   vec3 nor = normalize( vec3( dFdx(f)*iResolution.x, 6.0, dFdy(f)*iResolution.y ) );\n"
+    "   vec3 nor = normalize( vec3( dFdx(f)*iResolution.x*10.0, 6.0, dFdy(f)*iResolution.y*10.0 ) );\n"
     "#else\n"
     "    // Manual derivatives - better quality, but slower\n"
     "    vec4 kk; // Dummy 'out' variable for func calls\n"
@@ -4489,7 +4569,7 @@ static const char *ssd_fragment_shader_src =
     "    // Use alpha from u_color uniform, as in the original shader structure\n"
     "    float final_alpha = u_color.a > 0.0 ? u_color.a : 1.0;\n"
     "    \n"
-    "    frag_color = vec4( col, final_alpha ).bgra; // Set the final fragment color\n"
+    "    frag_color = vec4( col, 0.9 ); // Set the final fragment color\n"
     "}\n"
     "// --- End of Inigo Quilez's shader code (adapted) ---\n";
 
