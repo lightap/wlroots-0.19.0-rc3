@@ -355,6 +355,8 @@ struct wl_listener pointer_motion;
     GLuint ssd_shader_program;
     GLint ssd_shader_mvp_loc;
     GLint ssd_shader_color_loc;
+    GLint ssd_shader_time_loc;                  // NEW for SSD shader
+    GLint ssd_shader_rect_pixel_dimensions_loc; // Was already there, now used as 
 
     struct wlr_scene_node *main_background_node;
 
@@ -2297,32 +2299,18 @@ static void render_rect_node(struct wlr_scene_node *node, void *user_data) {
     }
     struct wlr_scene_rect *scene_rect = wlr_scene_rect_from_node(node);
 
-    // Use the node's x and y directly. These are relative to its parent.
-    // If this node is a direct child of the scene root (like the background),
-    // these are effectively layout coordinates.
-    // If this node is an SSD (child of toplevel->scene_tree), then these
-    // are relative to the toplevel->scene_tree. The toplevel->scene_tree
-    // itself is positioned on the layout. The MVP will be correct if the
-    // GL matrices are set up to reflect the current transform to output space.
-    // The scene graph usually handles this accumulation.
-    // For custom rendering, we rely on the `sx, sy` from an iterator like
-    // `wlr_scene_node_for_each_buffer` or manually constructing the full transform.
-    // Since render_data provides output, MVP is relative to output.
-    // The sx, sy passed in the for_each_rect callback (not used here) are output-local.
-    // Here, we are calculating MVP based on the current node's local coords AND output.
-    // This implies sx,sy must be the node's output-local coordinates.
-    // We will get these from wlr_scene_node_coords.
-
     int render_sx, render_sy;
     if (!wlr_scene_node_coords(node, &render_sx, &render_sy)) {
-        wlr_log(WLR_DEBUG, "[RENDER_RECT_NODE:%s] wlr_scene_node_coords failed for node %p", output->name, (void*)node);
-        return; // Cannot determine layout position, cannot render
+        wlr_log(WLR_DEBUG, "[RENDER_RECT_NODE:%s] wlr_scene_node_coords failed for node %p. Skipping.",
+                output->name, (void*)node);
+        return;
     }
 
     if (output->width == 0 || output->height == 0) return;
 
     GLuint program_to_use;
     GLint mvp_loc = -1, color_loc = -1, time_loc = -1, output_res_loc = -1, rect_dim_loc = -1;
+    // GLint current_ssd_rect_pixel_dims_loc = -1; // Not needed for this simple pattern
 
     bool is_main_background = (server->main_background_node == node);
 
@@ -2332,14 +2320,20 @@ static void render_rect_node(struct wlr_scene_node *node, void *user_data) {
         color_loc = server->rect_shader_color_loc;
         time_loc = server->rect_shader_time_loc;
         output_res_loc = server->rect_shader_resolution_loc;
-        rect_dim_loc = server->rect_shader_rect_res_loc;
+        rect_dim_loc = server->rect_shader_rect_res_loc; // If your Melt shader still uses this
     } else { // SSD
         program_to_use = server->ssd_shader_program;
         mvp_loc = server->ssd_shader_mvp_loc;
         color_loc = server->ssd_shader_color_loc;
+        time_loc = server->ssd_shader_time_loc; 
+        // No other uniforms needed for this simple SSD shader
     }
 
-    if (program_to_use == 0) return;
+    if (program_to_use == 0) {
+        wlr_log(WLR_ERROR, "Cannot render rect %dx%d, shader program ID is 0 for purpose %s.",
+                scene_rect->width, scene_rect->height, is_main_background ? "BG" : "SSD");
+        return;
+    }
     glUseProgram(program_to_use);
 
     float mvp[9];
@@ -2364,17 +2358,37 @@ static void render_rect_node(struct wlr_scene_node *node, void *user_data) {
         memcpy(mvp, base_mvp, sizeof(base_mvp));
     }
 
-    if (mvp_loc != -1) glUniformMatrix3fv(mvp_loc, 1, GL_FALSE, mvp);
-    if (color_loc != -1) glUniform4fv(color_loc, 1, scene_rect->color);
-    if (time_loc != -1) glUniform1f(time_loc, get_monotonic_time_seconds_as_float());
-    if (output_res_loc != -1) {
-        float res_vec[2] = {(float)output->width, (float)output->height};
-        glUniform2fv(output_res_loc, 1, res_vec);
+   if (mvp_loc != -1) glUniformMatrix3fv(mvp_loc, 1, GL_FALSE, mvp);
+
+
+    // Set u_color (used by both Melt and current SSD shader for alpha)
+    if (color_loc != -1) {
+        // Log to confirm alpha for SSDs, especially
+        if (!is_main_background) {
+             wlr_log(WLR_ERROR, "[SSD_RENDER_UCOLOR] Node %p, Program %u: Setting u_color (loc %d) to (%.2f, %.2f, %.2f, %.2f)",
+                (void*)node, program_to_use, color_loc,
+                scene_rect->color[0], scene_rect->color[1], scene_rect->color[2], scene_rect->color[3]);
+        }
+        glUniform4fv(color_loc, 1, scene_rect->color);
     }
-    if (rect_dim_loc != -1) { // If Melt shader uses u_rectResolution
-        float current_rect_dim_vec[2] = {(float)scene_rect->width, (float)scene_rect->height};
-        glUniform2fv(rect_dim_loc, 1, current_rect_dim_vec);
+
+    // Set time (used by Melt and current SSD shader)
+    if (time_loc != -1) {
+        float current_time_value = get_monotonic_time_seconds_as_float();
+        // Log to confirm time is being set for SSDs
+        if (!is_main_background) {
+             wlr_log(WLR_ERROR, "[SSD_RENDER_TIME] Node %p, Program %u: Setting time (loc %d) to %.2f",
+                (void*)node, program_to_use, time_loc, current_time_value);
+        }
+        glUniform1f(time_loc, current_time_value);
+    } else {
+         if (!is_main_background) { // Log if time_loc is -1 specifically for SSD path
+             wlr_log(WLR_ERROR, "[SSD_RENDER_TIME_FAIL] Node %p, Program %u: time_loc is -1 for SSD shader.", (void*)node, program_to_use);
+         }
     }
+    
+   
+    // No other uniforms to set for the simple SSD shader beyond mvp and u_color
 
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
 }
@@ -2739,15 +2753,15 @@ static void output_frame(struct wl_listener *listener, void *data) {
         }
 
         // --- Render Client Window Buffers (using back_shader_program for background effect) ---
-        if (server->back_shader_program != 0) {
+   /*     if (server->back_shader_program != 0) {
             glUseProgram(server->back_shader_program);
             wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Iterating for BUFFERS (client content with back_shader ID %u)",
-                    wlr_output->name, server->back_shader_program);
+                    wlr_output->name, server->ssd_shader_program);
             wlr_scene_node_for_each_buffer(&scene->tree.node, scene_buffer_iterator_main_window_only, &rdata);
         } else {
             wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Client background effect shader (back_shader_program) is 0.", wlr_output->name);
         }
-
+*/
         // --- Render Client Window Buffers (using main shader_program for foreground effect like "Flame") ---
         if (server->shader_program != 0) {
             glUseProgram(server->shader_program);
@@ -3946,7 +3960,7 @@ const char *fragment_shader_src =
 "    float dist = 3.5 - sin(iTime * 0.4) / 1.89;\n"
 "    \n"
 "    // Adjust UV to position flames (base at bottom, tips at top)\n"
-"    vec2 adjusted_uv = vec2(uv.x, 1.0 - uv.y * 1.2 + 0.2);\n"
+"    vec2 adjusted_uv = vec2(uv.x, 1.0 - uv.y * 1.2 + 0.3);\n"
 "    vec2 p = adjusted_uv * dist;\n"
 "    p += sin(p.yx * 4.0 + vec2(0.2, -0.3) * iTime) * 0.04;\n"
 "    p += sin(p.yx * 8.0 + vec2(0.6, 0.1) * iTime) * 0.01;\n"
@@ -4327,27 +4341,159 @@ const char *back_fragment_shader_src =
     "    frag_color = vec4(col, final_alpha).bgra;\n"
     "}";
 
-// NEW: Vertex shader for SSDs (can be very simple)
 static const char *ssd_vertex_shader_src =
     "#version 300 es\n"
     "precision mediump float;\n"
-    "in vec2 position;\n" // Vertices of the quad (0,0 to 1,1)
+    "in vec2 position;      // Vertex positions (0 to 1 for unit quad)\n"
+    "in vec2 texcoord;      // Vertex texture/local coordinates (also 0 to 1 if VAO is set up for it)\n"
+    "out vec2 v_texcoord;   // Pass local quad coordinates to fragment shader (for vignette)\n"
     "uniform mat3 mvp;\n"
     "void main() {\n"
     "    vec3 pos_transformed = mvp * vec3(position, 1.0);\n"
     "    gl_Position = vec4(pos_transformed.xy, 0.0, 1.0);\n"
+    "    v_texcoord = texcoord; // Pass the VAO's texcoord attribute\n"
     "}\n";
 
-// NEW: Fragment shader for SSDs (simple color)
+
 static const char *ssd_fragment_shader_src =
     "#version 300 es\n"
     "precision mediump float;\n"
-    "uniform vec4 u_color;\n" // Color for the SSD part
-    "out vec4 frag_color;\n"
-    "void main() {\n"
-    "    frag_color = u_color.bgra;\n" // Output the color directly (BGRA for RDP)
-    "}\n";
+    "\n"
+    "// Uniforms from the original context\n"
+    "uniform vec4 u_color;   // Base tint and alpha from the compositor\n"
+    "uniform float time;     // Time uniform for animation (used as iTime)\n"
+    "uniform mat3 mvp;       // MVP matrix (kept as requested, not used by this shader's core logic)\n"
+    "\n"
+    "out vec4 frag_color;    // Output fragment color\n"
+    "\n"
+    "// --- Start of Inigo Quilez's shader code (adapted) ---\n"
+    "// Copyright Inigo Quilez, 2013 - https://iquilezles.org/\n"
+    "// I am the sole copyright owner of this Work.\n"
+    "// You cannot host, display, distribute or share this Work neither\n"
+    "// as it is or altered, here on Shadertoy or anywhere else, in any\n"
+    "// form including physical and digital. You cannot use this Work in any\n"
+    "// commercial or non-commercial product, website or project. You cannot\n"
+    "// sell this Work and you cannot mint an NFTs of it or train a neural\n"
+    "// network with it without permission. I share this Work for educational\n"
+    "// purposes, and you can link to it, through an URL, proper attribution\n"
+    "// and unmodified screenshot, as part of your educational material. If\n"
+    "// these conditions are too restrictive please contact me and we'll\n"
+    "// definitely work it out.\n"
+    "\n"
+    "// See here for a tutorial on how to make this:\n"
+    "//\n"
+    "// https://iquilezles.org/articles/warp\n"
+    "\n"
+    "//====================================================================\n"
+    "\n"
+    "const mat2 m = mat2( 0.80,  0.60, -0.60,  0.80 );\n"
+    "\n"
+    "float noise( in vec2 p )\n"
+    "{\n"
+    "   return sin(p.x)*sin(p.y);\n"
+    "}\n"
+    "\n"
+    "float fbm4( vec2 p )\n"
+    "{\n"
+    "    float f = 0.0;\n"
+    "    f += 0.5000*noise( p ); p = m*p*2.02;\n"
+    "    f += 0.2500*noise( p ); p = m*p*2.03;\n"
+    "    f += 0.1250*noise( p ); p = m*p*2.01;\n"
+    "    f += 0.0625*noise( p );\n"
+    "    return f/0.9375;\n"
+    "}\n"
+    "\n"
+    "float fbm6( vec2 p )\n"
+    "{\n"
+    "    float f = 0.0;\n"
+    "    f += 0.500000*(0.5+0.5*noise( p )); p = m*p*2.02;\n"
+    "    f += 0.250000*(0.5+0.5*noise( p )); p = m*p*2.03;\n"
+    "    f += 0.125000*(0.5+0.5*noise( p )); p = m*p*2.01;\n"
+    "    f += 0.062500*(0.5+0.5*noise( p )); p = m*p*2.04;\n"
+    "    f += 0.031250*(0.5+0.5*noise( p )); p = m*p*2.01;\n"
+    "    f += 0.015625*(0.5+0.5*noise( p ));\n"
+    "    return f/0.96875;\n"
+    "}\n"
+    "\n"
+    "vec2 fbm4_2( vec2 p )\n"
+    "{\n"
+    "    return vec2(fbm4(p), fbm4(p+vec2(7.8)));\n"
+    "}\n"
+    "\n"
+    "vec2 fbm6_2( vec2 p )\n"
+    "{\n"
+    "    return vec2(fbm6(p+vec2(16.8)), fbm6(p+vec2(11.5)));\n"
+    "}\n"
+    "\n"
+    "//====================================================================\n"
+    "\n"
+    "// Input 'time' (original uniform) is used instead of 'iTime' from Shadertoy\n"
+    "float func( vec2 q, out vec4 ron )\n"
+    "{\n"
+    "    q += 0.03*sin( vec2(0.27,0.23)*time*10.0 + length(q)*vec2(4.1,4.3));\n"
+    "\n"
+    "   vec2 o = fbm4_2( 0.9*q );\n"
+    "\n"
+    "    o += 0.04*sin( vec2(0.12,0.14)*time*10.0 + length(o));\n"
+    "\n"
+    "    vec2 n = fbm6_2( 3.0*o );\n"
+    "\n"
+    "   ron = vec4( o, n );\n"
+    "\n"
+    "    float f = 0.5 + 0.5*fbm4( 1.8*q + 6.0*n );\n"
+    "\n"
+    "    return mix( f, f*f*f*3.5, f*abs(n.x) );\n"
+    "}\n"
+    "\n"
+    "void main()\n"
+    "{\n"
+    "    // Using a hardcoded resolution, similar to iResolution in Shadertoy.\n"
+    "    // The original shader also used a hardcoded vec2 R = vec2(1920.0, 1080.0);\n"
+    "    // This value should be adjusted if your target resolution is different.\n"
+    "    vec2 iResolution = vec2(1920.0, 1080.0);\n"
+    "\n"
+    "    // Calculate normalized coordinates 'p' from gl_FragCoord.xy (pixel coordinates)\n"
+    "    // This matches the Shadertoy convention: vec2 p = (2.0*fragCoord-iResolution.xy)/iResolution.y;\n"
+    "    vec2 p = (2.0*gl_FragCoord.xy - iResolution.xy) / iResolution.y;\n"
+    "    float e = 2.0 / iResolution.y; // Small epsilon for derivatives, based on resolution\n"
+    "\n"
+    "    vec4 on = vec4(0.0); // Will store intermediate values 'o' and 'n' from func\n"
+    "    float f = func(p, on); // Call the main pattern generation function\n"
+    "\n"
+    "   vec3 col = vec3(0.0);\n"
+    "    col = mix( vec3(0.2,0.1,0.4), vec3(0.3,0.05,0.05), f );\n"
+    "    col = mix( col, vec3(0.9,0.9,0.9), dot(on.zw,on.zw) ); // on.zw corresponds to 'n'\n"
+    "    col = mix( col, vec3(0.0,0.0,0.9), 0.2 + 0.5*on.y*on.y ); // on.y corresponds to 'o.y'\n"
+    "    col = mix( col, vec3(0.9,0.2,0.2), 0.5*smoothstep(1.2,1.3,abs(on.z)+abs(on.w)) ); // on.z, on.w are n.x, n.y\n"
+    "    col = clamp( col*f*2.0, 0.0, 1.0 );\n"
+    "    \n"
+    "#if 0\n"
+    "    // GPU derivatives - bad quality, but fast\n"
+    "    // Uses iResolution.x and iResolution.y for scaling derivatives\n"
+    "   vec3 nor = normalize( vec3( dFdx(f)*iResolution.x, 6.0, dFdy(f)*iResolution.y ) );\n"
+    "#else\n"
+    "    // Manual derivatives - better quality, but slower\n"
+    "    vec4 kk; // Dummy 'out' variable for func calls\n"
+    "   vec3 nor = normalize( vec3( func(p+vec2(e,0.0),kk)-f, \n"
+    "                                2.0*e, \n"
+    "                                func(p+vec2(0.0,e),kk)-f ) );\n"
+    "#endif\n"
+    "\n"
+    "    vec3 lig = normalize( vec3( 0.9, 0.2, -0.4 ) );\n"
+    "    float dif = clamp( 0.3+0.7*dot( nor, lig ), 0.0, 1.0 );\n"
+    "    vec3 lin = vec3(0.70,0.90,0.95)*(nor.y*0.5+0.5) + vec3(0.15,0.10,0.05)*dif;\n"
+    "    col *= 1.2*lin;\n"
+    "   col = 1.0 - col; // Invert colors\n"
+    "   col = 1.1*col*col; // Apply contrast/gamma like effect\n"
+    "    \n"
+    "    // Use alpha from u_color uniform, as in the original shader structure\n"
+    "    float final_alpha = u_color.a > 0.0 ? u_color.a : 1.0;\n"
+    "    \n"
+    "    frag_color = vec4( col, final_alpha ).bgra; // Set the final fragment color\n"
+    "}\n"
+    "// --- End of Inigo Quilez's shader code (adapted) ---\n";
 
+// ... (rest of your includes and global definitions) ...
 
     setenv("MESA_VK_VERSION_OVERRIDE", "1.2", 1);
     setenv("MESA_LOADER_DRIVER_OVERRIDE", "zink", 1);
@@ -4539,20 +4685,42 @@ const char *vendor = (const char *)glGetString(GL_VENDOR);
     }
 
 
-    // --- Create SSD Shader (Simple Color) ---
-struct shader_uniform_spec ssd_shader_uniforms[] = {
-    {"mvp", &server.ssd_shader_mvp_loc},
-    {"u_color", &server.ssd_shader_color_loc}
-};
-if (!create_generic_shader_program(server.renderer, "SSDColorShader",
-                                 ssd_vertex_shader_src,   // Use the new simple vertex shader
-                                 ssd_fragment_shader_src, // Use the new simple fragment shader
-                                 &server.ssd_shader_program,
-                                 ssd_shader_uniforms,
-                                 sizeof(ssd_shader_uniforms) / sizeof(ssd_shader_uniforms[0]))) {
-    wlr_log(WLR_ERROR, "Failed to create SSD color shader program.");
-    server_destroy(&server); return 1;
-}
+// In main()
+ // --- Create SSD Shader (Checkerboard) ---
+    struct shader_uniform_spec ssd_shader_uniforms[] = {
+        {"mvp", &server.ssd_shader_mvp_loc},
+        {"u_color", &server.ssd_shader_color_loc},
+        // These are not used by the checkerboard shader, so their locations will be -1.
+        // This is fine as render_rect_node doesn't try to set them for SSDs.
+        {"time", &server.ssd_shader_time_loc},
+        {"iResolution", &server.ssd_shader_rect_pixel_dimensions_loc}
+    };
+
+    // Use the correctly named global shader sources
+    if (!create_generic_shader_program(server.renderer, "SSDCheckerboardShader", // Updated log name
+                                     ssd_vertex_shader_src,  // Use the renamed global VS
+                                     ssd_fragment_shader_src, // Use the renamed global FS
+                                     &server.ssd_shader_program,
+                                     ssd_shader_uniforms,
+                                     sizeof(ssd_shader_uniforms) / sizeof(ssd_shader_uniforms[0]))) {
+        wlr_log(WLR_ERROR, "Failed to create SSD Checkerboard shader program.");
+        server_destroy(&server); return 1;
+    }
+    // Updated log message to be more accurate for the checkerboard shader
+    wlr_log(WLR_INFO, "SSDCheckerboardShader created (ID: %u). MVP@%d, Color@%d. (Unused: Time@%d, iResolution@%d)",
+            server.ssd_shader_program,
+            server.ssd_shader_mvp_loc,
+            server.ssd_shader_color_loc,
+            server.ssd_shader_time_loc, // This will likely be -1
+            server.ssd_shader_rect_pixel_dimensions_loc); 
+wlr_log(WLR_INFO, "SSDOctagramShader created (ID: %u). MVP@%d, Color@%d, Time@%d, RectDims(iRes)@%d",
+        server.ssd_shader_program,
+        server.ssd_shader_mvp_loc,
+        server.ssd_shader_color_loc,
+        server.ssd_shader_time_loc,
+        server.ssd_shader_rect_pixel_dimensions_loc);
+wlr_log(WLR_INFO, "SSDMultiColorRoundedShader created (ID: %u). MVP@%d, Color@%d, RectDims@%d",
+        server.ssd_shader_program, server.ssd_shader_mvp_loc, server.ssd_shader_color_loc, server.ssd_shader_rect_pixel_dimensions_loc);
 wlr_log(WLR_INFO, "SSDColorShader created (ID: %u). MVP@%d, Color@%d",
         server.ssd_shader_program, server.ssd_shader_mvp_loc, server.ssd_shader_color_loc);
     // Add a log to confirm locations (optional but helpful)
