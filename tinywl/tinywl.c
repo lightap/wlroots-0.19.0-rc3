@@ -388,10 +388,44 @@ struct wl_listener pointer_motion;
     GLint fullscreen_shader_scene_tex_loc;    // Location for the scene texture uniform
     GLint fullscreen_shader_tex_matrix_loc;   // Location for texture matrix uniform
  GLint fullscreen_shader_resolution_loc;
+
+
+// Add these new zoom uniform locations:
+    GLint fullscreen_shader_zoom_loc;
+    GLint fullscreen_shader_zoom_center_loc;
+    GLint fullscreen_shader_quadrant_loc;
+
+
+
+
+
+
+
+
      struct wlr_buffer *scene_capture_buffer;    // Buffer to capture the scene (NEW/REPURPOSED)
     struct wlr_texture *scene_texture;          // Texture from the captured scene buffer (REPURPOSED)
     // GLuint scene_fbo; // REMOVE THIS
  bool shrink_effect_active;
+
+ // Variables to control the zoom effect at runtime
+   // --- Animation variables for the fullscreen effect's geometric zoom ---
+
+    float effect_zoom_factor_normal;
+    float effect_zoom_factor_zoomed;
+    
+    bool  effect_is_target_zoomed;      // True if the *target* state is zoomed
+    bool  effect_is_animating_zoom;
+    float effect_anim_current_factor;   // Calculated in output_frame
+    float effect_anim_start_factor;
+    float effect_anim_target_factor;
+    float effect_anim_start_time_sec;
+    float effect_anim_duration_sec;
+    
+    float effect_zoom_center_x;
+    float effect_zoom_center_y;
+
+
+
 
     struct wlr_xdg_decoration_manager_v1 *xdg_decoration_manager;
 struct wl_listener xdg_decoration_new;
@@ -947,8 +981,7 @@ static bool handle_keybinding(struct tinywl_server *server, xkb_keysym_t sym) {
     return true;
 }
 
-// Ensure you have this forward declaration if handle_keybinding is defined later
-// static bool handle_keybinding(struct tinywl_server *server, xkb_keysym_t sym);
+
 
 static void keyboard_handle_key(struct wl_listener *listener, void *data) {
     struct tinywl_keyboard *keyboard = wl_container_of(listener, keyboard, key);
@@ -956,119 +989,149 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
     struct wlr_keyboard_key_event *event = data;
     struct wlr_seat *seat = server->seat;
 
-    // Log key event details with timestamp to track potential duplicates
-    wlr_log(WLR_DEBUG, "Key event: keycode=%u, state=%s, time=%u",
-            event->keycode, event->state == WL_KEYBOARD_KEY_STATE_PRESSED ? "pressed" : "released",
-            event->time_msec);
+    wlr_log(WLR_DEBUG, "Key event: keycode=%u, state=%s, time=%u, modifiers=0x%x",
+            event->keycode,
+            event->state == WL_KEYBOARD_KEY_STATE_PRESSED ? "pressed" : "released",
+            event->time_msec,
+            wlr_keyboard_get_modifiers(keyboard->wlr_keyboard));
 
-    // Track duplicate events - if we see same keycode and state with similar timestamp, ignore it
-    static uint32_t last_keycode_event = 0; // Use a distinct name to avoid conflict if other statics exist
-    static uint32_t last_state_event = 0;
-    static uint32_t last_time_event = 0;
-
-    // Check for duplicate events (same key, same state, within 5ms)
-    if (last_keycode_event == event->keycode &&
-        last_state_event == event->state &&
-        event->time_msec > 0 &&
-        last_time_event > 0 &&
-        (event->time_msec - last_time_event < 5 || last_time_event - event->time_msec < 5)) {
-        wlr_log(WLR_ERROR, "Ignoring duplicate key event: keycode=%u, state=%u, time=%u (prev=%u)", // Changed to WARNING
-                event->keycode, event->state, event->time_msec, last_time_event);
+    // --- Duplicate event detection ---
+    static uint32_t last_keycode_event_kbd = 0;
+    static uint32_t last_state_event_kbd = 0;
+    static uint32_t last_time_event_kbd = 0;
+    if (last_keycode_event_kbd == event->keycode &&
+        last_state_event_kbd == event->state &&
+        event->time_msec > 0 && last_time_event_kbd > 0 &&
+        (event->time_msec - last_time_event_kbd < 5 || last_time_event_kbd - event->time_msec < 5)) {
+        wlr_log(WLR_DEBUG, "Ignoring duplicate key event: keycode=%u", event->keycode); // Changed to DEBUG
         return;
     }
+    last_keycode_event_kbd = event->keycode;
+    last_state_event_kbd = event->state;
+    last_time_event_kbd = event->time_msec;
 
-    // Store current event details for duplicate detection
-    last_keycode_event = event->keycode;
-    last_state_event = event->state;
-    last_time_event = event->time_msec;
-
-    // Ignore release events at startup with no focused surface and no prior press
     if (event->state == WL_KEYBOARD_KEY_STATE_RELEASED && !seat->keyboard_state.focused_surface) {
-        // Note: XKB keycodes are offset by 8 from evdev keycodes
         xkb_keycode_t xkb_keycode_check = event->keycode + 8;
         struct xkb_state *state_check = keyboard->wlr_keyboard->xkb_state;
         if (xkb_state_key_get_level(state_check, xkb_keycode_check, 0) == 0) {
-            wlr_log(WLR_DEBUG, "Ignoring phantom release for keycode=%u (no prior press, no focused surface)", // Changed to DEBUG
-                    event->keycode);
+            wlr_log(WLR_DEBUG, "Ignoring phantom release for keycode=%u", event->keycode);
             return;
         }
     }
 
-    // Convert keycode to XKB keycode (Wayland keycodes are offset by 8 from evdev keycodes)
-    uint32_t keycode = event->keycode + 8;
+    uint32_t keycode_xkb = event->keycode + 8;
     const xkb_keysym_t *syms;
-    int nsyms = xkb_state_key_get_syms(keyboard->wlr_keyboard->xkb_state, keycode, &syms);
+    int nsyms = xkb_state_key_get_syms(keyboard->wlr_keyboard->xkb_state, keycode_xkb, &syms);
 
     if (nsyms <= 0) {
-        wlr_log(WLR_DEBUG, "No keysyms found for keycode %u (raw=%u)", keycode, event->keycode); // Changed to DEBUG
+        // Optional log
     } else {
-        if (wlr_log_get_verbosity() >= WLR_DEBUG) {
-            for (int i = 0; i < nsyms; i++) {
-                char buf[32];
-                xkb_keysym_get_name(syms[i], buf, sizeof(buf));
-                wlr_log(WLR_DEBUG, "Keysym %d: %s (0x%x)", i, buf, syms[i]);
-            }
-        }
+        // Optional syms logging
     }
 
     bool handled_by_compositor = false;
     uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
+    bool needs_redraw = false;
 
     if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-        // 1. Handle Ctrl+P for shrink effect
-        if ((modifiers & WLR_MODIFIER_CTRL)) {
+        // Handle 'P' key (without any modifiers)
+        if (!(modifiers & WLR_MODIFIER_CTRL) &&
+            !(modifiers & WLR_MODIFIER_ALT) &&
+            !(modifiers & WLR_MODIFIER_SHIFT) &&
+            !(modifiers & WLR_MODIFIER_LOGO)) {
             for (int i = 0; i < nsyms; i++) {
-                if (syms[i] == XKB_KEY_p) { // Check for 'p' key (lowercase 'p')
-                    server->shrink_effect_active = !server->shrink_effect_active;
-                    wlr_log(WLR_INFO, "Shrink effect %s", server->shrink_effect_active ? "ENABLED" : "DISABLED");
+                if (syms[i] == XKB_KEY_p || syms[i] == XKB_KEY_P) {
+                    if (!server->shrink_effect_active) {
+                        // --- FBO Effect is currently OFF. ---
+                        // 1. Turn ON the FBO effect.
+                        server->shrink_effect_active = true;
+                        wlr_log(WLR_INFO, "Fullscreen Shader Effect ENABLED via 'P'.");
 
-                    // Schedule a redraw on all outputs to apply/remove the effect
-                    struct tinywl_output *output_iter;
-                    wl_list_for_each(output_iter, &server->outputs, link) {
-                        if (output_iter->wlr_output && output_iter->wlr_output->enabled) {
-                            wlr_output_schedule_frame(output_iter->wlr_output);
+                        // 2. Set the target to be the "zoomed-in" state.
+                        server->effect_is_target_zoomed = true;
+
+                        // 3. Start animation from "normal" (1.0x) to "zoomed" (e.g., 2.0x).
+                        //    effect_anim_current_factor will be calculated fresh by output_frame if it was off.
+                        server->effect_anim_start_factor = server->effect_zoom_factor_normal;
+                        server->effect_anim_target_factor = server->effect_zoom_factor_zoomed;
+                        
+                        // Only start animation if factors are different (should always be true here)
+                        if (fabs(server->effect_anim_start_factor - server->effect_anim_target_factor) > 1e-4f) {
+                            server->effect_anim_start_time_sec = get_monotonic_time_seconds_as_float();
+                            server->effect_is_animating_zoom = true;
+                            wlr_log(WLR_INFO, "Initial Zoom-IN Animation Started (to %.2f from %.2f)",
+                                    server->effect_anim_target_factor, server->effect_anim_start_factor);
+                        } else {
+                            // This case should ideally not be hit if normal and zoomed factors are different
+                             server->effect_anim_current_factor = server->effect_anim_target_factor; // Snap
+                             server->effect_is_animating_zoom = false;
+                        }
+                    } else {
+                        // --- FBO Effect is already ON. Toggle zoom animation target state. ---
+                        server->effect_is_target_zoomed = !server->effect_is_target_zoomed;
+
+                        // Start animation from the current display factor.
+                        // server->effect_anim_current_factor is updated by output_frame.
+                        server->effect_anim_start_factor = server->effect_anim_current_factor;
+
+                        if (server->effect_is_target_zoomed) { // New target is ZOOMED-IN
+                            server->effect_anim_target_factor = server->effect_zoom_factor_zoomed;
+                            wlr_log(WLR_INFO, "Zoom-IN Animation Triggered by 'P'.");
+                        } else { // New target is NORMAL (and will turn off effect upon completion)
+                            server->effect_anim_target_factor = server->effect_zoom_factor_normal;
+                            wlr_log(WLR_INFO, "Zoom-OUT Animation (to turn off effect) Triggered by 'P'.");
+                        }
+
+                        if (fabs(server->effect_anim_start_factor - server->effect_anim_target_factor) > 1e-4f) {
+                            server->effect_anim_start_time_sec = get_monotonic_time_seconds_as_float();
+                            server->effect_is_animating_zoom = true;
+                            wlr_log(WLR_DEBUG, "Animation params: TargetFactor=%.2f, StartFactor=%.2f",
+                                    server->effect_anim_target_factor, server->effect_anim_start_factor);
+                        } else {
+                             wlr_log(WLR_INFO, "'P' pressed (effect on): Already at target factor %.2f.", server->effect_anim_target_factor);
+                             server->effect_is_animating_zoom = false;
+                             server->effect_anim_current_factor = server->effect_anim_target_factor; // Snap
+                             // If we snapped to normal and target is normal, output_frame's logic will turn off shrink_effect_active.
                         }
                     }
                     handled_by_compositor = true;
-                    break; // Ctrl+P handled
+                    needs_redraw = true;
+                    break;
                 }
             }
         }
 
-        // 2. Handle Alt+Key bindings (like F1, Escape) if Ctrl+P wasn't handled
+        // Handle Alt+Key bindings (like F1, Escape) if 'P' wasn't handled
         if (!handled_by_compositor && (modifiers & WLR_MODIFIER_ALT)) {
             for (int i = 0; i < nsyms; i++) {
-                handled_by_compositor = handle_keybinding(server, syms[i]);
-                if (handled_by_compositor) {
-                    break; // Alt+Key binding handled
+                if (handle_keybinding(server, syms[i])) {
+                    handled_by_compositor = true;
+                    needs_redraw = true; 
+                    break;
                 }
             }
         }
-    }
+        
+        if (needs_redraw) {
+            struct tinywl_output *output_iter;
+            wl_list_for_each(output_iter, &server->outputs, link) {
+                if (output_iter->wlr_output && output_iter->wlr_output->enabled) {
+                    wlr_output_schedule_frame(output_iter->wlr_output);
+                }
+            }
+        }
+    } 
 
-    // 3. Forward key event to the focused client if not handled by the compositor
+    // Forward key event to the focused client if not handled by the compositor
     if (!handled_by_compositor) {
-        // Set the keyboard once at initialization or focus change, not on every key event
-        // This static variable helps ensure wlr_seat_set_keyboard is called only when necessary.
         static struct wlr_keyboard *last_keyboard_set_on_seat = NULL;
         if (last_keyboard_set_on_seat != keyboard->wlr_keyboard) {
             wlr_seat_set_keyboard(seat, keyboard->wlr_keyboard);
             last_keyboard_set_on_seat = keyboard->wlr_keyboard;
-            wlr_log(WLR_DEBUG, "Set keyboard %p on seat %s", keyboard->wlr_keyboard, seat->name);
         }
-
-        // Only notify if there's a focused surface
         if (seat->keyboard_state.focused_surface) {
             wlr_seat_keyboard_notify_key(seat, event->time_msec, event->keycode, event->state);
-            wlr_log(WLR_DEBUG, "Key event (keycode %u, state %u) sent to focused surface %p",
-                    event->keycode, event->state, seat->keyboard_state.focused_surface);
-        } else {
-            wlr_log(WLR_DEBUG, "No focused surface for key event (keycode %u, state %u)",
-                    event->keycode, event->state);
         }
-    } else {
-        wlr_log(WLR_DEBUG, "Key event (keycode %u, state %u) handled by compositor.",
-                event->keycode, event->state);
     }
 }
 
@@ -2547,6 +2610,7 @@ static void render_rect_node(struct wlr_scene_node *node, void *user_data) {
         }
     }
 
+  
     glUniform2f(output_res_loc, scene_rect->width, scene_rect->height);
 
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
@@ -3050,7 +3114,6 @@ error_cleanup:
     return false;
 }
 
-
 static void output_frame(struct wl_listener *listener, void *data) {
     struct tinywl_output *output_wrapper = wl_container_of(listener, output_wrapper, frame);
     struct wlr_output *wlr_output = output_wrapper->wlr_output;
@@ -3064,28 +3127,89 @@ static void output_frame(struct wl_listener *listener, void *data) {
     struct wlr_output_state output_state_effect;
     struct wlr_render_pass *current_screen_pass = NULL;
 
-    // Early exit checks for output, renderer, allocator, scene_output
-    if (!wlr_output->enabled || !renderer || !server->allocator) {
-        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Output not ready.", wlr_output->name);
-        struct wlr_scene_output *scene_output_early_exit = wlr_scene_get_scene_output(scene, wlr_output);
-        if (scene_output_early_exit) wlr_scene_output_send_frame_done(scene_output_early_exit, &now);
+    // Early exit checks
+    if (!wlr_output || !wlr_output->enabled || !renderer || !server->allocator) {
+            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Output not ready (output_ptr=%p, enabled=%d, renderer_ptr=%p, allocator_ptr=%p).",
+                wlr_output ? wlr_output->name : "NULL_OUTPUT_NAME",
+                (void*)wlr_output,
+                wlr_output ? wlr_output->enabled : 0,
+                (void*)renderer,
+                (void*)server->allocator);
+        if (scene && wlr_output) { // Check both scene and wlr_output before getting scene_output
+             struct wlr_scene_output *scene_output_early_exit = wlr_scene_get_scene_output(scene, wlr_output);
+             if (scene_output_early_exit) wlr_scene_output_send_frame_done(scene_output_early_exit, &now);
+        }
+        return;
+    }
+     if (!scene) {
+        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Server scene is NULL.", wlr_output->name);
         return;
     }
     
     struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(scene, wlr_output);
     if (!scene_output) {
-        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] No scene_output.", wlr_output->name);
+        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] No scene_output for output.", wlr_output->name);
         return;
     }
 
-    bool apply_shrink_effect_this_frame = server->shrink_effect_active;
-    // Forcing the effect on to debug the fullscreen texture draw:
-    // apply_shrink_effect_this_frame = true;
+    // Snapshot the FBO path state for this frame. It might change during animation completion.
+    bool current_frame_fbo_path = server->shrink_effect_active;
 
-    if (apply_shrink_effect_this_frame) {
+    // Calculate the current zoom factor for animation if the FBO path is intended to be active
+    if (server->shrink_effect_active) { // Use server->shrink_effect_active to decide if animation logic runs
+        if (server->effect_is_animating_zoom) {
+            float now_sec = get_monotonic_time_seconds_as_float();
+            float elapsed_sec = now_sec - server->effect_anim_start_time_sec;
+            
+            float t = 1.0f; 
+            if (server->effect_anim_duration_sec > 1e-5f) {
+                t = elapsed_sec / server->effect_anim_duration_sec;
+            }
+
+            if (t >= 1.0f) {
+                t = 1.0f; 
+                server->effect_anim_current_factor = server->effect_anim_target_factor;
+                server->effect_is_animating_zoom = false; 
+                wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Zoom animation finished. Factor: %.2f. Target state was_zoomed: %d",
+                        wlr_output->name, server->effect_anim_current_factor, server->effect_is_target_zoomed);
+
+                // **MODIFICATION: If animation finished and the target was the "normal" (unzoomed) state,
+                // turn off the shrink_effect_active.**
+                if (!server->effect_is_target_zoomed && // Target was "normal" (not zoomed-in)
+                    fabs(server->effect_anim_current_factor - server->effect_zoom_factor_normal) < 1e-4f) {
+                    server->shrink_effect_active = false;       // Turn OFF the FBO path
+                    current_frame_fbo_path = false;           // Update local flag for *this* frame's rendering logic
+                    wlr_log(WLR_INFO, "[OUTPUT_FRAME:%s] Fullscreen Shader Effect DISABLED (animation to normal finished).", wlr_output->name);
+                    // Schedule another frame for all outputs to render the direct view
+                    struct tinywl_output *output_iter_redraw;
+                    wl_list_for_each(output_iter_redraw, &server->outputs, link) {
+                         if (output_iter_redraw->wlr_output && output_iter_redraw->wlr_output->enabled) {
+                              wlr_output_schedule_frame(output_iter_redraw->wlr_output);
+                         }
+                    }
+                }
+            } else {
+                server->effect_anim_current_factor = server->effect_anim_start_factor +
+                                           (server->effect_anim_target_factor - server->effect_anim_start_factor) * t;
+                wlr_output_schedule_frame(wlr_output);
+            }
+        } else { 
+            server->effect_anim_current_factor = server->effect_is_target_zoomed ?
+                                                 server->effect_zoom_factor_zoomed :
+                                                 server->effect_zoom_factor_normal;
+        }
+    } else { 
+        // FBO path is not active, ensure animation state is reset and current factor is non-zoomed
+        server->effect_is_animating_zoom = false;
+        server->effect_is_target_zoomed = false; // Default to normal target when effect is off
+        server->effect_anim_current_factor = server->effect_zoom_factor_normal;
+    }
+
+    // Now use 'current_frame_fbo_path' which reflects if the effect was turned off *this frame* by animation completion.
+    if (current_frame_fbo_path) {
         if (!setup_intermediate_framebuffer(server, wlr_output->width, wlr_output->height)) {
-            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to setup intermediate FBO. Disabling effect for this frame.", wlr_output->name);
-            apply_shrink_effect_this_frame = false;
+            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to setup intermediate FBO. Disabling FBO path for this frame.", wlr_output->name);
+            current_frame_fbo_path = false; 
         }
     }
 
@@ -3096,41 +3220,42 @@ static void output_frame(struct wl_listener *listener, void *data) {
         .pass = NULL
     };
 
-    if (apply_shrink_effect_this_frame) {
-        // STAGE 1: Render to intermediate framebuffer
+    if (current_frame_fbo_path) {
+        // STAGE 1: Render scene content to intermediate framebuffer
         glBindFramebuffer(GL_FRAMEBUFFER, server->intermediate_fbo);
         glViewport(0, 0, server->intermediate_width, server->intermediate_height);
         glScissor(0, 0, server->intermediate_width, server->intermediate_height);
         glEnable(GL_SCISSOR_TEST);
-        // Clear and common GL state for FBO rendering
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glDisable(GL_CULL_FACE);
         glDisable(GL_DEPTH_TEST);
+
         render_scene_content(server, wlr_output, &rdata_scene_render);
+
         glDisable(GL_SCISSOR_TEST);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     } else {
-        // Direct rendering path - using the detailed approach from paste-2
+        // Direct rendering path
         wlr_output_state_init(&output_state_direct);
         struct wlr_scene_output_state_options opts = {0};
         bool has_damage = wlr_scene_output_build_state(scene_output, &output_state_direct, &opts);
 
         if (!has_damage && !(output_state_direct.committed & WLR_OUTPUT_STATE_BUFFER)) {
-            wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] No damage or buffer, skipping render.", wlr_output->name);
+            wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Direct: No damage or buffer, skipping render.", wlr_output->name);
             wlr_output_state_finish(&output_state_direct);
             wlr_scene_output_send_frame_done(scene_output, &now);
             return;
         }
 
-        pixman_region32_t full_damage_direct;
-        pixman_region32_init_rect(&full_damage_direct, 0, 0, wlr_output->width, wlr_output->height);
-        wlr_output_state_set_damage(&output_state_direct, &full_damage_direct);
-        pixman_region32_fini(&full_damage_direct);
+        pixman_region32_t full_damage_for_direct_pass;
+        pixman_region32_init_rect(&full_damage_for_direct_pass, 0, 0, wlr_output->width, wlr_output->height);
+        wlr_output_state_set_damage(&output_state_direct, &full_damage_for_direct_pass);
+        pixman_region32_fini(&full_damage_for_direct_pass);
 
         current_screen_pass = wlr_output_begin_render_pass(wlr_output, &output_state_direct, NULL);
         if (!current_screen_pass) {
-            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] wlr_output_begin_render_pass failed.", wlr_output->name);
+            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Direct: wlr_output_begin_render_pass failed.", wlr_output->name);
             wlr_output_state_finish(&output_state_direct);
             wlr_scene_output_send_frame_done(scene_output, &now);
             return;
@@ -3138,8 +3263,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
         
         rdata_scene_render.pass = current_screen_pass;
 
-        // Clear and setup GL state for direct screen rendering
-        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // Black background for direct render
         glClear(GL_COLOR_BUFFER_BIT);
         glViewport(0, 0, wlr_output->width, wlr_output->height);
         glScissor(0, 0, wlr_output->width, wlr_output->height);
@@ -3149,88 +3273,13 @@ static void output_frame(struct wl_listener *listener, void *data) {
         glDisable(GL_CULL_FACE);
         glDisable(GL_DEPTH_TEST);
 
-        if (server->quad_vao == 0) {
-            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Quad VAO is zero! Skipping custom draw.", wlr_output->name);
-        } else {
-            glBindVertexArray(server->quad_vao);
-
-            // --- Render Background, SSDs, and Panel Rects ---
-            wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Iterating for ALL RECTS (background, SSDs).", wlr_output->name);
-            struct wlr_scene_node *iter_node_lvl1;
-            wl_list_for_each(iter_node_lvl1, &scene->tree.children, link) {
-                if (!iter_node_lvl1->enabled) {
-                    continue;
-                }
-
-                if (iter_node_lvl1 == server->top_panel_node) {
-                    // Skip panel here, render it specifically later
-                    continue;
-                }
-
-                if (iter_node_lvl1->type == WLR_SCENE_NODE_RECT) {
-                    // This is the main background or other top-level rects
-                    render_rect_node(iter_node_lvl1, &rdata_scene_render);
-                } else if (iter_node_lvl1->type == WLR_SCENE_NODE_TREE) {
-                    // This is a toplevel's scene_tree. Iterate its children for SSD rects.
-                    struct tinywl_toplevel *toplevel_ptr = iter_node_lvl1->data;
-                    if (toplevel_ptr && toplevel_ptr->ssd.enabled) {
-                        struct wlr_scene_tree *toplevel_s_tree = wlr_scene_tree_from_node(iter_node_lvl1);
-                        struct wlr_scene_node *ssd_node_candidate;
-                        wl_list_for_each(ssd_node_candidate, &toplevel_s_tree->children, link) {
-                            if (ssd_node_candidate->enabled && ssd_node_candidate->type == WLR_SCENE_NODE_RECT) {
-                                // Check if this node is one of the SSD parts
-                                if ( (toplevel_ptr->ssd.title_bar && ssd_node_candidate == &toplevel_ptr->ssd.title_bar->node) ||
-                                     (toplevel_ptr->ssd.border_left && ssd_node_candidate == &toplevel_ptr->ssd.border_left->node) ||
-                                     (toplevel_ptr->ssd.border_right && ssd_node_candidate == &toplevel_ptr->ssd.border_right->node) ||
-                                     (toplevel_ptr->ssd.border_bottom && ssd_node_candidate == &toplevel_ptr->ssd.border_bottom->node) ) {
-                                    render_rect_node(ssd_node_candidate, &rdata_scene_render);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // --- Render Panel Node ---
-            if (server->top_panel_node && server->top_panel_node->enabled) {
-                if (server->panel_shader_program != 0) {
-                    wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Rendering TOP PANEL node %p with panel_shader (ID: %u).",
-                            wlr_output->name, (void*)server->top_panel_node, server->panel_shader_program);
-                    render_panel_node(server->top_panel_node, &rdata_scene_render);
-                } else {
-                    wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Panel shader program is 0, cannot render panel.", wlr_output->name);
-                }
-            }
-
-      /*      // --- Render Client Window Buffers (using back_shader_program for background effect) ---
-            if (server->ssd_shader_program != 0) {
-                glUseProgram(server->ssd_shader_program);
-                wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Iterating for BUFFERS (client content with back_shader ID %u)",
-                        wlr_output->name, server->ssd_shader_program);
-                wlr_scene_node_for_each_buffer(&scene->tree.node, scene_buffer_iterator_main_window_only, &rdata_scene_render);
-            } else {
-                wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Client background effect shader (back_shader_program) is 0.", wlr_output->name);
-            }
-*/
-            // --- Render Client Window Buffers (using main shader_program for foreground effect like "Flame") ---
-            if (server->shader_program != 0) {
-                glUseProgram(server->shader_program);
-                wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Iterating for BUFFERS (client content with flame_shader ID %u)",
-                        wlr_output->name, server->shader_program);
-                wlr_scene_node_for_each_buffer(&scene->tree.node, scene_buffer_iterator, &rdata_scene_render);
-            } else {
-                wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Client flame shader (shader_program) is 0.", wlr_output->name);
-            }
-
-            glBindVertexArray(0);
-            glUseProgram(0);
-        }
+        render_scene_content(server, wlr_output, &rdata_scene_render);
 
         glDisable(GL_SCISSOR_TEST);
     }
 
-    // STAGE 2: Final composition to screen (if effect was active)
-    if (apply_shrink_effect_this_frame) {
+    // STAGE 2 (if FBO path was taken for this frame): Composite FBO to screen
+    if (current_frame_fbo_path) { // Use the local flag
         wlr_output_state_init(&output_state_effect);
         pixman_region32_t full_damage_effect;
         pixman_region32_init_rect(&full_damage_effect, 0, 0, wlr_output->width, wlr_output->height);
@@ -3239,38 +3288,29 @@ static void output_frame(struct wl_listener *listener, void *data) {
 
         current_screen_pass = wlr_output_begin_render_pass(wlr_output, &output_state_effect, NULL);
         if (!current_screen_pass) {
-            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to begin final effect pass for screen.", wlr_output->name);
+            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] FBO Path: Failed to begin final effect pass.", wlr_output->name);
             wlr_output_state_finish(&output_state_effect);
-            goto cleanup_frame_and_send_done;
+            goto cleanup_frame_and_send_done; 
         }
 
-        // Explicitly set viewport and scissor for the screen after starting the render pass
         glViewport(0, 0, wlr_output->width, wlr_output->height);
         glScissor(0, 0, wlr_output->width, wlr_output->height);
         glEnable(GL_SCISSOR_TEST);
-
-        wlr_log(WLR_INFO, "[OUTPUT_FRAME_EFFECT_DRAW] Final Screen Viewport: 0,0,%d,%d. Scissor: 0,0,%d,%d",
-                wlr_output->width, wlr_output->height, wlr_output->width, wlr_output->height);
-
-        glClearColor(0.2f, 0.0f, 0.2f, 1.0f);
+        glClearColor(0.1f, 0.0f, 0.1f, 1.0f); 
         glClear(GL_COLOR_BUFFER_BIT);
-
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_DEPTH_TEST);
 
         if (server->quad_vao != 0 && server->fullscreen_shader_program != 0) {
             glBindVertexArray(server->quad_vao);
             glUseProgram(server->fullscreen_shader_program);
 
-            float effect_mvp[9];
+            float effect_mvp[9]; 
             wlr_matrix_identity(effect_mvp);
-
-            effect_mvp[0] = 2.0f;  // Scale X by 2
-            effect_mvp[4] = 2.0f;  // Scale Y by 2
-            effect_mvp[6] = -1.0f; // Translate X by -1
-            effect_mvp[7] = -1.0f; // Translate Y by -1
-
-            wlr_log(WLR_INFO, "[OUTPUT_FRAME_EFFECT_DRAW] Using manual MVP for fullscreen quad.");
+            effect_mvp[0] = 2.0f; effect_mvp[4] = 2.0f;
+            effect_mvp[6] = -1.0f; effect_mvp[7] = -1.0f;
 
             if (server->fullscreen_shader_mvp_loc != -1) {
                 glUniformMatrix3fv(server->fullscreen_shader_mvp_loc, 1, GL_FALSE, effect_mvp);
@@ -3281,61 +3321,58 @@ static void output_frame(struct wl_listener *listener, void *data) {
                 glUniform1i(server->fullscreen_shader_scene_tex_loc, 0);
             }
 
+            if (server->fullscreen_shader_zoom_loc != -1) {
+                glUniform1f(server->fullscreen_shader_zoom_loc, server->effect_anim_current_factor);
+            }
+            if (server->fullscreen_shader_zoom_center_loc != -1) {
+                float center_for_shader[2] = {server->effect_zoom_center_x, server->effect_zoom_center_y};
+                glUniform2fv(server->fullscreen_shader_zoom_center_loc, 1, center_for_shader);
+            }
+
             glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
 
             glBindTexture(GL_TEXTURE_2D, 0);
             glBindVertexArray(0);
             glUseProgram(0);
         }
+        glDisable(GL_SCISSOR_TEST);
+    }
 
+    // Submit the active screen pass 
+    if (current_screen_pass) {
         if (!wlr_render_pass_submit(current_screen_pass)) {
-            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to submit final effect pass.", wlr_output->name);
+            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to submit render pass.", wlr_output->name);
         }
         
-        if (output_state_effect.committed & WLR_OUTPUT_STATE_BUFFER && output_state_effect.buffer) {
+        struct wlr_buffer *buffer_to_transmit = NULL;
+        if (current_frame_fbo_path && (output_state_effect.committed & WLR_OUTPUT_STATE_BUFFER)) { // FBO path was taken
+            buffer_to_transmit = output_state_effect.buffer;
+        } else if (!current_frame_fbo_path && (output_state_direct.committed & WLR_OUTPUT_STATE_BUFFER)) { // Direct path was taken
+            buffer_to_transmit = output_state_direct.buffer;
+        }
+
+        if (buffer_to_transmit && buffer_to_transmit->width > 0 && buffer_to_transmit->height > 0) {
             pthread_mutex_lock(&rdp_transmit_mutex);
-            struct wlr_buffer *locked_buffer = wlr_buffer_lock(output_state_effect.buffer);
+            struct wlr_buffer *locked_buffer = wlr_buffer_lock(buffer_to_transmit);
             if (locked_buffer) { 
                 rdp_transmit_surface(locked_buffer); 
                 wlr_buffer_unlock(locked_buffer); 
-            } else { 
-                wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to lock buffer (effect path) for RDP.", wlr_output->name); 
+            } else {
+                 wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to lock buffer for RDP transmit.", wlr_output->name);
             }
             pthread_mutex_unlock(&rdp_transmit_mutex);
         }
+    }
+
+    // Finish output states
+    if (current_frame_fbo_path) { // If FBO path was *intended* for this frame, finish its state
         wlr_output_state_finish(&output_state_effect);
-
-    } else if (current_screen_pass) { 
-        // Direct rendering path was taken - submit the render pass
-        if (!wlr_render_pass_submit(current_screen_pass)) {
-            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to submit direct render pass.", wlr_output->name);
-        }
-
-        // Check for GL errors after render pass submit
-        GLenum gl_err = glGetError();
-        if (gl_err != GL_NO_ERROR) {
-            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] GL error after render pass submit: 0x%x", wlr_output->name, gl_err);
-        }
-
-        if (output_state_direct.committed & WLR_OUTPUT_STATE_BUFFER && output_state_direct.buffer &&
-            output_state_direct.buffer->width > 0 && output_state_direct.buffer->height > 0) {
-            pthread_mutex_lock(&rdp_transmit_mutex);
-            struct wlr_buffer *locked_buffer = wlr_buffer_lock(output_state_direct.buffer);
-            if (locked_buffer) { 
-                rdp_transmit_surface(locked_buffer); 
-                wlr_buffer_unlock(locked_buffer); 
-            } else { 
-                wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to lock buffer (direct path) for RDP.", wlr_output->name); 
-            }
-            pthread_mutex_unlock(&rdp_transmit_mutex);
-        } else {
-            wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] No buffer to transmit or buffer invalid.", wlr_output->name);
-        }
+    } else { // Otherwise, finish the direct state
         wlr_output_state_finish(&output_state_direct);
     }
 
 cleanup_frame_and_send_done:
-    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_SCISSOR_TEST); 
     glDisable(GL_BLEND);
     wlr_scene_output_send_frame_done(scene_output, &now);
 }
@@ -4329,6 +4366,7 @@ static void handle_xdg_decoration_new(struct wl_listener *listener, void *data) 
         WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
 }
 
+
 /* Updated main function */
 int main(int argc, char *argv[]) {
     
@@ -4592,139 +4630,7 @@ static const char *panel_vertex_shader_src =
     "    gl_Position = vec4(pos_transformed.xy, 0.0, 1.0);\n"
     "    v_texcoord = texcoord;\n"
     "}\n";
-/*
-static const char *panel_fragment_shader_src = 
-    "#version 300 es\n"
-    "precision mediump float;\n"
-    "\n"
-    "in vec2 v_texcoord; // Normalized UV for the panel quad itself (0,0 to 1,1)\n"
-    "out vec4 frag_color;\n"
-    "\n"
-    "// Time and resolution uniforms for octgrams animation\n"
-    "uniform float time;\n"
-    "uniform vec2 iResolution;\n"
-    "\n"
-    "// Uniforms for the preview functionality\n"
-    "uniform sampler2D u_previewTexture;     // The window texture for the preview\n"
-    "uniform bool u_isPreviewActive;         // Flag: is there a preview to draw?\n"
-    "uniform vec4 u_previewRect;           // Preview position and size on panel: x, y, w, h (normalized 0-1 relative to panel's own UVs)\n"
-    "uniform mat3 u_previewTexTransform;   // Transform for sampling the preview texture\n"
-    "\n"
-    "// Octgrams animation variables and functions\n"
-    "float gTime = 0.0;\n"
-    "const float REPEAT = 5.0;\n"
-    "\n"
-    "mat2 rot(float a) {\n"
-    "    float c = cos(a), s = sin(a);\n"
-    "    return mat2(c,s,-s,c);\n"
-    "}\n"
-    "\n"
-    "float sdBox( vec3 p, vec3 b ) {\n"
-    "    vec3 q = abs(p) - b;\n"
-    "    return length(max(q,0.0)) + min(max(q.x,max(q.y,q.z)),0.0);\n"
-    "}\n"
-    "\n"
-    "float box(vec3 pos, float scale) {\n"
-    "    pos *= scale;\n"
-    "    float base = sdBox(pos, vec3(.4,.4,.1)) /1.5;\n"
-    "    pos.xy *= 5.0;\n"
-    "    pos.y -= 3.5;\n"
-    "    pos.xy *= rot(.75);\n"
-    "    float result = -base;\n"
-    "    return result;\n"
-    "}\n"
-    "\n"
-    "float box_set(vec3 pos, float iTime) {\n"
-    "    vec3 pos_origin = pos;\n"
-    "    pos = pos_origin;\n"
-    "    pos.y += sin(gTime * 0.4) * 2.5;\n"
-    "    pos.xy *= rot(.8);\n"
-    "    float box1 = box(pos,2.0 - abs(sin(gTime * 0.4)) * 1.5);\n"
-    "    pos = pos_origin;\n"
-    "    pos.y -=sin(gTime * 0.4) * 2.5;\n"
-    "    pos.xy *= rot(.8);\n"
-    "    float box2 = box(pos,2.0 - abs(sin(gTime * 0.4)) * 1.5);\n"
-    "    pos = pos_origin;\n"
-    "    pos.x +=sin(gTime * 0.4) * 2.5;\n"
-    "    pos.xy *= rot(.8);\n"
-    "    float box3 = box(pos,2.0 - abs(sin(gTime * 0.4)) * 1.5);\n"
-    "    pos = pos_origin;\n"
-    "    pos.x -=sin(gTime * 0.4) * 2.5;\n"
-    "    pos.xy *= rot(.8);\n"
-    "    float box4 = box(pos,2.0 - abs(sin(gTime * 0.4)) * 1.5);\n"
-    "    pos = pos_origin;\n"
-    "    pos.xy *= rot(.8);\n"
-    "    float box5 = box(pos,.5) * 6.0;\n"
-    "    pos = pos_origin;\n"
-    "    float box6 = box(pos,.5) * 6.0;\n"
-    "    float result = max(max(max(max(max(box1,box2),box3),box4),box5),box6);\n"
-    "    return result;\n"
-    "}\n"
-    "\n"
-    "float map(vec3 pos, float iTime) {\n"
-    "    vec3 pos_origin = pos;\n"
-    "    float box_set1 = box_set(pos, iTime);\n"
-    "    return box_set1;\n"
-    "}\n"
-    "\n"
-    "vec4 getOctgramsColor() {\n"
-    "    vec2 fragCoord = gl_FragCoord.xy;\n"
-    "    float iTime = time;\n"
-    "    \n"
-    "    vec2 p = (fragCoord.xy * 2.0 - iResolution.xy) / min(iResolution.x, iResolution.y);\n"
-    "    vec3 ro = vec3(0.0, -0.2, iTime * 4.0);\n"
-    "    vec3 ray = normalize(vec3(p, 1.5));\n"
-    "    ray.xy = ray.xy * rot(sin(iTime * .03) * 5.0);\n"
-    "    ray.yz = ray.yz * rot(sin(iTime * .05) * .2);\n"
-    "    float t = 0.1;\n"
-    "    vec3 col = vec3(0.0);\n"
-    "    float ac = 0.0;\n"
-    "    \n"
-    "    for (int i = 0; i < 99; i++){\n"
-    "        vec3 pos = ro + ray * t;\n"
-    "        pos = mod(pos-2.0, 4.0) -2.0;\n"
-    "        gTime = iTime -float(i) * 0.01;\n"
-    "        \n"
-    "        float d = map(pos, iTime);\n"
-    "        d = max(abs(d), 0.01);\n"
-    "        ac += exp(-d*23.0);\n"
-    "        t += d* 0.55;\n"
-    "    }\n"
-    "    \n"
-    "    col = vec3(ac * 0.02);\n"
-    "    col +=vec3(0.0,0.2 * abs(sin(iTime)),0.5 + sin(iTime) * 0.2);\n"
-    "    \n"
-    "    return vec4(col, 0.6);\n"
-    "}\n"
-    "\n"
-    "void main() {\n"
-    "    // Start with the octgrams animation as the background\n"
-    "    vec4 background_color = getOctgramsColor();\n"
-    "    vec4 final_pixel_color = background_color;\n"
-    "\n"
-    "    // Layer the preview on top if active\n"
-    "    if (u_isPreviewActive) {\n"
-    "        // Check if we're inside the preview rectangle\n"
-    "        bool is_inside_preview_x = (v_texcoord.x >= u_previewRect.x && v_texcoord.x < (u_previewRect.x + u_previewRect.z));\n"
-    "        bool is_inside_preview_y = (v_texcoord.y >= u_previewRect.y && v_texcoord.y < (u_previewRect.y + u_previewRect.w));\n"
-    "        \n"
-    "        if (is_inside_preview_x && is_inside_preview_y) {\n"
-    "            // We're inside the preview area - sample the preview texture\n"
-    "            vec3 transformed_uv_homogeneous = u_previewTexTransform * vec3(v_texcoord, 1.0);\n"
-    "            vec2 final_sample_uv = transformed_uv_homogeneous.xy;\n"
-    "            \n"
-    "            vec4 preview_sample = texture(u_previewTexture, final_sample_uv);\n"
-    "            \n"
-    "            if (preview_sample.a > 0.05) {\n"
-    "                // Blend the preview over the background\n"
-    "                final_pixel_color = mix(background_color, preview_sample, preview_sample.a);\n"
-    "            }\n"
-    "        }\n"
-    "    }\n"
-    "\n"
-    "    frag_color = final_pixel_color.bgra;\n"
-    "}";
-*/
+
 
 static const char *panel_fragment_shader_src =
     "#version 300 es\n"
@@ -5230,7 +5136,7 @@ static const char *ssd_fragment_shader_src =
     "    frag_color = vec4(col, final_alpha*0.8).bgra;\n"
     "}\n"
     "// --- End of Inigo Quilez's shader code (adapted) ---\n";
-
+/*
 // Add these near your other shader source strings
 static const char *fullscreen_vertex_shader_src =
        "#version 300 es\n"
@@ -5257,6 +5163,111 @@ static const char *fullscreen_fragment_shader_src =
        "    vec3 inverted_rgb = vec3(1.0) - original_color.rgb;\n" // Invert R, G, B
        "    frag_color = vec4(inverted_rgb, original_color.a);\n"  // Keep original alpha
        "}\n";
+*//*
+static const char *fullscreen_vertex_shader_src =
+       "#version 300 es\n"
+       "precision mediump float;\n"
+       "layout(location = 0) in vec2 a_position_01;\n" // Vertices of the quad (0,0 to 1,1)
+       "layout(location = 1) in vec2 a_texcoord;\n"    // Texture coords for the quad (0,0 to 1,1)
+       "uniform mat3 mvp;\n"
+       "out vec2 v_texcoord_to_fs;\n"
+       "void main() {\n"
+       "    float zoom = 0.5; // 2x smaller\n"
+       "    \n"
+       "    // Scale the quad geometry and position it based on which instance/quadrant\n"
+       "    vec2 scaled_pos = a_position_01 * zoom;\n"
+       "    \n"
+       "    // Offset to different quadrants (you'd need to pass quadrant info)\n"
+       "    // For now, this will scale everything to center\n"
+       "    vec2 center_offset = vec2(0.5 - zoom * 0.5);\n"
+       "    vec2 final_pos = scaled_pos + center_offset;\n"
+       "    \n"
+       "    gl_Position = vec4((mvp * vec3(final_pos, 1.0)).xy, 0.0, 1.0);\n"
+       // Pass texture coordinates directly. The FBO texture (scene content)\n"
+       // will be mapped entirely onto the scaled quad.\n"
+       "    v_texcoord_to_fs = a_texcoord;\n"
+       "}\n";
+
+static const char *fullscreen_fragment_shader_src =
+       "#version 300 es\n"
+       "precision mediump float;\n"
+       "in vec2 v_texcoord_to_fs;\n"
+       "out vec4 frag_color;\n"
+       "uniform sampler2D u_scene_texture;\n"
+       "void main() {\n"
+       "    vec4 original_color = texture(u_scene_texture, v_texcoord_to_fs);\n"
+       "    vec3 inverted_rgb = vec3(1.0) - original_color.rgb;\n" // Invert R, G, B
+       "    frag_color = vec4(inverted_rgb, original_color.a);\n"  // Keep original alpha
+       "}\n";*/
+
+
+
+static const char *fullscreen_vertex_shader_src =
+       "#version 300 es\n"
+       "precision mediump float;\n"
+       "layout(location = 0) in vec2 a_position_01; // Quad vertices (typically 0,0 to 1,1)\n"
+       "layout(location = 1) in vec2 a_texcoord;    // Texture coords (0,0 to 1,1)\n"
+       "\n"
+       "uniform mat3 mvp;           // Transforms a [0,1] quad to fullscreen NDC (e.g. scale by 2, translate by -1)\n"
+       "\n"
+       "// u_zoom: Geometric scale factor for the quad itself.\n"
+       "// 1.0 = normal size (quadrant takes its designated quarter of the screen).\n"
+       "// >1.0 = ZOOM IN (quadrant appears larger on screen).\n"
+       "// <1.0 = ZOOM OUT (quadrant appears smaller on screen).\n"
+       "uniform float u_zoom;\n"
+       "\n"
+       "// u_zoom_center: The point in a_position_01's [0,1] space around which to scale.\n"
+       "uniform vec2 u_zoom_center; // e.g., (0.5, 0.5) to scale from the center of the quad.\n"
+       "\n"
+       "out vec2 v_texcoord_to_fs;\n"
+       "\n"
+       "void main() {\n"
+       "    // 1. Scale a_position_01 (our [0,1] input quad) around u_zoom_center by u_zoom factor.\n"
+       "    vec2 scaled_a_position_01 = (a_position_01 - u_zoom_center) * u_zoom + u_zoom_center;\n"
+       "\n"
+       "    // 2. Transform this scaled [0,1]-space quad to full Normalized Device Coordinates (NDC) [-1,1].\n"
+       "    //    The 'mvp' should be set up in C to map a standard [0,1] quad to fullscreen NDC.\n"
+       "    //    Example C-side MVP (like your effect_mvp for fullscreen): \n"
+       "    //    mvp[0]=2.0; mvp[4]=2.0; mvp[6]=-1.0; mvp[7]=-1.0; (maps [0,1] to [-1,1])\n"
+       "    vec3 full_ndc_pos = mvp * vec3(scaled_a_position_01, 1.0);\n"
+       "\n"
+       "    // 3. Now, take the (geometrically zoomed) full NDC position and scale it down for the quadrant view.\n"
+       "    //    This scales the *already zoomed* item down to fit into a quadrant space.\n"
+       "    vec2 quadrant_ndc_pos = full_ndc_pos.xy * 0.5; // Scale to half size in NDC for quarter area\n"
+       "\n"
+       "    // 4. Offset to the desired quadrant (e.g., top-left).\n"
+       "    //    This offset is in NDC space.\n"
+       "    int u_quadrant_fixed = 0; // Forcing top-left for now\n"
+       "    vec2 quad_offset_ndc;\n"
+       "    if (u_quadrant_fixed == 0) {\n"
+       "        quad_offset_ndc = vec2(-0.5, 0.5);  // Top-left: move left by 0.5 NDC, up by 0.5 NDC\n"
+       "    } else if (u_quadrant_fixed == 1) {\n"
+       "        quad_offset_ndc = vec2(0.5, 0.5);   // Top-right\n"
+       "    } else if (u_quadrant_fixed == 2) {\n"
+       "        quad_offset_ndc = vec2(-0.5, -0.5); // Bottom-left\n"
+       "    } else { // u_quadrant_fixed == 3\n"
+       "        quad_offset_ndc = vec2(0.5, -0.5);  // Bottom-right\n"
+       "    }\n"
+       "\n"
+       "    gl_Position = vec4(quadrant_ndc_pos + quad_offset_ndc, 0.0, 1.0);\n"
+       "\n"
+       "    // Texture coordinates pass through. The full texture maps to the (now geometrically scaled) quad.\n"
+       "    v_texcoord_to_fs = a_texcoord;\n"
+       "}\n";
+
+static const char *fullscreen_fragment_shader_src =
+       "#version 300 es\n"
+       "precision mediump float;\n"
+       "in vec2 v_texcoord_to_fs;\n"
+       "out vec4 frag_color;\n"
+       "uniform sampler2D u_scene_texture;\n"
+       "void main() {\n"
+       "    vec4 original_color = texture(u_scene_texture, v_texcoord_to_fs);\n"
+   //    "    vec3 inverted_rgb = vec3(1.0) - original_color.rgb;\n" // Invert R, G, B
+//       "    frag_color = vec4(inverted_rgb, original_color.a);\n"  // Keep original alpha
+        "    frag_color = vec4(original_color);\n" 
+       "}\n";
+
 
 
     setenv("MESA_VK_VERSION_OVERRIDE", "1.2", 1);
@@ -5482,19 +5493,42 @@ const char *vendor = (const char *)glGetString(GL_VENDOR);
 
     // --- Create Fullscreen Shader (for Scaled Down Scene View) ---
     struct shader_uniform_spec scaled_scene_uniforms[] = {
-        {"mvp", &server.fullscreen_shader_mvp_loc},
-        {"u_scene_texture", &server.fullscreen_shader_scene_tex_loc}
-        // Add time/resolution if your scaled_scene_fragment_shader_src uses them for other effects
-    };
-    if (!create_generic_shader_program(server.renderer, "ScaledSceneViewShader",
-                                     fullscreen_vertex_shader_src, // Use the VS that passes texcoords
-                                     fullscreen_fragment_shader_src, // Use the FS that samples u_scene_texture
-                                     &server.fullscreen_shader_program, // Store in fullscreen_shader_program
-                                     scaled_scene_uniforms,
-                                     sizeof(scaled_scene_uniforms) / sizeof(scaled_scene_uniforms[0]))) {
-        wlr_log(WLR_ERROR, "Failed to create scaled scene view shader program.");
-        server_destroy(&server); return 1;
-    }
+    {"mvp", &server.fullscreen_shader_mvp_loc},
+    {"u_scene_texture", &server.fullscreen_shader_scene_tex_loc},
+    {"u_zoom", &server.fullscreen_shader_zoom_loc},
+    {"u_zoom_center", &server.fullscreen_shader_zoom_center_loc},
+  //  {"u_quadrant", &server.fullscreen_shader_quadrant_loc}  // Add this if using the uniform version
+};
+
+if (!create_generic_shader_program(server.renderer, "ScaledSceneViewShader",
+                                 fullscreen_vertex_shader_src,
+                                 fullscreen_fragment_shader_src,
+                                 &server.fullscreen_shader_program,
+                                 scaled_scene_uniforms,
+                                 sizeof(scaled_scene_uniforms) / sizeof(scaled_scene_uniforms[0]))) {
+    wlr_log(WLR_ERROR, "Failed to create scaled scene view shader program.");
+    server_destroy(&server); 
+    return 1;
+}
+
+    // Initialize zoom effect variables
+    // Initialize zoom effect variables
+   
+    server.effect_zoom_factor_normal = 2.0f;
+    server.effect_zoom_factor_zoomed = 1.0f;
+    
+    server.effect_is_target_zoomed = true;
+    server.effect_is_animating_zoom = false;
+    server.effect_anim_current_factor = server.effect_zoom_factor_normal;
+    server.effect_anim_start_factor = server.effect_zoom_factor_normal;
+    server.effect_anim_target_factor = server.effect_zoom_factor_normal;
+    server.effect_anim_duration_sec = 0.3f; 
+
+    // For the current shader, u_zoom_center should be (0,0) to scale around the quadrant's local center
+    server.effect_zoom_center_x = 0.0f;
+    server.effect_zoom_center_y = 1.0f;
+
+
     wlr_log(WLR_INFO, "ScaledSceneViewShader (fullscreen_shader_program) created. MVP@%d, SceneTex@%d",
             server.fullscreen_shader_mvp_loc, server.fullscreen_shader_scene_tex_loc);
 
