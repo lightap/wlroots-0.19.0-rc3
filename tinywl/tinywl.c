@@ -380,10 +380,26 @@ struct wl_listener pointer_motion;
     GLuint quad_ibo;
 
 
- 
+
+    // Fullscreen shader effect (as before)
+    GLuint fullscreen_shader_program;
+    GLint fullscreen_shader_mvp_loc;
+     GLint fullscreen_shader_time_loc; // Keep if shader uses it for non-rotation anim
+    GLint fullscreen_shader_scene_tex_loc;    // Location for the scene texture uniform
+    GLint fullscreen_shader_tex_matrix_loc;   // Location for texture matrix uniform
+ GLint fullscreen_shader_resolution_loc;
+     struct wlr_buffer *scene_capture_buffer;    // Buffer to capture the scene (NEW/REPURPOSED)
+    struct wlr_texture *scene_texture;          // Texture from the captured scene buffer (REPURPOSED)
+    // GLuint scene_fbo; // REMOVE THIS
+ bool shrink_effect_active;
 
     struct wlr_xdg_decoration_manager_v1 *xdg_decoration_manager;
 struct wl_listener xdg_decoration_new;
+
+GLuint intermediate_fbo;
+    GLuint intermediate_texture;
+    GLuint intermediate_rbo; // render buffer for depth if needed
+    int intermediate_width, intermediate_height;
 };
 
 /* Updated tinywl_output struct to store timer */
@@ -695,112 +711,135 @@ static void server_destroy(struct tinywl_server *server) {
     wl_list_remove(&server->request_cursor.link);
     wl_list_remove(&server->request_set_selection.link);
     wl_list_remove(&server->new_output.link);
+    if (server->xdg_decoration_manager) { // Check if it was created
+        wl_list_remove(&server->xdg_decoration_new.link);
+    }
+
 
     /* Clean up toplevels */
     struct tinywl_toplevel *toplevel, *toplevel_tmp;
     wl_list_for_each_safe(toplevel, toplevel_tmp, &server->toplevels, link) {
-        wl_list_remove(&toplevel->link);
-        wl_list_remove(&toplevel->map.link);
-        wl_list_remove(&toplevel->unmap.link);
-        wl_list_remove(&toplevel->commit.link);
-        wl_list_remove(&toplevel->destroy.link);
-        wl_list_remove(&toplevel->request_move.link);
-        wl_list_remove(&toplevel->request_resize.link);
-        wl_list_remove(&toplevel->request_maximize.link);
-        wl_list_remove(&toplevel->request_fullscreen.link);
-        free(toplevel);
+        // xdg_toplevel_destroy will remove listeners and free toplevel
+        // For safety, ensure destroy is called if not already
+        if (toplevel->type == TINYWL_TOPLEVEL_XDG && toplevel->xdg_toplevel) {
+             // xdg_toplevel_destroy is called via signal, no need to call manually here
+        } else {
+            wl_list_remove(&toplevel->link);
+            // remove other specific listeners if it's a custom toplevel type
+            free(toplevel);
+        }
     }
 
     /* Clean up outputs */
     struct tinywl_output *output, *output_tmp;
     wl_list_for_each_safe(output, output_tmp, &server->outputs, link) {
-        wl_list_remove(&output->link);
-        wl_list_remove(&output->frame.link);
-        wl_list_remove(&output->request_state.link);
-        wl_list_remove(&output->destroy.link);
-        free(output);
+        // output_destroy is called via signal
     }
 
     /* Clean up keyboards */
     struct tinywl_keyboard *kb, *kb_tmp;
     wl_list_for_each_safe(kb, kb_tmp, &server->keyboards, link) {
-        wl_list_remove(&kb->link);
-        wl_list_remove(&kb->modifiers.link);
-        wl_list_remove(&kb->key.link);
-        wl_list_remove(&kb->destroy.link);
-        free(kb);
+        // keyboard_handle_destroy is called via signal
     }
+    
+    /* Clean up popups */
+    struct tinywl_popup *popup, *popup_tmp;
+    wl_list_for_each_safe(popup, popup_tmp, &server->popups, link) {
+        // popup_destroy is called via signal
+    }
+
 
     /* Destroy resources */
-    if (server->scene) {
-        wlr_scene_node_destroy(&server->scene->tree.node);
+    if (server->scene) { // scene_layout is part of scene
+        wlr_scene_node_destroy(&server->scene->tree.node); // This destroys scene_layout too
+        server->scene = NULL;
+        server->scene_layout = NULL;
     }
+     if (server->output_layout) { // Destroy after scene
+        wlr_output_layout_destroy(server->output_layout);
+        server->output_layout = NULL;
+    }
+    if (server->xdg_shell) { // Destroy after toplevels/popups
+        // wlr_xdg_shell_destroy(server->xdg_shell); // This is usually handled by wl_display_destroy_clients
+        server->xdg_shell = NULL;
+    }
+    if (server->xdg_decoration_manager) {
+        // wlr_xdg_decoration_manager_v1_destroy(server->xdg_decoration_manager); // Also usually handled by wl_display_destroy_clients
+        server->xdg_decoration_manager = NULL;
+    }
+
+
     if (server->cursor_mgr) {
         wlr_xcursor_manager_destroy(server->cursor_mgr);
+        server->cursor_mgr = NULL;
     }
-    if (server->cursor) {
+    if (server->cursor) { // Destroy after output_layout
         wlr_cursor_destroy(server->cursor);
-    }
-    if (server->allocator) {
-        wlr_allocator_destroy(server->allocator);
-    }
-    /* Temporary workaround for renderer buffer list corruption */
-    if (server->renderer) {
-        wlr_log(WLR_INFO, "Skipping renderer destruction due to potential buffer list corruption");
-        // wlr_renderer_destroy(server.renderer); // Commented out to avoid segfault
-    }
-    if (server->backend) {
-        wlr_backend_destroy(server->backend);
-    }
-    if (server->seat) {
-        wlr_seat_destroy(server->seat);
-    }
-    if (server->wl_display) {
-        wl_display_destroy(server->wl_display);
+        server->cursor = NULL;
     }
 
-  
-
-     struct wlr_egl *egl_destroy = NULL;
-    if (server->renderer) { // Need renderer to get EGL context
+    struct wlr_egl *egl_destroy = NULL;
+    if (server->renderer) { 
         egl_destroy = wlr_gles2_renderer_get_egl(server->renderer);
     }
 
+   
+        
+
     if (egl_destroy && wlr_egl_make_current(egl_destroy, NULL)) {
-        if (server->shader_program) {
-            glDeleteProgram(server->shader_program);
-            server->shader_program = 0;
-        }
-        if (server->quad_vao) {
-            glDeleteVertexArrays(1, &server->quad_vao);
-            server->quad_vao = 0;
-        }
-        if (server->quad_vbo) {
-            glDeleteBuffers(1, &server->quad_vbo);
-            server->quad_vbo = 0;
-        }
-        if (server->quad_ibo) {
-            glDeleteBuffers(1, &server->quad_ibo);
-            server->quad_ibo = 0;
-        }
+        if (server->shader_program) glDeleteProgram(server->shader_program);
+        if (server->rect_shader_program) glDeleteProgram(server->rect_shader_program);
+        if (server->panel_shader_program) glDeleteProgram(server->panel_shader_program);
+        if (server->ssd_shader_program) glDeleteProgram(server->ssd_shader_program);
+        if (server->back_shader_program) glDeleteProgram(server->back_shader_program);
+        if (server->fullscreen_shader_program) glDeleteProgram(server->fullscreen_shader_program); // NEW
+
+        if (server->quad_vao) glDeleteVertexArrays(1, &server->quad_vao);
+        if (server->quad_vbo) glDeleteBuffers(1, &server->quad_vbo);
+        if (server->quad_ibo) glDeleteBuffers(1, &server->quad_ibo);
+        
+        server->shader_program = 0;
+        server->rect_shader_program = 0;
+        server->panel_shader_program = 0;
+        server->ssd_shader_program = 0;
+        server->back_shader_program = 0;
+ 
+        server->fullscreen_shader_program = 0; // NEW
+        server->quad_vao = 0;
+        server->quad_vbo = 0;
+        server->quad_ibo = 0;
+
         wlr_egl_unset_current(egl_destroy);
-    } else if (server->shader_program || server->quad_vao || server->quad_vbo || server->quad_ibo) {
+    } else if (server->shader_program || server->rect_shader_program || server->panel_shader_program ||
+               server->ssd_shader_program || server->back_shader_program ||
+               server->fullscreen_shader_program || // NEW
+               server->quad_vao || server->quad_vbo || server->quad_ibo) {
         wlr_log(WLR_ERROR, "Could not make EGL context current to delete GL resources in server_destroy");
     }
-
-       if (egl_destroy && wlr_egl_make_current(egl_destroy, NULL)) {
-        if (server->shader_program) { // Flame shader
-            glDeleteProgram(server->shader_program);
-            server->shader_program = 0;
-        }
-        if (server->rect_shader_program) { // New: Rect shader
-            glDeleteProgram(server->rect_shader_program);
-            server->rect_shader_program = 0;
-        }
-        // ... delete VAO, VBO, IBO ...
-        wlr_egl_unset_current(egl_destroy);
+    
+    if (server->allocator) { // Destroy before renderer
+        wlr_allocator_destroy(server->allocator);
+        server->allocator = NULL;
+    }
+    if (server->renderer) { 
+         wlr_renderer_destroy(server->renderer);
+         server->renderer = NULL;
+    }
+    if (server->backend) { // Destroy after renderer
+        wlr_backend_destroy(server->backend);
+        server->backend = NULL;
+    }
+    if (server->seat) { // Destroy after backend (input devices)
+        wlr_seat_destroy(server->seat);
+        server->seat = NULL;
+    }
+    if (server->wl_display) {
+        wl_display_destroy_clients(server->wl_display); // Ensure clients are gone before display
+        wl_display_destroy(server->wl_display);
+        server->wl_display = NULL;
     }
 }
+
 
 
 
@@ -908,59 +947,61 @@ static bool handle_keybinding(struct tinywl_server *server, xkb_keysym_t sym) {
     return true;
 }
 
+// Ensure you have this forward declaration if handle_keybinding is defined later
+// static bool handle_keybinding(struct tinywl_server *server, xkb_keysym_t sym);
+
 static void keyboard_handle_key(struct wl_listener *listener, void *data) {
     struct tinywl_keyboard *keyboard = wl_container_of(listener, keyboard, key);
     struct tinywl_server *server = keyboard->server;
     struct wlr_keyboard_key_event *event = data;
     struct wlr_seat *seat = server->seat;
-    
+
     // Log key event details with timestamp to track potential duplicates
     wlr_log(WLR_DEBUG, "Key event: keycode=%u, state=%s, time=%u",
             event->keycode, event->state == WL_KEYBOARD_KEY_STATE_PRESSED ? "pressed" : "released",
             event->time_msec);
-    
+
     // Track duplicate events - if we see same keycode and state with similar timestamp, ignore it
-    static uint32_t last_keycode = 0;
-    static uint32_t last_state = 0;
-    static uint32_t last_time = 0;
-    
+    static uint32_t last_keycode_event = 0; // Use a distinct name to avoid conflict if other statics exist
+    static uint32_t last_state_event = 0;
+    static uint32_t last_time_event = 0;
+
     // Check for duplicate events (same key, same state, within 5ms)
-    if (last_keycode == event->keycode && 
-        last_state == event->state &&
-        event->time_msec > 0 && 
-        last_time > 0 &&
-        (event->time_msec - last_time < 5 || last_time - event->time_msec < 5)) {
-        wlr_log(WLR_ERROR, "Ignoring duplicate key event: keycode=%u, state=%u, time=%u (prev=%u)",
-                event->keycode, event->state, event->time_msec, last_time);
+    if (last_keycode_event == event->keycode &&
+        last_state_event == event->state &&
+        event->time_msec > 0 &&
+        last_time_event > 0 &&
+        (event->time_msec - last_time_event < 5 || last_time_event - event->time_msec < 5)) {
+        wlr_log(WLR_ERROR, "Ignoring duplicate key event: keycode=%u, state=%u, time=%u (prev=%u)", // Changed to WARNING
+                event->keycode, event->state, event->time_msec, last_time_event);
         return;
     }
-    
+
     // Store current event details for duplicate detection
-    last_keycode = event->keycode;
-    last_state = event->state;
-    last_time = event->time_msec;
+    last_keycode_event = event->keycode;
+    last_state_event = event->state;
+    last_time_event = event->time_msec;
 
     // Ignore release events at startup with no focused surface and no prior press
     if (event->state == WL_KEYBOARD_KEY_STATE_RELEASED && !seat->keyboard_state.focused_surface) {
         // Note: XKB keycodes are offset by 8 from evdev keycodes
-        xkb_keycode_t xkb_keycode = event->keycode + 8;
-        struct xkb_state *state = keyboard->wlr_keyboard->xkb_state;
-        if (xkb_state_key_get_level(state, xkb_keycode, 0) == 0) {
-            wlr_log(WLR_ERROR, "Ignoring phantom release for keycode=%u (no prior press, no focused surface)",
+        xkb_keycode_t xkb_keycode_check = event->keycode + 8;
+        struct xkb_state *state_check = keyboard->wlr_keyboard->xkb_state;
+        if (xkb_state_key_get_level(state_check, xkb_keycode_check, 0) == 0) {
+            wlr_log(WLR_DEBUG, "Ignoring phantom release for keycode=%u (no prior press, no focused surface)", // Changed to DEBUG
                     event->keycode);
             return;
         }
     }
-    
-    // Convert keycode to XKB keycode (Wayland keycodes are offset by 8)
+
+    // Convert keycode to XKB keycode (Wayland keycodes are offset by 8 from evdev keycodes)
     uint32_t keycode = event->keycode + 8;
     const xkb_keysym_t *syms;
     int nsyms = xkb_state_key_get_syms(keyboard->wlr_keyboard->xkb_state, keycode, &syms);
-    
+
     if (nsyms <= 0) {
-        wlr_log(WLR_ERROR, "No keysyms found for keycode %u (raw=%u)", keycode, event->keycode);
+        wlr_log(WLR_DEBUG, "No keysyms found for keycode %u (raw=%u)", keycode, event->keycode); // Changed to DEBUG
     } else {
-        // Only log detailed keysym info at debug level to reduce noise
         if (wlr_log_get_verbosity() >= WLR_DEBUG) {
             for (int i = 0; i < nsyms; i++) {
                 char buf[32];
@@ -969,33 +1010,65 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
             }
         }
     }
-    
-    // Handle keybindings for Alt+key combinations
-    bool handled = false;
+
+    bool handled_by_compositor = false;
     uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
-    if ((modifiers & WLR_MODIFIER_ALT) && event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-        for (int i = 0; i < nsyms; i++) {
-            handled = handle_keybinding(server, syms[i]);
-            if (handled) break;
+
+    if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+        // 1. Handle Ctrl+P for shrink effect
+        if ((modifiers & WLR_MODIFIER_CTRL)) {
+            for (int i = 0; i < nsyms; i++) {
+                if (syms[i] == XKB_KEY_p) { // Check for 'p' key (lowercase 'p')
+                    server->shrink_effect_active = !server->shrink_effect_active;
+                    wlr_log(WLR_INFO, "Shrink effect %s", server->shrink_effect_active ? "ENABLED" : "DISABLED");
+
+                    // Schedule a redraw on all outputs to apply/remove the effect
+                    struct tinywl_output *output_iter;
+                    wl_list_for_each(output_iter, &server->outputs, link) {
+                        if (output_iter->wlr_output && output_iter->wlr_output->enabled) {
+                            wlr_output_schedule_frame(output_iter->wlr_output);
+                        }
+                    }
+                    handled_by_compositor = true;
+                    break; // Ctrl+P handled
+                }
+            }
+        }
+
+        // 2. Handle Alt+Key bindings (like F1, Escape) if Ctrl+P wasn't handled
+        if (!handled_by_compositor && (modifiers & WLR_MODIFIER_ALT)) {
+            for (int i = 0; i < nsyms; i++) {
+                handled_by_compositor = handle_keybinding(server, syms[i]);
+                if (handled_by_compositor) {
+                    break; // Alt+Key binding handled
+                }
+            }
         }
     }
-    
-    // Forward key event to the focused client if not handled
-    if (!handled) {
+
+    // 3. Forward key event to the focused client if not handled by the compositor
+    if (!handled_by_compositor) {
         // Set the keyboard once at initialization or focus change, not on every key event
-        static struct wlr_keyboard *last_keyboard = NULL;
-        if (last_keyboard != keyboard->wlr_keyboard) {
+        // This static variable helps ensure wlr_seat_set_keyboard is called only when necessary.
+        static struct wlr_keyboard *last_keyboard_set_on_seat = NULL;
+        if (last_keyboard_set_on_seat != keyboard->wlr_keyboard) {
             wlr_seat_set_keyboard(seat, keyboard->wlr_keyboard);
-            last_keyboard = keyboard->wlr_keyboard;
+            last_keyboard_set_on_seat = keyboard->wlr_keyboard;
+            wlr_log(WLR_DEBUG, "Set keyboard %p on seat %s", keyboard->wlr_keyboard, seat->name);
         }
-        
+
         // Only notify if there's a focused surface
         if (seat->keyboard_state.focused_surface) {
             wlr_seat_keyboard_notify_key(seat, event->time_msec, event->keycode, event->state);
-            wlr_log(WLR_DEBUG, "Key sent to focused surface %p", seat->keyboard_state.focused_surface);
+            wlr_log(WLR_DEBUG, "Key event (keycode %u, state %u) sent to focused surface %p",
+                    event->keycode, event->state, seat->keyboard_state.focused_surface);
         } else {
-            wlr_log(WLR_DEBUG, "No focused surface for key event");
+            wlr_log(WLR_DEBUG, "No focused surface for key event (keycode %u, state %u)",
+                    event->keycode, event->state);
         }
+    } else {
+        wlr_log(WLR_DEBUG, "Key event (keycode %u, state %u) handled by compositor.",
+                event->keycode, event->state);
     }
 }
 
@@ -1771,7 +1844,6 @@ void debug_scene_tree(struct wlr_scene *scene, struct wlr_output *output) {
     
     wlr_log(WLR_INFO, "[DEBUG] Total nodes: %d", node_count);
 }
-
 // scene_buffer_iterator for MAIN WINDOWS ONLY (using windowback Shader)
 static void scene_buffer_iterator_main_window_only(
         struct wlr_scene_buffer *scene_buffer,
@@ -2362,6 +2434,7 @@ void check_scene_bypass_issue(struct wlr_scene_output *scene_output, struct wlr_
     wlr_log(WLR_INFO, "[BYPASS_CHECK:%s] If you see this but no rectangles, you might be bypassing scene rendering", output->name);
 }
 
+
 static void render_rect_node(struct wlr_scene_node *node, void *user_data) {
     struct render_data *rdata = user_data;
     struct wlr_output *output = rdata->output;
@@ -2714,6 +2787,268 @@ static void render_panel_node(struct wlr_scene_node *node, void *user_data) {
     }
 }
 
+// PLACE THIS ENTIRE FUNCTION DEFINITION *BEFORE* your output_frame function
+
+static void render_scene_content(struct tinywl_server *server,
+                                 struct wlr_output *wlr_output, // Final display output
+                                 struct render_data *current_rdata) { // Pass has target info
+    // Clear current target (FBO or screen)
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f); // Clear with transparent black for FBO
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    if (server->quad_vao == 0) {
+        wlr_log(WLR_ERROR, "[RENDER_SCENE_CONTENT:%s] Quad VAO is zero! Skipping custom draw.", wlr_output->name);
+        return;
+    }
+    glBindVertexArray(server->quad_vao);
+
+    // The current_rdata (passed in) contains the correct server, renderer,
+    // output (final target for some projections), and current_pass (NULL for FBO).
+
+    // --- Render Background Rects and SSDs ---
+    struct wlr_scene_node *iter_node_lvl1;
+    wl_list_for_each(iter_node_lvl1, &server->scene->tree.children, link) {
+        if (!iter_node_lvl1->enabled) continue;
+        if (iter_node_lvl1 == server->top_panel_node && iter_node_lvl1->type == WLR_SCENE_NODE_RECT) continue;
+
+        if (iter_node_lvl1->type == WLR_SCENE_NODE_RECT) {
+            render_rect_node(iter_node_lvl1, current_rdata);
+        } else if (iter_node_lvl1->type == WLR_SCENE_NODE_TREE) {
+            struct tinywl_toplevel *toplevel_ptr = iter_node_lvl1->data;
+            if (toplevel_ptr && toplevel_ptr->type == TINYWL_TOPLEVEL_XDG && toplevel_ptr->ssd.enabled) {
+                struct wlr_scene_tree *toplevel_s_tree = wlr_scene_tree_from_node(iter_node_lvl1);
+                struct wlr_scene_node *ssd_node_candidate;
+                wl_list_for_each(ssd_node_candidate, &toplevel_s_tree->children, link) {
+                    if (ssd_node_candidate->enabled && ssd_node_candidate->type == WLR_SCENE_NODE_RECT) {
+                        if ( (toplevel_ptr->ssd.title_bar && ssd_node_candidate == &toplevel_ptr->ssd.title_bar->node) ||
+                             (toplevel_ptr->ssd.border_left && ssd_node_candidate == &toplevel_ptr->ssd.border_left->node) ||
+                             (toplevel_ptr->ssd.border_right && ssd_node_candidate == &toplevel_ptr->ssd.border_right->node) ||
+                             (toplevel_ptr->ssd.border_bottom && ssd_node_candidate == &toplevel_ptr->ssd.border_bottom->node) ) {
+                            render_rect_node(ssd_node_candidate, current_rdata);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Render Panel Node ---
+    if (server->top_panel_node && server->top_panel_node->enabled &&
+        server->top_panel_node->type == WLR_SCENE_NODE_RECT && server->panel_shader_program != 0) {
+        // render_panel_node needs similar proj_width/height logic as render_rect_node
+        // For now, assuming render_panel_node is adapted or we'll see its output
+        render_panel_node(server->top_panel_node, current_rdata);
+    }
+
+      if (server->shader_program != 0) {
+            glUseProgram(server->shader_program);
+            wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Iterating for BUFFERS (client content with flame_shader ID %u)",
+                    wlr_output->name, server->shader_program);
+            wlr_scene_node_for_each_buffer(&server->scene->tree.node, scene_buffer_iterator, current_rdata);
+        } else {
+            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Client flame shader (shader_program) is 0.", wlr_output->name);
+        }
+
+    glBindVertexArray(0);
+    glUseProgram(0);
+}
+
+
+// Helper function to manually create a texture transform matrix (if wlr_matrix_texture_transform is missing)
+// This is a simplified version. A full one would handle all 8 transforms.
+// tex_coords are typically (0,0) top-left, (1,1) bottom-right.
+// Output geometry is (0,0) top-left for NORMAL.
+static void manual_texture_transform(float mat[static 9], enum wl_output_transform transform) {
+    wlr_matrix_identity(mat);
+    switch (transform) {
+        case WL_OUTPUT_TRANSFORM_NORMAL:
+            // mat is already identity
+            break;
+        case WL_OUTPUT_TRANSFORM_90:
+            // Rotate 90 deg clockwise around (0.5, 0.5)
+            // Tex (u,v) -> (v, 1-u)
+            // x' = 0*u + 1*v + 0
+            // y' = -1*u + 0*v + 1
+            // z' = 0*u + 0*v + 1
+            mat[0] = 0; mat[1] = -1; mat[2] = 0;
+            mat[3] = 1; mat[4] = 0;  mat[5] = 0;
+            mat[6] = 0; mat[7] = 1;  mat[8] = 1;
+            break;
+        case WL_OUTPUT_TRANSFORM_180:
+            // Tex (u,v) -> (1-u, 1-v)
+            mat[0] = -1; mat[1] = 0; mat[2] = 0;
+            mat[3] = 0;  mat[4] = -1;mat[5] = 0;
+            mat[6] = 1;  mat[7] = 1; mat[8] = 1;
+            break;
+        case WL_OUTPUT_TRANSFORM_270:
+            // Tex (u,v) -> (1-v, u)
+            mat[0] = 0; mat[1] = 1; mat[2] = 0;
+            mat[3] = -1;mat[4] = 0; mat[5] = 0;
+            mat[6] = 1; mat[7] = 0; mat[8] = 1;
+            break;
+        case WL_OUTPUT_TRANSFORM_FLIPPED:
+            // Tex (u,v) -> (1-u, v)
+            mat[0] = -1; mat[1] = 0; mat[2] = 0;
+            mat[3] = 0;  mat[4] = 1; mat[5] = 0;
+            mat[6] = 1;  mat[7] = 0; mat[8] = 1;
+            break;
+        case WL_OUTPUT_TRANSFORM_FLIPPED_90:
+            // Tex (u,v) -> (v, u) -- Check this one, flipped then 90
+            // Flipped: (1-u, v)
+            // Rot 90 on that: (v, 1-(1-u)) = (v, u)
+            mat[0] = 0; mat[1] = 1; mat[2] = 0;
+            mat[3] = 1; mat[4] = 0; mat[5] = 0;
+            mat[6] = 0; mat[7] = 0; mat[8] = 1;
+            break;
+        case WL_OUTPUT_TRANSFORM_FLIPPED_180:
+            // Tex (u,v) -> (u, 1-v)
+            mat[0] = 1; mat[1] = 0; mat[2] = 0;
+            mat[3] = 0; mat[4] = -1;mat[5] = 0;
+            mat[6] = 0; mat[7] = 1; mat[8] = 1;
+            break;
+        case WL_OUTPUT_TRANSFORM_FLIPPED_270:
+            // Tex (u,v) -> (1-v, 1-u) -- Check this one
+            // Flipped: (1-u, v)
+            // Rot 270 on that: (1-v, 1-(1-u)) = (1-v, u) -> NO, (1-v, 1-(1-u)) = (1-v, u)
+            // Rot 270 is (y, 1-x). So (v, 1-(1-u)) = (v, u) ... no this is wrong
+            // Flipped: (1-u, v)
+            // 270: (1-v', u') -> (1-v, 1-u)
+            mat[0] = 0; mat[1] = -1; mat[2] = 0;
+            mat[3] = -1;mat[4] = 0;  mat[5] = 0;
+            mat[6] = 1; mat[7] = 1;  mat[8] = 1;
+            break;
+    }
+}
+
+static bool setup_intermediate_framebuffer(struct tinywl_server *server, int width, int height) {
+    GLenum err;
+
+    struct wlr_egl *egl = wlr_gles2_renderer_get_egl(server->renderer);
+    if (!egl) {
+        wlr_log(WLR_ERROR, "setup_intermediate_framebuffer: Failed to get EGL from renderer.");
+        return false;
+    }
+    struct wlr_egl_context saved_ctx;
+    if (!wlr_egl_make_current(egl, &saved_ctx)) {
+        wlr_log(WLR_ERROR, "setup_intermediate_framebuffer: Failed to make EGL context current.");
+        return false;
+    }
+
+    while ((err = glGetError()) != GL_NO_ERROR) {
+        wlr_log(WLR_DEBUG, "setup_intermediate_framebuffer: Clearing pre-existing GL error: 0x%x", err);
+    }
+
+    if (server->intermediate_fbo != 0) {
+        if (server->intermediate_width != width || server->intermediate_height != height) {
+            wlr_log(WLR_INFO, "setup_intermediate_framebuffer: Resizing FBO from %dx%d to %dx%d",
+                    server->intermediate_width, server->intermediate_height, width, height);
+            glDeleteFramebuffers(1, &server->intermediate_fbo); server->intermediate_fbo = 0;
+            glDeleteTextures(1, &server->intermediate_texture); server->intermediate_texture = 0;
+            if (server->intermediate_rbo != 0) {
+                glDeleteRenderbuffers(1, &server->intermediate_rbo); server->intermediate_rbo = 0;
+            }
+        } else {
+            // Dimensions are the same, FBO can be reused.
+            // Context is already current from above.
+            return true; // No need to restore yet if FBO is fine
+        }
+    }
+    
+    glGenTextures(1, &server->intermediate_texture);
+    if ((err = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL error after glGenTextures: 0x%x", err); goto error_cleanup; }
+    
+    glBindTexture(GL_TEXTURE_2D, server->intermediate_texture);
+    if ((err = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL error after glBindTexture: 0x%x", err); goto error_cleanup; }
+    
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    if ((err = glGetError()) != GL_NO_ERROR) {
+        wlr_log(WLR_ERROR, "GL error after glTexImage2D(GL_RGBA8, %dx%d): 0x%x. Trying GL_RGBA.", width, height, err);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        if ((err = glGetError()) != GL_NO_ERROR) {
+             wlr_log(WLR_ERROR, "GL error after fallback glTexImage2D(GL_RGBA, %dx%d): 0x%x", width, height, err);
+             goto error_cleanup;
+        } else {
+            wlr_log(WLR_INFO, "Used fallback GL_RGBA for intermediate texture.");
+        }
+    }
+    
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    if ((err = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL error after glTexParameteri: 0x%x", err); goto error_cleanup; }
+
+    glGenFramebuffers(1, &server->intermediate_fbo);
+    if ((err = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL error after glGenFramebuffers: 0x%x", err); goto error_cleanup; }
+    
+    glBindFramebuffer(GL_FRAMEBUFFER, server->intermediate_fbo);
+    if ((err = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL error after glBindFramebuffer: 0x%x", err); goto error_cleanup; }
+    
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, server->intermediate_texture, 0);
+    if ((err = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL error after glFramebufferTexture2D: 0x%x", err); goto error_cleanup; }
+
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if ((err = glGetError()) != GL_NO_ERROR) {
+        wlr_log(WLR_ERROR, "GL error *during* glCheckFramebufferStatus call: 0x%x. FBO Status was reported as: 0x%x", err, status);
+    }
+
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        wlr_log(WLR_ERROR, "Intermediate framebuffer not complete. Status: 0x%x (width: %d, height: %d)", status, width, height);
+        switch (status) {
+            // GLES 2.0/3.0 Common Codes (OES suffixes might be needed depending on headers)
+            // If your headers define them without _OES, that's fine too.
+            case GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT: 
+                wlr_log(WLR_ERROR, " Reason: GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT"); break;
+            case GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT: 
+                wlr_log(WLR_ERROR, " Reason: GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT"); break;
+            case GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS: // Common in GLES
+                wlr_log(WLR_ERROR, " Reason: GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS"); break;
+            case GL_FRAMEBUFFER_UNSUPPORTED: 
+                wlr_log(WLR_ERROR, " Reason: GL_FRAMEBUFFER_UNSUPPORTED (format combination not supported)"); break;
+            
+            // GLES 3.0 specific (these might still cause issues if true GLES 3.0 context isn't fully active/supported by Zink here)
+            // For wider compatibility, you might comment these out if they still cause compilation errors.
+            // For GL_FRAMEBUFFER_UNDEFINED, it means the default framebuffer was queried, which shouldn't happen here.
+            // If `status` is 0, then the `default` case will catch it.
+#ifdef GL_FRAMEBUFFER_UNDEFINED 
+            case GL_FRAMEBUFFER_UNDEFINED: 
+                wlr_log(WLR_ERROR, " Reason: GL_FRAMEBUFFER_UNDEFINED (should not happen for non-default FBO)"); break;
+#endif
+#ifdef GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE
+            case GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE: 
+                wlr_log(WLR_ERROR, " Reason: GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE (GLES 3.0+)"); break;
+#endif
+            default: 
+                wlr_log(WLR_ERROR, " Reason: Unknown or less common FBO status code (0x%x). Could be 0 if glCheckFramebufferStatus itself failed.", status); break;
+        }
+        goto error_cleanup;
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);    
+    
+    server->intermediate_width = width;
+    server->intermediate_height = height;
+    
+    wlr_log(WLR_INFO, "Intermediate framebuffer created/verified: %dx%d, FBO ID: %u, Texture ID: %u",
+            width, height, server->intermediate_fbo, server->intermediate_texture);
+    wlr_egl_restore_context(&saved_ctx);
+    return true;
+
+error_cleanup:
+    if (server->intermediate_fbo != 0) {
+        glDeleteFramebuffers(1, &server->intermediate_fbo);
+        server->intermediate_fbo = 0;
+    }
+    if (server->intermediate_texture != 0) {
+        glDeleteTextures(1, &server->intermediate_texture);
+        server->intermediate_texture = 0;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    wlr_egl_restore_context(&saved_ctx);
+    return false;
+}
 
 
 static void output_frame(struct wl_listener *listener, void *data) {
@@ -2721,176 +3056,291 @@ static void output_frame(struct wl_listener *listener, void *data) {
     struct wlr_output *wlr_output = output_wrapper->wlr_output;
     struct tinywl_server *server = output_wrapper->server;
     struct wlr_scene *scene = server->scene;
+    struct wlr_renderer *renderer = server->renderer;
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
 
-    if (!wlr_output->enabled || !wlr_output->renderer || !wlr_output->allocator) {
+    struct wlr_output_state output_state_direct;
+    struct wlr_output_state output_state_effect;
+    struct wlr_render_pass *current_screen_pass = NULL;
+
+    // Early exit checks for output, renderer, allocator, scene_output
+    if (!wlr_output->enabled || !renderer || !server->allocator) {
         wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Output not ready.", wlr_output->name);
         struct wlr_scene_output *scene_output_early_exit = wlr_scene_get_scene_output(scene, wlr_output);
         if (scene_output_early_exit) wlr_scene_output_send_frame_done(scene_output_early_exit, &now);
         return;
     }
-
+    
     struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(scene, wlr_output);
     if (!scene_output) {
         wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] No scene_output.", wlr_output->name);
         return;
     }
 
-    // debug_scene_rendering(scene, wlr_output); // Keep for debugging if needed
+    bool apply_shrink_effect_this_frame = server->shrink_effect_active;
+    // Forcing the effect on to debug the fullscreen texture draw:
+    // apply_shrink_effect_this_frame = true;
 
-    struct wlr_output_state state;
-    wlr_output_state_init(&state);
-
-    struct wlr_scene_output_state_options opts = {0};
-    bool has_damage = wlr_scene_output_build_state(scene_output, &state, &opts);
-
-    if (!has_damage && !(state.committed & WLR_OUTPUT_STATE_BUFFER)) {
-        wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] No damage or buffer, skipping render.", wlr_output->name);
-        wlr_output_state_finish(&state);
-        wlr_scene_output_send_frame_done(scene_output, &now);
-        return;
+    if (apply_shrink_effect_this_frame) {
+        if (!setup_intermediate_framebuffer(server, wlr_output->width, wlr_output->height)) {
+            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to setup intermediate FBO. Disabling effect for this frame.", wlr_output->name);
+            apply_shrink_effect_this_frame = false;
+        }
     }
 
-    pixman_region32_t full_damage_region;
-    pixman_region32_init_rect(&full_damage_region, 0, 0, wlr_output->width, wlr_output->height);
-    wlr_output_state_set_damage(&state, &full_damage_region);
-    pixman_region32_fini(&full_damage_region);
+    struct render_data rdata_scene_render = {
+        .renderer = renderer,
+        .server = server,
+        .output = wlr_output,
+        .pass = NULL
+    };
 
-    struct wlr_render_pass *pass = wlr_output_begin_render_pass(wlr_output, &state, NULL);
-    if (!pass) {
-        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] wlr_output_begin_render_pass failed.", wlr_output->name);
-        wlr_output_state_finish(&state);
-        wlr_scene_output_send_frame_done(scene_output, &now);
-        return;
-    }
-
-    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    glViewport(0, 0, wlr_output->width, wlr_output->height);
-    glScissor(0, 0, wlr_output->width, wlr_output->height);
-    glEnable(GL_SCISSOR_TEST);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glDisable(GL_CULL_FACE);
-    glDisable(GL_DEPTH_TEST);
-
-    if (server->quad_vao == 0) {
-         wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Quad VAO is zero! Skipping custom draw.", wlr_output->name);
+    if (apply_shrink_effect_this_frame) {
+        // STAGE 1: Render to intermediate framebuffer
+        glBindFramebuffer(GL_FRAMEBUFFER, server->intermediate_fbo);
+        glViewport(0, 0, server->intermediate_width, server->intermediate_height);
+        glScissor(0, 0, server->intermediate_width, server->intermediate_height);
+        glEnable(GL_SCISSOR_TEST);
+        // Clear and common GL state for FBO rendering
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_DEPTH_TEST);
+        render_scene_content(server, wlr_output, &rdata_scene_render);
+        glDisable(GL_SCISSOR_TEST);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
     } else {
-        glBindVertexArray(server->quad_vao);
+        // Direct rendering path - using the detailed approach from paste-2
+        wlr_output_state_init(&output_state_direct);
+        struct wlr_scene_output_state_options opts = {0};
+        bool has_damage = wlr_scene_output_build_state(scene_output, &output_state_direct, &opts);
 
-        struct render_data rdata = {
-            .renderer = server->renderer,
-            .server = server,
-            .output = wlr_output,
-            .pass = pass
-        };
+        if (!has_damage && !(output_state_direct.committed & WLR_OUTPUT_STATE_BUFFER)) {
+            wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] No damage or buffer, skipping render.", wlr_output->name);
+            wlr_output_state_finish(&output_state_direct);
+            wlr_scene_output_send_frame_done(scene_output, &now);
+            return;
+        }
 
-        // --- Render Background, SSDs, and Panel Rects ---
-        // This simplified loop iterates all rects. render_rect_node differentiates.
-        // The panel is handled separately by render_panel_node.
-        wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Iterating for ALL RECTS (background, SSDs).", wlr_output->name);
-        struct wlr_scene_node *iter_node_lvl1; // Nodes directly under scene root
-        wl_list_for_each(iter_node_lvl1, &scene->tree.children, link) {
-            if (!iter_node_lvl1->enabled) {
-                continue;
-            }
+        pixman_region32_t full_damage_direct;
+        pixman_region32_init_rect(&full_damage_direct, 0, 0, wlr_output->width, wlr_output->height);
+        wlr_output_state_set_damage(&output_state_direct, &full_damage_direct);
+        pixman_region32_fini(&full_damage_direct);
 
-            if (iter_node_lvl1 == server->top_panel_node) {
-                // Skip panel here, render it specifically later
-                continue;
-            }
+        current_screen_pass = wlr_output_begin_render_pass(wlr_output, &output_state_direct, NULL);
+        if (!current_screen_pass) {
+            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] wlr_output_begin_render_pass failed.", wlr_output->name);
+            wlr_output_state_finish(&output_state_direct);
+            wlr_scene_output_send_frame_done(scene_output, &now);
+            return;
+        }
+        
+        rdata_scene_render.pass = current_screen_pass;
 
-            if (iter_node_lvl1->type == WLR_SCENE_NODE_RECT) {
-                // This is the main background or other top-level rects
-                render_rect_node(iter_node_lvl1, &rdata);
-            } else if (iter_node_lvl1->type == WLR_SCENE_NODE_TREE) {
-                // This is a toplevel's scene_tree. Iterate its children for SSD rects.
-                struct tinywl_toplevel *toplevel_ptr = iter_node_lvl1->data;
-                if (toplevel_ptr && toplevel_ptr->ssd.enabled) {
-                    struct wlr_scene_tree *toplevel_s_tree = wlr_scene_tree_from_node(iter_node_lvl1);
-                    struct wlr_scene_node *ssd_node_candidate;
-                    wl_list_for_each(ssd_node_candidate, &toplevel_s_tree->children, link) {
-                        if (ssd_node_candidate->enabled && ssd_node_candidate->type == WLR_SCENE_NODE_RECT) {
-                            // Check if this node is one of the SSD parts
-                            // This check is important to not accidentally re-render client content area if it was a rect
-                            if ( (toplevel_ptr->ssd.title_bar && ssd_node_candidate == &toplevel_ptr->ssd.title_bar->node) ||
-                                 (toplevel_ptr->ssd.border_left && ssd_node_candidate == &toplevel_ptr->ssd.border_left->node) ||
-                                 (toplevel_ptr->ssd.border_right && ssd_node_candidate == &toplevel_ptr->ssd.border_right->node) ||
-                                 (toplevel_ptr->ssd.border_bottom && ssd_node_candidate == &toplevel_ptr->ssd.border_bottom->node) ) {
-                                render_rect_node(ssd_node_candidate, &rdata);
+        // Clear and setup GL state for direct screen rendering
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glViewport(0, 0, wlr_output->width, wlr_output->height);
+        glScissor(0, 0, wlr_output->width, wlr_output->height);
+        glEnable(GL_SCISSOR_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_DEPTH_TEST);
+
+        if (server->quad_vao == 0) {
+            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Quad VAO is zero! Skipping custom draw.", wlr_output->name);
+        } else {
+            glBindVertexArray(server->quad_vao);
+
+            // --- Render Background, SSDs, and Panel Rects ---
+            wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Iterating for ALL RECTS (background, SSDs).", wlr_output->name);
+            struct wlr_scene_node *iter_node_lvl1;
+            wl_list_for_each(iter_node_lvl1, &scene->tree.children, link) {
+                if (!iter_node_lvl1->enabled) {
+                    continue;
+                }
+
+                if (iter_node_lvl1 == server->top_panel_node) {
+                    // Skip panel here, render it specifically later
+                    continue;
+                }
+
+                if (iter_node_lvl1->type == WLR_SCENE_NODE_RECT) {
+                    // This is the main background or other top-level rects
+                    render_rect_node(iter_node_lvl1, &rdata_scene_render);
+                } else if (iter_node_lvl1->type == WLR_SCENE_NODE_TREE) {
+                    // This is a toplevel's scene_tree. Iterate its children for SSD rects.
+                    struct tinywl_toplevel *toplevel_ptr = iter_node_lvl1->data;
+                    if (toplevel_ptr && toplevel_ptr->ssd.enabled) {
+                        struct wlr_scene_tree *toplevel_s_tree = wlr_scene_tree_from_node(iter_node_lvl1);
+                        struct wlr_scene_node *ssd_node_candidate;
+                        wl_list_for_each(ssd_node_candidate, &toplevel_s_tree->children, link) {
+                            if (ssd_node_candidate->enabled && ssd_node_candidate->type == WLR_SCENE_NODE_RECT) {
+                                // Check if this node is one of the SSD parts
+                                if ( (toplevel_ptr->ssd.title_bar && ssd_node_candidate == &toplevel_ptr->ssd.title_bar->node) ||
+                                     (toplevel_ptr->ssd.border_left && ssd_node_candidate == &toplevel_ptr->ssd.border_left->node) ||
+                                     (toplevel_ptr->ssd.border_right && ssd_node_candidate == &toplevel_ptr->ssd.border_right->node) ||
+                                     (toplevel_ptr->ssd.border_bottom && ssd_node_candidate == &toplevel_ptr->ssd.border_bottom->node) ) {
+                                    render_rect_node(ssd_node_candidate, &rdata_scene_render);
+                                }
                             }
                         }
                     }
                 }
             }
-        }
 
-        // --- Render Panel Node ---
-        if (server->top_panel_node && server->top_panel_node->enabled) {
-            if (server->panel_shader_program != 0) {
-                wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Rendering TOP PANEL node %p with panel_shader (ID: %u).",
-                        wlr_output->name, (void*)server->top_panel_node, server->panel_shader_program);
-                render_panel_node(server->top_panel_node, &rdata);
-            } else {
-                wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Panel shader program is 0, cannot render panel.", wlr_output->name);
+            // --- Render Panel Node ---
+            if (server->top_panel_node && server->top_panel_node->enabled) {
+                if (server->panel_shader_program != 0) {
+                    wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Rendering TOP PANEL node %p with panel_shader (ID: %u).",
+                            wlr_output->name, (void*)server->top_panel_node, server->panel_shader_program);
+                    render_panel_node(server->top_panel_node, &rdata_scene_render);
+                } else {
+                    wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Panel shader program is 0, cannot render panel.", wlr_output->name);
+                }
             }
-        }
 
- /*       // --- Render Client Window Buffers (using back_shader_program for background effect) ---
-        if (server->ssd_shader_program != 0) {
-            glUseProgram(server->ssd_shader_program);
-            wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Iterating for BUFFERS (client content with back_shader ID %u)",
-                    wlr_output->name, server->ssd_shader_program);
-            wlr_scene_node_for_each_buffer(&scene->tree.node, scene_buffer_iterator_main_window_only, &rdata);
-        } else {
-            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Client background effect shader (back_shader_program) is 0.", wlr_output->name);
-        }
+      /*      // --- Render Client Window Buffers (using back_shader_program for background effect) ---
+            if (server->ssd_shader_program != 0) {
+                glUseProgram(server->ssd_shader_program);
+                wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Iterating for BUFFERS (client content with back_shader ID %u)",
+                        wlr_output->name, server->ssd_shader_program);
+                wlr_scene_node_for_each_buffer(&scene->tree.node, scene_buffer_iterator_main_window_only, &rdata_scene_render);
+            } else {
+                wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Client background effect shader (back_shader_program) is 0.", wlr_output->name);
+            }
 */
-        // --- Render Client Window Buffers (using main shader_program for foreground effect like "Flame") ---
-        if (server->shader_program != 0) {
-            glUseProgram(server->shader_program);
-            wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Iterating for BUFFERS (client content with flame_shader ID %u)",
-                    wlr_output->name, server->shader_program);
-            wlr_scene_node_for_each_buffer(&scene->tree.node, scene_buffer_iterator, &rdata);
-        } else {
-            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Client flame shader (shader_program) is 0.", wlr_output->name);
+            // --- Render Client Window Buffers (using main shader_program for foreground effect like "Flame") ---
+            if (server->shader_program != 0) {
+                glUseProgram(server->shader_program);
+                wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Iterating for BUFFERS (client content with flame_shader ID %u)",
+                        wlr_output->name, server->shader_program);
+                wlr_scene_node_for_each_buffer(&scene->tree.node, scene_buffer_iterator, &rdata_scene_render);
+            } else {
+                wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Client flame shader (shader_program) is 0.", wlr_output->name);
+            }
+
+            glBindVertexArray(0);
+            glUseProgram(0);
         }
 
-        glBindVertexArray(0);
-        glUseProgram(0); // Unbind any active program
+        glDisable(GL_SCISSOR_TEST);
     }
 
+    // STAGE 2: Final composition to screen (if effect was active)
+    if (apply_shrink_effect_this_frame) {
+        wlr_output_state_init(&output_state_effect);
+        pixman_region32_t full_damage_effect;
+        pixman_region32_init_rect(&full_damage_effect, 0, 0, wlr_output->width, wlr_output->height);
+        wlr_output_state_set_damage(&output_state_effect, &full_damage_effect);
+        pixman_region32_fini(&full_damage_effect);
+
+        current_screen_pass = wlr_output_begin_render_pass(wlr_output, &output_state_effect, NULL);
+        if (!current_screen_pass) {
+            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to begin final effect pass for screen.", wlr_output->name);
+            wlr_output_state_finish(&output_state_effect);
+            goto cleanup_frame_and_send_done;
+        }
+
+        // Explicitly set viewport and scissor for the screen after starting the render pass
+        glViewport(0, 0, wlr_output->width, wlr_output->height);
+        glScissor(0, 0, wlr_output->width, wlr_output->height);
+        glEnable(GL_SCISSOR_TEST);
+
+        wlr_log(WLR_INFO, "[OUTPUT_FRAME_EFFECT_DRAW] Final Screen Viewport: 0,0,%d,%d. Scissor: 0,0,%d,%d",
+                wlr_output->width, wlr_output->height, wlr_output->width, wlr_output->height);
+
+        glClearColor(0.2f, 0.0f, 0.2f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+        if (server->quad_vao != 0 && server->fullscreen_shader_program != 0) {
+            glBindVertexArray(server->quad_vao);
+            glUseProgram(server->fullscreen_shader_program);
+
+            float effect_mvp[9];
+            wlr_matrix_identity(effect_mvp);
+
+            effect_mvp[0] = 2.0f;  // Scale X by 2
+            effect_mvp[4] = 2.0f;  // Scale Y by 2
+            effect_mvp[6] = -1.0f; // Translate X by -1
+            effect_mvp[7] = -1.0f; // Translate Y by -1
+
+            wlr_log(WLR_INFO, "[OUTPUT_FRAME_EFFECT_DRAW] Using manual MVP for fullscreen quad.");
+
+            if (server->fullscreen_shader_mvp_loc != -1) {
+                glUniformMatrix3fv(server->fullscreen_shader_mvp_loc, 1, GL_FALSE, effect_mvp);
+            }
+            if (server->fullscreen_shader_scene_tex_loc != -1) {
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, server->intermediate_texture);
+                glUniform1i(server->fullscreen_shader_scene_tex_loc, 0);
+            }
+
+            glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+
+            glBindTexture(GL_TEXTURE_2D, 0);
+            glBindVertexArray(0);
+            glUseProgram(0);
+        }
+
+        if (!wlr_render_pass_submit(current_screen_pass)) {
+            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to submit final effect pass.", wlr_output->name);
+        }
+        
+        if (output_state_effect.committed & WLR_OUTPUT_STATE_BUFFER && output_state_effect.buffer) {
+            pthread_mutex_lock(&rdp_transmit_mutex);
+            struct wlr_buffer *locked_buffer = wlr_buffer_lock(output_state_effect.buffer);
+            if (locked_buffer) { 
+                rdp_transmit_surface(locked_buffer); 
+                wlr_buffer_unlock(locked_buffer); 
+            } else { 
+                wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to lock buffer (effect path) for RDP.", wlr_output->name); 
+            }
+            pthread_mutex_unlock(&rdp_transmit_mutex);
+        }
+        wlr_output_state_finish(&output_state_effect);
+
+    } else if (current_screen_pass) { 
+        // Direct rendering path was taken - submit the render pass
+        if (!wlr_render_pass_submit(current_screen_pass)) {
+            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to submit direct render pass.", wlr_output->name);
+        }
+
+        // Check for GL errors after render pass submit
+        GLenum gl_err = glGetError();
+        if (gl_err != GL_NO_ERROR) {
+            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] GL error after render pass submit: 0x%x", wlr_output->name, gl_err);
+        }
+
+        if (output_state_direct.committed & WLR_OUTPUT_STATE_BUFFER && output_state_direct.buffer &&
+            output_state_direct.buffer->width > 0 && output_state_direct.buffer->height > 0) {
+            pthread_mutex_lock(&rdp_transmit_mutex);
+            struct wlr_buffer *locked_buffer = wlr_buffer_lock(output_state_direct.buffer);
+            if (locked_buffer) { 
+                rdp_transmit_surface(locked_buffer); 
+                wlr_buffer_unlock(locked_buffer); 
+            } else { 
+                wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to lock buffer (direct path) for RDP.", wlr_output->name); 
+            }
+            pthread_mutex_unlock(&rdp_transmit_mutex);
+        } else {
+            wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] No buffer to transmit or buffer invalid.", wlr_output->name);
+        }
+        wlr_output_state_finish(&output_state_direct);
+    }
+
+cleanup_frame_and_send_done:
     glDisable(GL_SCISSOR_TEST);
-
-    if (!wlr_render_pass_submit(pass)) {
-        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] wlr_render_pass_submit failed.", wlr_output->name);
-    }
-
-    GLenum gl_err = glGetError();
-    if (gl_err != GL_NO_ERROR) {
-        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] GL error after render pass submit: 0x%x", wlr_output->name, gl_err);
-    }
-
-    if (state.committed & WLR_OUTPUT_STATE_BUFFER && state.buffer &&
-        state.buffer->width > 0 && state.buffer->height > 0) {
-        pthread_mutex_lock(&rdp_transmit_mutex);
-        struct wlr_buffer *locked_buffer = wlr_buffer_lock(state.buffer);
-        if (locked_buffer) {
-            rdp_transmit_surface(locked_buffer);
-            wlr_buffer_unlock(locked_buffer);
-        } else {
-            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to lock buffer for RDP transmission.", wlr_output->name);
-        }
-        pthread_mutex_unlock(&rdp_transmit_mutex);
-    } else {
-        wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] No buffer to transmit or buffer invalid.", wlr_output->name);
-    }
-
-    wlr_output_state_finish(&state);
+    glDisable(GL_BLEND);
     wlr_scene_output_send_frame_done(scene_output, &now);
 }
+
+
 static void output_request_state(struct wl_listener *listener, void *data) {
     struct tinywl_output *output = wl_container_of(listener, output, request_state);
     const struct wlr_output_event_request_state *event = data;
@@ -4777,12 +5227,36 @@ static const char *ssd_fragment_shader_src =
     "    float final_alpha = original_alpha * shape_alpha_mask;\n"
     "    // --- End Individual Corner Control Rounded Masking ---\n"
     "\n"
-    "    frag_color = vec4(col, final_alpha*0.8);\n"
+    "    frag_color = vec4(col, final_alpha*0.8).bgra;\n"
     "}\n"
     "// --- End of Inigo Quilez's shader code (adapted) ---\n";
 
+// Add these near your other shader source strings
+static const char *fullscreen_vertex_shader_src =
+       "#version 300 es\n"
+       "precision mediump float;\n"
+       "layout(location = 0) in vec2 a_position_01;\n" // Vertices of the quad (0,0 to 1,1)
+       "layout(location = 1) in vec2 a_texcoord;\n"    // Texture coords for the quad (0,0 to 1,1)
+       "uniform mat3 mvp;\n"
+       "out vec2 v_texcoord_to_fs;\n"
+       "void main() {\n"
+       "    gl_Position = vec4((mvp * vec3(a_position_01, 1.0)).xy, 0.0, 1.0);\n"
+       // Pass texture coordinates directly. The FBO texture (scene content)
+       // will be mapped entirely onto the scaled quad.
+       "    v_texcoord_to_fs = a_texcoord;\n"
+       "}\n";
 
-
+static const char *fullscreen_fragment_shader_src =
+       "#version 300 es\n"
+       "precision mediump float;\n"
+       "in vec2 v_texcoord_to_fs;\n"
+       "out vec4 frag_color;\n"
+       "uniform sampler2D u_scene_texture;\n"
+       "void main() {\n"
+       "    vec4 original_color = texture(u_scene_texture, v_texcoord_to_fs);\n"
+       "    vec3 inverted_rgb = vec3(1.0) - original_color.rgb;\n" // Invert R, G, B
+       "    frag_color = vec4(inverted_rgb, original_color.a);\n"  // Keep original alpha
+       "}\n";
 
 
     setenv("MESA_VK_VERSION_OVERRIDE", "1.2", 1);
@@ -4821,6 +5295,7 @@ static const char *ssd_fragment_shader_src =
     }
 
     struct tinywl_server server = {0};
+    server.shrink_effect_active = false;
 
 // Initialize all lists
     wl_list_init(&server.toplevels);
@@ -4997,8 +5472,34 @@ const char *vendor = (const char *)glGetString(GL_VENDOR);
         wlr_log(WLR_ERROR, "Failed to create SSD Checkerboard shader program.");
         server_destroy(&server); return 1;
     }
+
+
+
+
+// /server.scale_down_effect_active = false; // Or true if you want it on by default
+
+    // ... (creation of your other shaders: flame, rect, panel, ssd, back) ...
+
+    // --- Create Fullscreen Shader (for Scaled Down Scene View) ---
+    struct shader_uniform_spec scaled_scene_uniforms[] = {
+        {"mvp", &server.fullscreen_shader_mvp_loc},
+        {"u_scene_texture", &server.fullscreen_shader_scene_tex_loc}
+        // Add time/resolution if your scaled_scene_fragment_shader_src uses them for other effects
+    };
+    if (!create_generic_shader_program(server.renderer, "ScaledSceneViewShader",
+                                     fullscreen_vertex_shader_src, // Use the VS that passes texcoords
+                                     fullscreen_fragment_shader_src, // Use the FS that samples u_scene_texture
+                                     &server.fullscreen_shader_program, // Store in fullscreen_shader_program
+                                     scaled_scene_uniforms,
+                                     sizeof(scaled_scene_uniforms) / sizeof(scaled_scene_uniforms[0]))) {
+        wlr_log(WLR_ERROR, "Failed to create scaled scene view shader program.");
+        server_destroy(&server); return 1;
+    }
+    wlr_log(WLR_INFO, "ScaledSceneViewShader (fullscreen_shader_program) created. MVP@%d, SceneTex@%d",
+            server.fullscreen_shader_mvp_loc, server.fullscreen_shader_scene_tex_loc);
+
     // Updated log message to be more accurate for the checkerboard shader
-    wlr_log(WLR_INFO, "SSDCheckerboardShader created (ID: %u). MVP@%d, Color@%d. (Unused: Time@%d, iResolution@%d)",
+    wlr_log(WLR_INFO, "SSDShader created (ID: %u). MVP@%d, Color@%d. (Unused: Time@%d, iResolution@%d)",
             server.ssd_shader_program,
             server.ssd_shader_mvp_loc,
             server.ssd_shader_color_loc,
