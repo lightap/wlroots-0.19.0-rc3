@@ -357,7 +357,7 @@ struct wl_listener pointer_motion;
     GLint ssd_shader_color_loc;
     GLint ssd_shader_time_loc;                  // NEW for SSD shader
     GLint ssd_shader_rect_pixel_dimensions_loc; // Was already there, now used as 
-
+ GLint ssd_shader_resolution_loc;
     struct wlr_scene_node *main_background_node;
 
     GLuint back_shader_program;
@@ -2383,8 +2383,7 @@ static void render_rect_node(struct wlr_scene_node *node, void *user_data) {
 
     GLuint program_to_use;
     GLint mvp_loc = -1, color_loc = -1, time_loc = -1, output_res_loc = -1, rect_dim_loc = -1;
-    // GLint current_ssd_rect_pixel_dims_loc = -1; // Not needed for this simple pattern
-
+    GLint rect_dim_loc_for_current_shader = -1; 
     bool is_main_background = (server->main_background_node == node);
 
     if (is_main_background) {
@@ -2394,13 +2393,16 @@ static void render_rect_node(struct wlr_scene_node *node, void *user_data) {
         time_loc = server->rect_shader_time_loc;
         output_res_loc = server->rect_shader_resolution_loc;
         rect_dim_loc = server->rect_shader_rect_res_loc; // If your Melt shader still uses this
+        rect_dim_loc_for_current_shader = rect_dim_loc; // Set this for consistency
     } else { // SSD
         program_to_use = server->ssd_shader_program;
         mvp_loc = server->ssd_shader_mvp_loc;
         color_loc = server->ssd_shader_color_loc;
-        time_loc = server->ssd_shader_time_loc; 
-        // No other uniforms needed for this simple SSD shader
+        time_loc = server->ssd_shader_time_loc;
+        output_res_loc = server->ssd_shader_resolution_loc;  
+        rect_dim_loc_for_current_shader = server->ssd_shader_rect_pixel_dimensions_loc;
     }
+    
 
     if (program_to_use == 0) {
         wlr_log(WLR_ERROR, "Cannot render rect %dx%d, shader program ID is 0 for purpose %s.",
@@ -2431,8 +2433,7 @@ static void render_rect_node(struct wlr_scene_node *node, void *user_data) {
         memcpy(mvp, base_mvp, sizeof(base_mvp));
     }
 
-   if (mvp_loc != -1) glUniformMatrix3fv(mvp_loc, 1, GL_FALSE, mvp);
-
+    if (mvp_loc != -1) glUniformMatrix3fv(mvp_loc, 1, GL_FALSE, mvp);
 
     // Set u_color (used by both Melt and current SSD shader for alpha)
     if (color_loc != -1) {
@@ -2460,8 +2461,20 @@ static void render_rect_node(struct wlr_scene_node *node, void *user_data) {
          }
     }
     
-   
-    // No other uniforms to set for the simple SSD shader beyond mvp and u_color
+    // Set rectangle dimensions for both shaders
+    if (rect_dim_loc_for_current_shader != -1) {
+        glUniform2f(rect_dim_loc_for_current_shader, scene_rect->width, scene_rect->height);
+        if (!is_main_background) {
+            wlr_log(WLR_ERROR, "[SSD_RENDER_RECT_DIM] Node %p: Setting rect_dimensions to (%.0f, %.0f)",
+                (void*)node, (float)scene_rect->width, (float)scene_rect->height);
+        }
+    } else {
+        if (!is_main_background) {
+            wlr_log(WLR_ERROR, "[SSD_RENDER_RECT_DIM_FAIL] Node %p: rect_dim_loc_for_current_shader is -1", (void*)node);
+        }
+    }
+
+    glUniform2f(output_res_loc, scene_rect->width, scene_rect->height);
 
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
 }
@@ -2825,9 +2838,9 @@ static void output_frame(struct wl_listener *listener, void *data) {
             }
         }
 
-        // --- Render Client Window Buffers (using back_shader_program for background effect) ---
-   /*     if (server->back_shader_program != 0) {
-            glUseProgram(server->back_shader_program);
+ /*       // --- Render Client Window Buffers (using back_shader_program for background effect) ---
+        if (server->ssd_shader_program != 0) {
+            glUseProgram(server->ssd_shader_program);
             wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Iterating for BUFFERS (client content with back_shader ID %u)",
                     wlr_output->name, server->ssd_shader_program);
             wlr_scene_node_for_each_buffer(&scene->tree.node, scene_buffer_iterator_main_window_only, &rdata);
@@ -3873,16 +3886,16 @@ int main(int argc, char *argv[]) {
 
 // Vertex shader for simple colored rectangles
 static const char *rect_vertex_shader_src =
-    "#version 300 es\n"
+        "#version 300 es\n"
     "precision mediump float;\n"
-    "in vec2 position;      // Vertex positions (0 to 1 for unit quad)\n"
-    "in vec2 texcoord;      // Vertex texture/local coordinates (also 0 to 1 if VAO is set up for it)\n"
-    "out vec2 v_texcoord;   // Pass local quad coordinates to fragment shader (for vignette)\n"
+    "layout(location = 0) in vec2 position;\n"    // Position at location 0
+    "layout(location = 1) in vec2 texcoord;\n"    // Texcoord at location 1
+    "out vec2 v_texcoord;\n"
     "uniform mat3 mvp;\n"
     "void main() {\n"
     "    vec3 pos_transformed = mvp * vec3(position, 1.0);\n"
     "    gl_Position = vec4(pos_transformed.xy, 0.0, 1.0);\n"
-    "    v_texcoord = texcoord; // Pass the VAO's texcoord attribute\n"
+    "    v_texcoord = texcoord;\n"
     "}\n";
 
 static const char *rect_fragment_shader_src =
@@ -3970,16 +3983,16 @@ static const char *rect_fragment_shader_src =
     "}\n";
 
 const char *vertex_shader_src =
-    "#version 300 es\n"
+        "#version 300 es\n"
     "precision mediump float;\n"
-    "in vec2 position;\n"
-    "in vec2 texcoord;\n" 
-    "out vec2 v_texcoord;\n" 
+    "layout(location = 0) in vec2 position;\n"    // Position at location 0
+    "layout(location = 1) in vec2 texcoord;\n"    // Texcoord at location 1
+    "out vec2 v_texcoord;\n"
     "uniform mat3 mvp;\n"
     "void main() {\n"
     "    vec3 pos_transformed = mvp * vec3(position, 1.0);\n"
     "    gl_Position = vec4(pos_transformed.xy, 0.0, 1.0);\n"
-    "    v_texcoord = position;\n" 
+    "    v_texcoord = texcoord;\n"
     "}\n";
 
 const char *fragment_shader_src = 
@@ -4118,16 +4131,16 @@ const char *fragment_shader_src =
 
 // Vertex shader for simple colored rectangles
 static const char *panel_vertex_shader_src =
-    "#version 300 es\n"
+        "#version 300 es\n"
     "precision mediump float;\n"
-    "in vec2 position;      // Vertex positions (0 to 1 for unit quad)\n"
-    "in vec2 texcoord;      // Vertex texture/local coordinates (also 0 to 1 if VAO is set up for it)\n"
-    "out vec2 v_texcoord;   // Pass local quad coordinates to fragment shader (for vignette)\n"
+    "layout(location = 0) in vec2 position;\n"    // Position at location 0
+    "layout(location = 1) in vec2 texcoord;\n"    // Texcoord at location 1
+    "out vec2 v_texcoord;\n"
     "uniform mat3 mvp;\n"
     "void main() {\n"
     "    vec3 pos_transformed = mvp * vec3(position, 1.0);\n"
     "    gl_Position = vec4(pos_transformed.xy, 0.0, 1.0);\n"
-    "    v_texcoord = texcoord; // Pass the VAO's texcoord attribute\n"
+    "    v_texcoord = texcoord;\n"
     "}\n";
 /*
 static const char *panel_fragment_shader_src = 
@@ -4262,7 +4275,7 @@ static const char *panel_fragment_shader_src =
     "    frag_color = final_pixel_color.bgra;\n"
     "}";
 */
-    
+
 static const char *panel_fragment_shader_src =
     "#version 300 es\n"
     "precision mediump float;\n"
@@ -4388,16 +4401,16 @@ static const char *panel_fragment_shader_src =
 
 
 const char *back_vertex_shader_src =
-    "#version 300 es\n"
+        "#version 300 es\n"
     "precision mediump float;\n"
-    "in vec2 position;\n"
-    "in vec2 texcoord;\n" 
-    "out vec2 v_texcoord;\n" 
+    "layout(location = 0) in vec2 position;\n"    // Position at location 0
+    "layout(location = 1) in vec2 texcoord;\n"    // Texcoord at location 1
+    "out vec2 v_texcoord;\n"
     "uniform mat3 mvp;\n"
     "void main() {\n"
     "    vec3 pos_transformed = mvp * vec3(position, 1.0);\n"
     "    gl_Position = vec4(pos_transformed.xy, 0.0, 1.0);\n"
-    "    v_texcoord = position;\n" 
+    "    v_texcoord = texcoord;\n"
     "}\n";
 
 const char *back_fragment_shader_src =   
@@ -4543,159 +4556,195 @@ const char *back_fragment_shader_src =
     "}";
 
 static const char *ssd_vertex_shader_src =
-    "#version 300 es\n"
+       "#version 300 es\n"
     "precision mediump float;\n"
-    "in vec2 position;      // Vertex positions (0 to 1 for unit quad)\n"
-    "in vec2 texcoord;      // Vertex texture/local coordinates (also 0 to 1 if VAO is set up for it)\n"
-    "out vec2 v_texcoord;   // Pass local quad coordinates to fragment shader (for vignette)\n"
+    "layout(location = 0) in vec2 position;\n"    // Position at location 0
+    "layout(location = 1) in vec2 texcoord;\n"    // Texcoord at location 1
+    "out vec2 v_texcoord;\n"
     "uniform mat3 mvp;\n"
     "void main() {\n"
     "    vec3 pos_transformed = mvp * vec3(position, 1.0);\n"
     "    gl_Position = vec4(pos_transformed.xy, 0.0, 1.0);\n"
-    "    v_texcoord = texcoord; // Pass the VAO's texcoord attribute\n"
+    "    v_texcoord = texcoord;\n"
     "}\n";
 
 
 static const char *ssd_fragment_shader_src =
+  "/* Octgrams shader converted to panel format, with curved corners using v_texcoord */\n"
     "#version 300 es\n"
     "precision mediump float;\n"
     "\n"
-    "// Uniforms from the original context\n"
-    "uniform vec4 u_color;   // Base tint and alpha from the compositor\n"
-    "uniform float time;     // Time uniform for animation (used as iTime)\n"
-    "uniform mat3 mvp;       // MVP matrix (kept as requested, not used by this shader's core logic)\n"
+    "in vec2 v_texcoord; // IMPORTANT: This MUST be correctly supplied for the panel's quad\n"
+    "out vec4 frag_color;\n"
     "\n"
-    "out vec4 frag_color;    // Output fragment color\n"
+    "uniform float time;\n"
+    "uniform vec2 iResolution; // Resolution of the viewport/target this shader draws to\n"
     "\n"
-    "// --- Start of Inigo Quilez's shader code (adapted) ---\n"
-    "// Copyright Inigo Quilez, 2013 - https://iquilezles.org/\n"
-    "// I am the sole copyright owner of this Work.\n"
-    "// You cannot host, display, distribute or share this Work neither\n"
-    "// as it is or altered, here on Shadertoy or anywhere else, in any\n"
-    "// form including physical and digital. You cannot use this Work in any\n"
-    "// commercial or non-commercial product, website or project. You cannot\n"
-    "// sell this Work and you cannot mint an NFTs of it or train a neural\n"
-    "// network with it without permission. I share this Work for educational\n"
-    "// purposes, and you can link to it, through an URL, proper attribution\n"
-    "// and unmodified screenshot, as part of your educational material. If\n"
-    "// these conditions are too restrictive please contact me and we'll\n"
-    "// definitely work it out.\n"
+    "float gTime = 0.0;\n"
+    "const float REPEAT = 5.0;\n"
     "\n"
-    "// See here for a tutorial on how to make this:\n"
-    "//\n"
-    "// https://iquilezles.org/articles/warp\n"
-    "\n"
-    "//====================================================================\n"
-    "\n"
-    "const mat2 m = mat2( 0.80,  0.60, -0.60,  0.80 );\n"
-    "\n"
-    "float noise( in vec2 p )\n"
-    "{\n"
-    "   return sin(p.x)*sin(p.y);\n"
+    "mat2 rot(float a) {\n"
+    "    float c = cos(a), s = sin(a);\n"
+    "    return mat2(c,s,-s,c);\n"
     "}\n"
     "\n"
-    "float fbm4( vec2 p )\n"
-    "{\n"
-    "    float f = 0.0;\n"
-    "    f += 0.5000*noise( p ); p = m*p*2.02;\n"
-    "    f += 0.2500*noise( p ); p = m*p*2.03;\n"
-    "    f += 0.1250*noise( p ); p = m*p*2.01;\n"
-    "    f += 0.0625*noise( p );\n"
-    "    return f/0.9375;\n"
+    "float sdBox( vec3 p, vec3 b ) {\n"
+    "    vec3 q = abs(p) - b;\n"
+    "    return length(max(q,0.0)) + min(max(q.x,max(q.y,q.z)),0.0);\n"
     "}\n"
     "\n"
-    "float fbm6( vec2 p )\n"
-    "{\n"
-    "    float f = 0.0;\n"
-    "    f += 0.500000*(0.5+0.5*noise( p )); p = m*p*2.02;\n"
-    "    f += 0.250000*(0.5+0.5*noise( p )); p = m*p*2.03;\n"
-    "    f += 0.125000*(0.5+0.5*noise( p )); p = m*p*2.01;\n"
-    "    f += 0.062500*(0.5+0.5*noise( p )); p = m*p*2.04;\n"
-    "    f += 0.031250*(0.5+0.5*noise( p )); p = m*p*2.01;\n"
-    "    f += 0.015625*(0.5+0.5*noise( p ));\n"
-    "    return f/0.96875;\n"
-    "}\n"
-    "\n"
-    "vec2 fbm4_2( vec2 p )\n"
-    "{\n"
-    "    return vec2(fbm4(p), fbm4(p+vec2(7.8)));\n"
-    "}\n"
-    "\n"
-    "vec2 fbm6_2( vec2 p )\n"
-    "{\n"
-    "    return vec2(fbm6(p+vec2(16.8)), fbm6(p+vec2(11.5)));\n"
-    "}\n"
-    "\n"
-    "//====================================================================\n"
-    "\n"
-    "// Input 'time' (original uniform) is used instead of 'iTime' from Shadertoy\n"
-    "float func( vec2 q, out vec4 ron )\n"
-    "{\n"
-    "    q += 0.03*sin( vec2(0.27,0.23)*time*10.0 + length(q)*vec2(4.1,4.3));\n"
-    "\n"
-    "   vec2 o = fbm4_2( 0.9*q );\n"
-    "\n"
-    "    o += 0.04*sin( vec2(0.12,0.14)*time*10.0 + length(o));\n"
-    "\n"
-    "    vec2 n = fbm6_2( 3.0*o );\n"
-    "\n"
-    "   ron = vec4( o, n );\n"
-    "\n"
-    "    float f = 0.5 + 0.5*fbm4( 1.8*q + 6.0*n );\n"
-    "\n"
-    "    return mix( f, f*f*f*3.5, f*abs(n.x) );\n"
-    "}\n"
-    "\n"
-    "void main()\n"
-    "{\n"
-    "    // Using a hardcoded resolution, similar to iResolution in Shadertoy.\n"
-    "    // The original shader also used a hardcoded vec2 R = vec2(1920.0, 1080.0);\n"
-    "    // This value should be adjusted if your target resolution is different.\n"
-    "    vec2 iResolution = vec2(1920.0, 1080.0);\n"
-    "\n"
-    "    // Calculate normalized coordinates 'p' from gl_FragCoord.xy (pixel coordinates)\n"
-    "    // This matches the Shadertoy convention: vec2 p = (2.0*fragCoord-iResolution.xy)/iResolution.y;\n"
-    "    vec2 p = (2.0*gl_FragCoord.xy - iResolution.xy) / iResolution.y;\n"
-    "    float e = 2.0 / iResolution.y; // Small epsilon for derivatives, based on resolution\n"
-    "\n"
-    "    vec4 on = vec4(0.0); // Will store intermediate values 'o' and 'n' from func\n"
-    "    float f = func(p, on); // Call the main pattern generation function\n"
-    "\n"
-    "   vec3 col = vec3(0.0);\n"
-    "    col = mix( vec3(0.2,0.1,0.4), vec3(0.3,0.05,0.05), f );\n"
-    "    col = mix( col, vec3(0.9,0.9,0.9), dot(on.zw,on.zw) ); // on.zw corresponds to 'n'\n"
-    "    col = mix( col, vec3(0.0,0.0,0.9), 0.2 + 0.5*on.y*on.y ); // on.y corresponds to 'o.y'\n"
-    "    col = mix( col, vec3(0.9,0.2,0.2), 0.5*smoothstep(1.2,1.3,abs(on.z)+abs(on.w)) ); // on.z, on.w are n.x, n.y\n"
-    "    col = clamp( col*f*2.0, 0.0, 1.0 );\n"
+    "// Helper function for Signed Distance to a 2D Box with individual corner control\n"
+    "// p: point to sample in pixel coordinates\n"
+    "// b: half-extents of the box in pixel coordinates\n"
+    "// r: corner radius in pixels\n"
+    "float sdfTopRoundBox2D(vec2 p, vec2 b, float r) {\n"
+    "    r = min(r, min(b.x, b.y)); // Clamp radius to prevent issues with small rectangles\n"
     "    \n"
-    "#if 0\n"
-    "    // GPU derivatives - bad quality, but fast\n"
-    "    // Uses iResolution.x and iResolution.y for scaling derivatives\n"
-    "   vec3 nor = normalize( vec3( dFdx(f)*iResolution.x*10.0, 6.0, dFdy(f)*iResolution.y*10.0 ) );\n"
-    "#else\n"
-    "    // Manual derivatives - better quality, but slower\n"
-    "    vec4 kk; // Dummy 'out' variable for func calls\n"
-    "   vec3 nor = normalize( vec3( func(p+vec2(e,0.0),kk)-f, \n"
-    "                                2.0*e, \n"
-    "                                func(p+vec2(0.0,e),kk)-f ) );\n"
-    "#endif\n"
-    "\n"
-    "    vec3 lig = normalize( vec3( 0.9, 0.2, -0.4 ) );\n"
-    "    float dif = clamp( 0.3+0.7*dot( nor, lig ), 0.0, 1.0 );\n"
-    "    vec3 lin = vec3(0.70,0.90,0.95)*(nor.y*0.5+0.5) + vec3(0.15,0.10,0.05)*dif;\n"
-    "    col *= 1.2*lin;\n"
-    "   col = 1.0 - col; // Invert colors\n"
-    "   col = 1.1*col*col; // Apply contrast/gamma like effect\n"
+    "    // **Top Left**: roundTopLeft = true (ROUNDED)\n"
+    "    // **Top Right**: roundTopRight = true (ROUNDED)\n"
+    "    // **Bottom Left**: roundBottomLeft = false (SHARP)\n"
+    "    // **Bottom Right**: roundBottomRight = false (SHARP)\n"
+    "    bool roundTopLeft = false;\n"
+    "    bool roundTopRight = false;\n"
+    "    bool roundBottomLeft = true;\n"
+    "    bool roundBottomRight = true;\n"
     "    \n"
-    "    // Use alpha from u_color uniform, as in the original shader structure\n"
-    "    float final_alpha = u_color.a > 0.0 ? u_color.a : 1.0;\n"
+    "    // Determine which corner we're in\n"
+    "    bool inTopLeft = (p.x < -b.x + r && p.y > b.y - r);\n"
+    "    bool inTopRight = (p.x > b.x - r && p.y > b.y - r);\n"
+    "    bool inBottomLeft = (p.x < -b.x + r && p.y < -b.y + r);\n"
+    "    bool inBottomRight = (p.x > b.x - r && p.y < -b.y + r);\n"
     "    \n"
-    "    frag_color = vec4( col, 0.9 ); // Set the final fragment color\n"
+    "    // Apply rounding to specific corners\n"
+    "    if (inTopLeft && roundTopLeft) {\n"
+    "        vec2 corner_center = vec2(-b.x + r, b.y - r);\n"
+    "        return length(p - corner_center) - r;\n"
+    "    }\n"
+    "    else if (inTopRight && roundTopRight) {\n"
+    "        vec2 corner_center = vec2(b.x - r, b.y - r);\n"
+    "        return length(p - corner_center) - r;\n"
+    "    }\n"
+    "    else if (inBottomLeft && roundBottomLeft) {\n"
+    "        vec2 corner_center = vec2(-b.x + r, -b.y + r);\n"
+    "        return length(p - corner_center) - r;\n"
+    "    }\n"
+    "    else if (inBottomRight && roundBottomRight) {\n"
+    "        vec2 corner_center = vec2(b.x - r, -b.y + r);\n"
+    "        return length(p - corner_center) - r;\n"
+    "    }\n"
+    "    \n"
+    "    // Default to regular box SDF for all other areas\n"
+    "    vec2 q = abs(p) - b;\n"
+    "    return max(q.x, q.y);\n"
     "}\n"
-    "// --- End of Inigo Quilez's shader code (adapted) ---\n";
-
-// ... (rest of your includes and global definitions) ...
-
+    "\n"
+    "float box(vec3 pos, float scale) {\n"
+    "    pos *= scale;\n"
+    "    float base = sdBox(pos, vec3(.4,.4,.1)) /1.5;\n"
+    "    pos.xy *= 5.0;\n"
+    "    pos.y -= 3.5;\n"
+    "    pos.xy *= rot(.75);\n"
+    "    float result = -base;\n"
+    "    return result;\n"
+    "}\n"
+    "\n"
+    "float box_set(vec3 pos, float iTime) {\n"
+    "    vec3 pos_origin = pos;\n"
+    "    pos = pos_origin;\n"
+    "    pos.y += sin(gTime * 0.4) * 2.5;\n"
+    "    pos.xy *= rot(.8);\n"
+    "    float box1 = box(pos,2.0 - abs(sin(gTime * 0.4)) * 1.5);\n"
+    "    pos = pos_origin;\n"
+    "    pos.y -=sin(gTime * 0.4) * 2.5;\n"
+    "    pos.xy *= rot(.8);\n"
+    "    float box2 = box(pos,2.0 - abs(sin(gTime * 0.4)) * 1.5);\n"
+    "    pos = pos_origin;\n"
+    "    pos.x +=sin(gTime * 0.4) * 2.5;\n"
+    "    pos.xy *= rot(.8);\n"
+    "    float box3 = box(pos,2.0 - abs(sin(gTime * 0.4)) * 1.5);\n"
+    "    pos = pos_origin;\n"
+    "    pos.x -=sin(gTime * 0.4) * 2.5;\n"
+    "    pos.xy *= rot(.8);\n"
+    "    float box4 = box(pos,2.0 - abs(sin(gTime * 0.4)) * 1.5);\n"
+    "    pos = pos_origin;\n"
+    "    pos.xy *= rot(.8);\n"
+    "    float box5 = box(pos,.5) * 6.0;\n"
+    "    pos = pos_origin;\n"
+    "    float box6 = box(pos,.5) * 6.0;\n"
+    "    float result = max(max(max(max(max(box1,box2),box3),box4),box5),box6);\n"
+    "    return result;\n"
+    "}\n"
+    "\n"
+    "float map(vec3 pos, float iTime) {\n"
+    "    vec3 pos_origin = pos;\n"
+    "    float box_set1 = box_set(pos, iTime);\n"
+    "    return box_set1;\n"
+    "}\n"
+    "\n"
+    "void main() {\n"
+    "    // Scene rendering part (uses gl_FragCoord to map to the effect space)\n"
+    "    vec2 fragCoord_for_scene = gl_FragCoord.xy;\n"
+    "    float iTime = time;\n"
+    "    \n"
+    "    vec2 p_scene = (fragCoord_for_scene * 2.0 - iResolution.xy) / min(iResolution.x, iResolution.y);\n"
+    "    vec3 ro = vec3(0.0, -0.2, iTime * 4.0);\n"
+    "    vec3 ray = normalize(vec3(p_scene, 1.5));\n"
+    "    ray.xy = ray.xy * rot(sin(iTime * .03) * 5.0);\n"
+    "    ray.yz = ray.yz * rot(sin(iTime * .05) * .2);\n"
+    "    float t = 0.1;\n"
+    "    vec3 col = vec3(0.0);\n"
+    "    float ac = 0.0;\n"
+    "    \n"
+    "    for (int i = 0; i < 99; i++){\n"
+    "        vec3 pos = ro + ray * t;\n"
+    "        pos = mod(pos-2.0, 4.0) -2.0;\n"
+    "        gTime = iTime -float(i) * 0.01;\n"
+    "        \n"
+    "        float d = map(pos, iTime);\n"
+    "        d = max(abs(d), 0.01);\n"
+    "        ac += exp(-d*23.0);\n"
+    "        t += d* 0.55;\n"
+    "    }\n"
+    "    \n"
+    "    col = vec3(ac * 0.02);\n"
+    "    col +=vec3(0.0,0.2 * abs(sin(iTime)),0.5 + sin(iTime) * 0.2);\n"
+    "    \n"
+    "    // --- Individual Corner Control Rounded Masking with FIXED 40px corner radius ---\n"
+    "    // Convert v_texcoord [0,1] to actual pixel coordinates from center\n"
+    "    // This ensures the coordinate system matches the actual pixel dimensions\n"
+    "    vec2 pixel_pos = (v_texcoord - 0.5) * iResolution;\n"
+    "\n"
+    "    // Half-extents of the rectangle in pixels\n"
+    "    vec2 box_half_extents_pixels = iResolution * 0.5;\n"
+    "    \n"
+    "    // FIXED corner radius in pixels - this will always be 40 pixels regardless of shape size\n"
+    "    float corner_radius_pixels = 40.0;\n"
+    "\n"
+    "    // Calculate signed distance to the selectively-rounded rectangle edge in pixels\n"
+    "    float dist_to_edge = sdfTopRoundBox2D(pixel_pos, box_half_extents_pixels, corner_radius_pixels);\n"
+    "\n"
+    "    // Antialiasing width in pixels (using 2.0 for smoother edges with larger radius)\n"
+    "    float aa_pixels = 2.0;\n"
+    "    \n"
+    "    // Create alpha mask: 1.0 inside, 0.0 outside, smooth transition at the edge\n"
+    "    float shape_alpha_mask;\n"
+    "    if (dist_to_edge > aa_pixels * 0.5) {\n"
+    "        shape_alpha_mask = 0.0; // Completely outside - fully transparent\n"
+    "    } else if (dist_to_edge < -aa_pixels * 0.5) {\n"
+    "        shape_alpha_mask = 1.0; // Completely inside - fully opaque\n"
+    "    } else {\n"
+    "        // Smooth transition zone\n"
+    "        shape_alpha_mask = 1.0 - smoothstep(-aa_pixels * 0.5, aa_pixels * 0.5, dist_to_edge);\n"
+    "    }\n"
+    "    \n"
+    "    shape_alpha_mask = clamp(shape_alpha_mask, 0.0, 1.0);\n"
+    "\n"
+    "    float original_alpha = 0.6; // Original alpha of the content\n"
+    "    float final_alpha = original_alpha * shape_alpha_mask;\n"
+    "    // --- End Individual Corner Control Rounded Masking ---\n"
+    "\n"
+    "    frag_color = vec4(col, final_alpha).bgra;\n"
+    "}";
     setenv("MESA_VK_VERSION_OVERRIDE", "1.2", 1);
     setenv("MESA_LOADER_DRIVER_OVERRIDE", "zink", 1);
    // setenv("GALLIUM_DRIVER", "zink", 1);
@@ -4894,7 +4943,8 @@ const char *vendor = (const char *)glGetString(GL_VENDOR);
         // These are not used by the checkerboard shader, so their locations will be -1.
         // This is fine as render_rect_node doesn't try to set them for SSDs.
         {"time", &server.ssd_shader_time_loc},
-        {"iResolution", &server.ssd_shader_rect_pixel_dimensions_loc}
+         {"u_rectPixelDimensions", &server.ssd_shader_rect_pixel_dimensions_loc},
+         {"iResolution", &server.ssd_shader_resolution_loc},
     };
 
     // Use the correctly named global shader sources
@@ -4966,11 +5016,12 @@ wlr_log(WLR_INFO, "SSDColorShader created (ID: %u). MVP@%d, Color@%d",
     if (wlr_egl_make_current(egl_main, NULL)) {
         while ((err_main = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error main A (after make_current): 0x%x", err_main); }
 
-        const GLfloat verts[] = { 
-            0.0f, 0.0f, 0.0f, 1.0f, 
-            1.0f, 0.0f, 1.0f, 1.0f, 
-            0.0f, 1.0f, 0.0f, 0.0f, 
-            1.0f, 1.0f, 1.0f, 0.0f, 
+       const GLfloat verts[] = {
+            // positions // texcoords (Y flipped from your original)
+            0.0f, 0.0f,  0.0f, 0.0f, // Top-left quad -> Tex (0,0)
+            1.0f, 0.0f,  1.0f, 0.0f, // Top-right quad -> Tex (1,0)
+            0.0f, 1.0f,  0.0f, 1.0f, // Bottom-left quad -> Tex (0,1)
+            1.0f, 1.0f,  1.0f, 1.0f, // Bottom-right quad -> Tex (1,1)
         };
         const GLuint indices[] = {0, 1, 2, 1, 3, 2}; 
 
@@ -5012,12 +5063,27 @@ wlr_log(WLR_INFO, "SSDColorShader created (ID: %u). MVP@%d, Color@%d",
         } else { wlr_log(WLR_INFO, "Texcoord attribute NOT FOUND (OK for solid color shader but VS still declares it)."); }
         while ((err_main = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error main K (after texcoord attrib setup): 0x%x", err_main); }
 
-        glBindVertexArray(0); 
-        glBindBuffer(GL_ARRAY_BUFFER, 0); 
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0); 
-        wlr_egl_unset_current(egl_main);
-        while ((err_main = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error after VAO setup in main (unbinding): 0x%x", err_main); }
-    } else { 
+        
+    glBindVertexArray(server.quad_vao); // Bind the VAO you want to configure
+
+    glBindBuffer(GL_ARRAY_BUFFER, server.quad_vbo);
+    // Position attribute at fixed location 0
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)0);
+    wlr_log(WLR_DEBUG, "VAO Setup: Enabled attrib 0 for position");
+
+    // Texcoord attribute at fixed location 1
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)(2 * sizeof(GLfloat)));
+    wlr_log(WLR_DEBUG, "VAO Setup: Enabled attrib 1 for texcoord");
+
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, server.quad_ibo); // Bind IBO to VAO
+
+    glBindVertexArray(0); // Unbind VAO
+    glBindBuffer(GL_ARRAY_BUFFER, 0); // Unbind VBO
+    // glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0); // Don't unbind IBO while VAO is bound usually, but okay after VAO is unbound.
+    wlr_egl_unset_current(egl_main);
+} else {
         wlr_log(WLR_ERROR, "Failed to make EGL context current for quad VBO setup in main");
         server_destroy(&server);
         // return 1; // Or handle error appropriately
