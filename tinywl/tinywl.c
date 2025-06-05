@@ -390,6 +390,9 @@ struct wl_listener pointer_motion;
  GLint fullscreen_shader_resolution_loc;
 
 
+   // GLint fullscreen_shader_current_quad_loc;   
+
+
 // Add these new zoom uniform locations:
     GLint fullscreen_shader_zoom_loc;
     GLint fullscreen_shader_zoom_center_loc;
@@ -3329,7 +3332,19 @@ static void output_frame(struct wl_listener *listener, void *data) {
                 glUniform2fv(server->fullscreen_shader_zoom_center_loc, 1, center_for_shader);
             }
 
-            glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+           // Set the target quadrant once (the one that should expand)
+// Set the target quadrant once (which quadrant should expand)
+int target_quadrant = 0; // Example: expand quadrant 1 (top-right)
+if (server->fullscreen_shader_quadrant_loc != -1) {
+    glUniform1i(server->fullscreen_shader_quadrant_loc, target_quadrant);
+}
+
+// Loop through all quadrants to draw each one
+//if (server->fullscreen_shader_current_quad_loc != -1) {
+    
+      //  glUniform1i(server->fullscreen_shader_current_quad_loc, 1);
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+
 
             glBindTexture(GL_TEXTURE_2D, 0);
             glBindVertexArray(0);
@@ -5202,70 +5217,139 @@ static const char *fullscreen_fragment_shader_src =
 
 
 
+
+/*interesting effcet
 static const char *fullscreen_vertex_shader_src =
        "#version 300 es\n"
        "precision mediump float;\n"
-       "layout(location = 0) in vec2 a_position_01; // Quad vertices (typically 0,0 to 1,1)\n"
-       "layout(location = 1) in vec2 a_texcoord;    // Texture coords (0,0 to 1,1)\n"
+       "layout(location = 0) in vec2 a_position_01;\n"
+       "layout(location = 1) in vec2 a_texcoord;\n"
        "\n"
-       "uniform mat3 mvp;           // Transforms a [0,1] quad to fullscreen NDC (e.g. scale by 2, translate by -1)\n"
+       // MVP is not directly used by this shader logic for positioning quadrants
+       // uniform mat3 mvp; \n"
+       "uniform float u_zoom;        // Main Q0 zoom: 1.0 (normal) to 2.0 (Q0 fullscreen)\n"
+       "uniform int u_quadrant;      // <<< ORIGINAL AND CONSISTENT NAME NOW\n"
        "\n"
-       "// u_zoom: Geometric scale factor for the quad itself.\n"
-       "// 1.0 = normal size (quadrant takes its designated quarter of the screen).\n"
-       "// >1.0 = ZOOM IN (quadrant appears larger on screen).\n"
-       "// <1.0 = ZOOM OUT (quadrant appears smaller on screen).\n"
-       "uniform float u_zoom;\n"
+       "out vec2 v_texcoord_to_fs;\n"
        "\n"
-       "// u_zoom_center: The point in a_position_01's [0,1] space around which to scale.\n"
-       "uniform vec2 u_zoom_center; // e.g., (0.5, 0.5) to scale from the center of the quad.\n"
+       "const float ANIM_PARAM_MAX = 1.0; \n"
+       "\n"
+       "void main() {\n"
+       "    vec2 final_ndc_pos;\n"
+       "    float t_anim = (u_zoom - 1.0) / ANIM_PARAM_MAX; \n"
+       "    t_anim = clamp(t_anim, 0.0, 1.0);\n"
+       "\n"
+       "    if (u_quadrant == 0) { // MAIN ZOOMING QUADRANT (Top-Left)\n"
+       "        float main_quad_ndc_span = 1.0 + t_anim;\n"
+       "        final_ndc_pos.x = -1.0 + (a_position_01.x * main_quad_ndc_span);\n"
+       "        final_ndc_pos.y =  1.0 - (a_position_01.y * main_quad_ndc_span);\n"
+       "\n"
+       "    } else { // --- Other (non-main) quadrants --- \n"
+       "        float other_quad_scale = 1.0 - t_anim;\n"
+       "        vec2 quad_min_ndc, quad_max_ndc, anchor_ndc;\n"
+       "\n"
+       "        if (u_quadrant == 1) { // Top-Right Quadrant\n"
+       "            quad_min_ndc = vec2(0.0, 0.0);\n"
+       "            quad_max_ndc = vec2(1.0, 1.0);\n"
+       "            anchor_ndc   = vec2(1.0, 1.0);\n"
+       "        } else if (u_quadrant == 2) { // Bottom-Left Quadrant\n"
+       "            quad_min_ndc = vec2(-1.0, -1.0);\n"
+       "            quad_max_ndc = vec2(0.0, 0.0);\n"
+       "            anchor_ndc   = vec2(-1.0, -1.0);\n"
+       "        } else { // u_quadrant == 3, Bottom-Right Quadrant\n"
+       "            quad_min_ndc = vec2(0.0, -1.0);\n"
+       "            quad_max_ndc = vec2(1.0, 0.0);\n"
+       "            anchor_ndc   = vec2(1.0, -1.0);\n"
+       "        }\n"
+       "\n"
+       "        vec2 vertex_in_unscaled_quad_ndc;\n"
+       "        vertex_in_unscaled_quad_ndc.x = mix(quad_min_ndc.x, quad_max_ndc.x, a_position_01.x);\n"
+       "        vertex_in_unscaled_quad_ndc.y = mix(quad_min_ndc.y, quad_max_ndc.y, 1.0 - a_position_01.y);\n"
+       "\n"
+       "        final_ndc_pos = (vertex_in_unscaled_quad_ndc - anchor_ndc) * other_quad_scale + anchor_ndc;\n"
+       "    }\n"
+       "\n"
+       "    gl_Position = vec4(final_ndc_pos, 0.0, 1.0);\n"
+       "    v_texcoord_to_fs = vec2(a_texcoord.x, 1.0 - a_texcoord.y);\n"
+       "}\n";*/
+
+// Vertex Shader
+static const char *fullscreen_vertex_shader_src =
+       "#version 300 es\n"
+       "precision mediump float;\n"
+       "layout(location = 0) in vec2 a_position_01;\n"
+       "layout(location = 1) in vec2 a_texcoord;\n"
+       "\n"
+       "uniform float u_zoom;       // 1.0 to 2.0\n"
+       "uniform highp int u_quadrant;    // Which quadrant to expand (0-3)\n"
        "\n"
        "out vec2 v_texcoord_to_fs;\n"
        "\n"
        "void main() {\n"
-       "    // 1. Scale a_position_01 (our [0,1] input quad) around u_zoom_center by u_zoom factor.\n"
-       "    vec2 scaled_a_position_01 = (a_position_01 - u_zoom_center) * u_zoom + u_zoom_center;\n"
-       "\n"
-       "    // 2. Transform this scaled [0,1]-space quad to full Normalized Device Coordinates (NDC) [-1,1].\n"
-       "    //    The 'mvp' should be set up in C to map a standard [0,1] quad to fullscreen NDC.\n"
-       "    //    Example C-side MVP (like your effect_mvp for fullscreen): \n"
-       "    //    mvp[0]=2.0; mvp[4]=2.0; mvp[6]=-1.0; mvp[7]=-1.0; (maps [0,1] to [-1,1])\n"
-       "    vec3 full_ndc_pos = mvp * vec3(scaled_a_position_01, 1.0);\n"
-       "\n"
-       "    // 3. Now, take the (geometrically zoomed) full NDC position and scale it down for the quadrant view.\n"
-       "    //    This scales the *already zoomed* item down to fit into a quadrant space.\n"
-       "    vec2 quadrant_ndc_pos = full_ndc_pos.xy * 0.5; // Scale to half size in NDC for quarter area\n"
-       "\n"
-       "    // 4. Offset to the desired quadrant (e.g., top-left).\n"
-       "    //    This offset is in NDC space.\n"
-       "    int u_quadrant_fixed = 0; // Forcing top-left for now\n"
-       "    vec2 quad_offset_ndc;\n"
-       "    if (u_quadrant_fixed == 0) {\n"
-       "        quad_offset_ndc = vec2(-0.5, 0.5);  // Top-left: move left by 0.5 NDC, up by 0.5 NDC\n"
-       "    } else if (u_quadrant_fixed == 1) {\n"
-       "        quad_offset_ndc = vec2(0.5, 0.5);   // Top-right\n"
-       "    } else if (u_quadrant_fixed == 2) {\n"
-       "        quad_offset_ndc = vec2(-0.5, -0.5); // Bottom-left\n"
-       "    } else { // u_quadrant_fixed == 3\n"
-       "        quad_offset_ndc = vec2(0.5, -0.5);  // Bottom-right\n"
-       "    }\n"
-       "\n"
-       "    gl_Position = vec4(quadrant_ndc_pos + quad_offset_ndc, 0.0, 1.0);\n"
-       "\n"
-       "    // Texture coordinates pass through. The full texture maps to the (now geometrically scaled) quad.\n"
+       "    gl_Position = vec4(a_position_01 * 2.0 - 1.0, 0.0, 1.0);\n"
        "    v_texcoord_to_fs = a_texcoord;\n"
        "}\n";
 
+// Fragment Shader
 static const char *fullscreen_fragment_shader_src =
        "#version 300 es\n"
        "precision mediump float;\n"
-       "in vec2 v_texcoord_to_fs;\n"
-       "out vec4 frag_color;\n"
+       "precision mediump int;\n"
+       "\n"
        "uniform sampler2D u_scene_texture;\n"
+       "uniform float u_zoom;       // 1.0 to 2.0\n"
+       "uniform highp int u_quadrant;     // Which quadrant to expand (0-3)\n"
+       "\n"
+       "in vec2 v_texcoord_to_fs;\n"
+       "out vec4 FragColor;\n"
+       "\n"
        "void main() {\n"
-       "    vec4 original_color = texture(u_scene_texture, v_texcoord_to_fs);\n"
-   //    "    vec3 inverted_rgb = vec3(1.0) - original_color.rgb;\n" // Invert R, G, B
-//       "    frag_color = vec4(inverted_rgb, original_color.a);\n"  // Keep original alpha
-        "    frag_color = vec4(original_color);\n" 
+       "    float t = clamp(u_zoom - 1.0, 0.0, 1.0);\n"
+       "    vec2 uv = v_texcoord_to_fs;\n"
+       "    \n"
+       "    // Define the center point of each quadrant in the 2x2 grid\n"
+       "    vec2 quad_centers[4];\n"
+       "    quad_centers[0] = vec2(0.0, 1.0);  // Top-left\n"
+       "    quad_centers[1] = vec2(1.0, 1.0);  // Top-right\n"
+       "    quad_centers[2] = vec2(0.00, 0.00);  // Bottom-left\n"
+       "    quad_centers[3] = vec2(1.00, 0.00);  // Bottom-right\n"
+       "    \n"
+       "    // Get the center of the selected quadrant\n"
+       "    vec2 zoom_center = quad_centers[u_quadrant];\n"
+       "    \n"
+       "    // Transform UV: zoom in from the selected quadrant's center\n"
+       "    // As t goes from 0 to 1, we zoom from the quadrant center to full screen\n"
+       "    vec2 offset_from_center = uv - zoom_center;\n"
+       "    vec2 scaled_offset = offset_from_center / (1.0 + t);\n"
+       "    vec2 transformed_uv = zoom_center + scaled_offset;\n"
+       "    \n"
+       "    // Map the transformed UV to the original texture coordinates\n"
+       "    // We need to map from [0,1] screen space back to the quadrant's texture space\n"
+       "    vec2 texture_uv;\n"
+       "    \n"
+       "    // Determine which quadrant the transformed UV falls into\n"
+       "    int target_quad;\n"
+       "    if (transformed_uv.x < 0.5 && transformed_uv.y > 0.5) target_quad = 0;\n"
+       "    else if (transformed_uv.x > 0.5 && transformed_uv.y > 0.5) target_quad = 1;\n"
+       "    else if (transformed_uv.x < 0.5 && transformed_uv.y < 0.5) target_quad = 2;\n"
+       "    else target_quad = 3;\n"
+       "    \n"
+       "    // Map to texture coordinates based on which quadrant\n"
+       "    if (target_quad == 0) {\n"
+       "        // Top-left quadrant\n"
+       "        texture_uv = vec2(transformed_uv.x * 2.0, (transformed_uv.y - 0.5) * 2.0);\n"
+       "    } else if (target_quad == 1) {\n"
+       "        // Top-right quadrant  \n"
+       "        texture_uv = vec2((transformed_uv.x - 0.5) * 2.0, (transformed_uv.y - 0.5) * 2.0);\n"
+       "    } else if (target_quad == 2) {\n"
+       "        // Bottom-left quadrant\n"
+       "        texture_uv = vec2(transformed_uv.x * 2.0, transformed_uv.y * 2.0);\n"
+       "    } else {\n"
+       "        // Bottom-right quadrant\n"
+       "        texture_uv = vec2((transformed_uv.x - 0.5) * 2.0, transformed_uv.y * 2.0);\n"
+       "    }\n"
+       "    \n"
+       "    FragColor = texture(u_scene_texture, texture_uv);\n"
        "}\n";
 
 
@@ -5497,7 +5581,8 @@ const char *vendor = (const char *)glGetString(GL_VENDOR);
     {"u_scene_texture", &server.fullscreen_shader_scene_tex_loc},
     {"u_zoom", &server.fullscreen_shader_zoom_loc},
     {"u_zoom_center", &server.fullscreen_shader_zoom_center_loc},
-  //  {"u_quadrant", &server.fullscreen_shader_quadrant_loc}  // Add this if using the uniform version
+    {"u_quadrant", &server.fullscreen_shader_quadrant_loc}  // Add this if using the uniform version
+// {"u_current_quad", &server.fullscreen_shader_current_quad_loc} 
 };
 
 if (!create_generic_shader_program(server.renderer, "ScaledSceneViewShader",
@@ -5527,7 +5612,12 @@ if (!create_generic_shader_program(server.renderer, "ScaledSceneViewShader",
     // For the current shader, u_zoom_center should be (0,0) to scale around the quadrant's local center
     server.effect_zoom_center_x = 0.0f;
     server.effect_zoom_center_y = 1.0f;
-
+  wlr_log(WLR_INFO, "Fullscreen Shader Locations: mvp=%d, scene_tex=%d, zoom=%d, zoom_center=%d, quadrant=%d",
+            server.fullscreen_shader_mvp_loc,
+            server.fullscreen_shader_scene_tex_loc,
+            server.fullscreen_shader_zoom_loc,
+            server.fullscreen_shader_zoom_center_loc,
+            server.fullscreen_shader_quadrant_loc); // Log the new location too
 
     wlr_log(WLR_INFO, "ScaledSceneViewShader (fullscreen_shader_program) created. MVP@%d, SceneTex@%d",
             server.fullscreen_shader_mvp_loc, server.fullscreen_shader_scene_tex_loc);
