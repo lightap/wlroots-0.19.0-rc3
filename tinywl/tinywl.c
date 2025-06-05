@@ -2871,7 +2871,7 @@ static void render_scene_content(struct tinywl_server *server,
 
     // The current_rdata (passed in) contains the correct server, renderer,
     // output (final target for some projections), and current_pass (NULL for FBO).
-
+/*
     // --- Render Background Rects and SSDs ---
     struct wlr_scene_node *iter_node_lvl1;
     wl_list_for_each(iter_node_lvl1, &server->scene->tree.children, link) {
@@ -2915,6 +2915,74 @@ static void render_scene_content(struct tinywl_server *server,
         } else {
             wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Client flame shader (shader_program) is 0.", wlr_output->name);
         }
+*/
+
+    // --- Render Windows (Surface + Decorations Together) ---
+struct wlr_scene_node *iter_node_lvl1;
+
+// Static variable to track if panel has been rendered this frame
+static bool panel_rendered = false;
+
+
+wl_list_for_each(iter_node_lvl1, &server->scene->tree.children, link) {
+    if (!iter_node_lvl1->enabled) continue;
+    
+    // Skip panel - we've already rendered it above
+    if (iter_node_lvl1 == server->top_panel_node && iter_node_lvl1->type == WLR_SCENE_NODE_RECT) continue;
+    
+    if (iter_node_lvl1->type == WLR_SCENE_NODE_RECT) {
+        // Render standalone background rects (not part of windows)
+        render_rect_node(iter_node_lvl1, current_rdata);
+    } else if (iter_node_lvl1->type == WLR_SCENE_NODE_TREE) {
+        struct tinywl_toplevel *toplevel_ptr = iter_node_lvl1->data;
+        
+        if (toplevel_ptr && toplevel_ptr->type == TINYWL_TOPLEVEL_XDG) {
+            struct wlr_scene_tree *toplevel_s_tree = wlr_scene_tree_from_node(iter_node_lvl1);
+
+
+// Render panel once at the beginning if it exists and hasn't been rendered yet
+if (!panel_rendered && server->top_panel_node && server->top_panel_node->enabled &&
+    server->top_panel_node->type == WLR_SCENE_NODE_RECT && server->panel_shader_program != 0) {
+    render_panel_node(server->top_panel_node, current_rdata);
+    panel_rendered = true;
+}            
+            // First render SSD decorations if enabled
+            if (toplevel_ptr->ssd.enabled) {
+                struct wlr_scene_node *ssd_node_candidate;
+                wl_list_for_each(ssd_node_candidate, &toplevel_s_tree->children, link) {
+                    if (ssd_node_candidate->enabled && ssd_node_candidate->type == WLR_SCENE_NODE_RECT) {
+                        if ( (toplevel_ptr->ssd.title_bar && ssd_node_candidate == &toplevel_ptr->ssd.title_bar->node) ||
+                             (toplevel_ptr->ssd.border_left && ssd_node_candidate == &toplevel_ptr->ssd.border_left->node) ||
+                             (toplevel_ptr->ssd.border_right && ssd_node_candidate == &toplevel_ptr->ssd.border_right->node) ||
+                             (toplevel_ptr->ssd.border_bottom && ssd_node_candidate == &toplevel_ptr->ssd.border_bottom->node) ) {
+                            render_rect_node(ssd_node_candidate, current_rdata);
+                        }
+                    }
+                }
+            }
+            
+            // Then render the window surface/buffers for this specific window
+            if (server->shader_program != 0) {
+                glUseProgram(server->shader_program);
+                wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Rendering buffers for window with flame_shader ID %u",
+                        wlr_output->name, server->shader_program);
+                wlr_scene_node_for_each_buffer(&toplevel_s_tree->node, scene_buffer_iterator, current_rdata);
+            } else {
+                wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Client flame shader (shader_program) is 0.", wlr_output->name);
+            }
+        } else {
+            // For non-window trees, render any buffers they might contain
+            if (server->shader_program != 0) {
+                glUseProgram(server->shader_program);
+                wlr_scene_node_for_each_buffer(iter_node_lvl1, scene_buffer_iterator, current_rdata);
+            }
+        }
+    }
+}
+
+// Reset the static variable for the next frame (add this at the end of your frame rendering function)
+panel_rendered = false;
+
 
     glBindVertexArray(0);
     glUseProgram(0);
@@ -4380,7 +4448,6 @@ static void handle_xdg_decoration_new(struct wl_listener *listener, void *data) 
     wlr_xdg_toplevel_decoration_v1_set_mode(decoration, 
         WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
 }
-
 
 /* Updated main function */
 int main(int argc, char *argv[]) {
