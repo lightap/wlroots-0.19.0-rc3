@@ -465,6 +465,8 @@ GLuint desktop1_fbo;
 
      struct desktop_fb *desktops;
     int num_desktops;
+
+     int pending_desktop_switch;
    
 };
 
@@ -1014,8 +1016,6 @@ static bool handle_keybinding(struct tinywl_server *server, xkb_keysym_t sym) {
     return true;
 }
 
-
-
 static void keyboard_handle_key(struct wl_listener *listener, void *data) {
     struct tinywl_keyboard *keyboard = wl_container_of(listener, keyboard, key);
     struct tinywl_server *server = keyboard->server;
@@ -1036,7 +1036,7 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
         last_state_event_kbd == event->state &&
         event->time_msec > 0 && last_time_event_kbd > 0 &&
         (event->time_msec - last_time_event_kbd < 5 || last_time_event_kbd - event->time_msec < 5)) {
-        wlr_log(WLR_DEBUG, "Ignoring duplicate key event: keycode=%u", event->keycode); // Changed to DEBUG
+        wlr_log(WLR_DEBUG, "Ignoring duplicate key event: keycode=%u", event->keycode);
         return;
     }
     last_keycode_event_kbd = event->keycode;
@@ -1076,41 +1076,30 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
                 if (syms[i] == XKB_KEY_p || syms[i] == XKB_KEY_P) {
                     if (!server->shrink_effect_active) {
                         // --- FBO Effect is currently OFF. ---
-                        // 1. Turn ON the FBO effect.
                         server->shrink_effect_active = true;
                         wlr_log(WLR_INFO, "Fullscreen Shader Effect ENABLED via 'P'.");
-
-                        // 2. Set the target to be the "zoomed-in" state.
                         server->effect_is_target_zoomed = true;
-
-                        // 3. Start animation from "normal" (1.0x) to "zoomed" (e.g., 2.0x).
-                        //    effect_anim_current_factor will be calculated fresh by output_frame if it was off.
                         server->effect_anim_start_factor = server->effect_zoom_factor_normal;
                         server->effect_anim_target_factor = server->effect_zoom_factor_zoomed;
                         
-                        // Only start animation if factors are different (should always be true here)
                         if (fabs(server->effect_anim_start_factor - server->effect_anim_target_factor) > 1e-4f) {
                             server->effect_anim_start_time_sec = get_monotonic_time_seconds_as_float();
                             server->effect_is_animating_zoom = true;
                             wlr_log(WLR_INFO, "Initial Zoom-IN Animation Started (to %.2f from %.2f)",
                                     server->effect_anim_target_factor, server->effect_anim_start_factor);
                         } else {
-                            // This case should ideally not be hit if normal and zoomed factors are different
-                             server->effect_anim_current_factor = server->effect_anim_target_factor; // Snap
-                             server->effect_is_animating_zoom = false;
+                            server->effect_anim_current_factor = server->effect_anim_target_factor;
+                            server->effect_is_animating_zoom = false;
                         }
                     } else {
                         // --- FBO Effect is already ON. Toggle zoom animation target state. ---
                         server->effect_is_target_zoomed = !server->effect_is_target_zoomed;
-
-                        // Start animation from the current display factor.
-                        // server->effect_anim_current_factor is updated by output_frame.
                         server->effect_anim_start_factor = server->effect_anim_current_factor;
 
-                        if (server->effect_is_target_zoomed) { // New target is ZOOMED-IN
+                        if (server->effect_is_target_zoomed) {
                             server->effect_anim_target_factor = server->effect_zoom_factor_zoomed;
                             wlr_log(WLR_INFO, "Zoom-IN Animation Triggered by 'P'.");
-                        } else { // New target is NORMAL (and will turn off effect upon completion)
+                        } else {
                             server->effect_anim_target_factor = server->effect_zoom_factor_normal;
                             wlr_log(WLR_INFO, "Zoom-OUT Animation (to turn off effect) Triggered by 'P'.");
                         }
@@ -1121,10 +1110,9 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
                             wlr_log(WLR_DEBUG, "Animation params: TargetFactor=%.2f, StartFactor=%.2f",
                                     server->effect_anim_target_factor, server->effect_anim_start_factor);
                         } else {
-                             wlr_log(WLR_INFO, "'P' pressed (effect on): Already at target factor %.2f.", server->effect_anim_target_factor);
-                             server->effect_is_animating_zoom = false;
-                             server->effect_anim_current_factor = server->effect_anim_target_factor; // Snap
-                             // If we snapped to normal and target is normal, output_frame's logic will turn off shrink_effect_active.
+                            wlr_log(WLR_INFO, "'P' pressed (effect on): Already at target factor %.2f.", server->effect_anim_target_factor);
+                            server->effect_anim_current_factor = server->effect_anim_target_factor;
+                            server->effect_is_animating_zoom = false;
                         }
                     }
                     handled_by_compositor = true;
@@ -1134,26 +1122,55 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
             }
         }
 
-        // Handle Alt+Key bindings (like F1, Escape) if 'P' wasn't handled
-        if (!handled_by_compositor && (modifiers & WLR_MODIFIER_ALT)) {
+        // Handle 'O' key for desktop switching
+        if (!(modifiers & (WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT | WLR_MODIFIER_SHIFT))) {
             for (int i = 0; i < nsyms; i++) {
-                if (handle_keybinding(server, syms[i])) {
+                if (syms[i] == XKB_KEY_o) {
+                    // Calculate target desktop
+                    int target_desktop = 1 - server->current_desktop;
+                    if (server->shrink_effect_active) {
+                        // Defer the desktop switch until effect is inactive
+                        server->pending_desktop_switch = target_desktop;
+                        wlr_log(WLR_INFO, "Desktop switch to %d deferred until shrink effect is inactive", target_desktop);
+                    } else {
+                        // Perform switch immediately if effect is inactive
+                        server->current_desktop = target_desktop;
+                        server->pending_desktop_switch = -1; // Clear pending switch
+                        wlr_log(WLR_INFO, "Switched to desktop %d", server->current_desktop);
+                        // Schedule a frame to show the change
+                        struct tinywl_output *output;
+                        wl_list_for_each(output, &server->outputs, link) {
+                            if (output->wlr_output && output->wlr_output->enabled) {
+                                wlr_output_schedule_frame(output->wlr_output);
+                            }
+                        }
+                    }
                     handled_by_compositor = true;
-                    needs_redraw = true; 
                     break;
                 }
             }
         }
-        
-        if (needs_redraw) {
-            struct tinywl_output *output_iter;
-            wl_list_for_each(output_iter, &server->outputs, link) {
-                if (output_iter->wlr_output && output_iter->wlr_output->enabled) {
-                    wlr_output_schedule_frame(output_iter->wlr_output);
-                }
+    }
+
+    // Handle Alt+Key bindings (like F1, Escape) if 'P' or 'O' wasn't handled
+    if (!handled_by_compositor && (modifiers & WLR_MODIFIER_ALT)) {
+        for (int i = 0; i < nsyms; i++) {
+            if (handle_keybinding(server, syms[i])) {
+                handled_by_compositor = true;
+                needs_redraw = true; 
+                break;
             }
         }
-    } 
+    }
+    
+    if (needs_redraw) {
+        struct tinywl_output *output_iter;
+        wl_list_for_each(output_iter, &server->outputs, link) {
+            if (output_iter->wlr_output && output_iter->wlr_output->enabled) {
+                wlr_output_schedule_frame(output_iter->wlr_output);
+            }
+        }
+    }
 
     // Forward key event to the focused client if not handled by the compositor
     if (!handled_by_compositor) {
@@ -1167,7 +1184,6 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
         }
     }
 }
-
 static void keyboard_handle_destroy(struct wl_listener *listener, void *data) {
     struct tinywl_keyboard *keyboard = wl_container_of(listener, keyboard, destroy);
     wl_list_remove(&keyboard->modifiers.link);
@@ -3023,13 +3039,13 @@ wl_list_for_each(iter_node_lvl1, &server->scene->tree.children, link) {
         if (toplevel_ptr && toplevel_ptr->type == TINYWL_TOPLEVEL_XDG) {
             struct wlr_scene_tree *toplevel_s_tree = wlr_scene_tree_from_node(iter_node_lvl1);
 
-/
+/*
 // Render panel once at the beginning if it exists and hasn't been rendered yet
 if (!panel_rendered && server->top_panel_node && server->top_panel_node->enabled &&
     server->top_panel_node->type == WLR_SCENE_NODE_RECT && server->panel_shader_program != 0) {
     render_panel_node(server->top_panel_node, current_rdata);
     panel_rendered = true;
-}            
+} */           
             // First render SSD decorations if enabled
             if (toplevel_ptr->ssd.enabled) {
                 struct wlr_scene_node *ssd_node_candidate;
@@ -3749,19 +3765,7 @@ GLuint get_desktop_fbo(struct tinywl_server *server, int desktop_idx) {
     return server->desktops[desktop_idx].fbo;
 }
 
-// Switch to a different desktop
-bool switch_desktop(struct tinywl_server *server, int desktop_idx) {
-    if (desktop_idx < 0 || desktop_idx >= server->num_desktops) {
-        wlr_log(WLR_ERROR, "Invalid desktop index: %d", desktop_idx);
-        return false;
-    }
-    
-    int old_desktop = server->current_desktop;
-    server->current_desktop = desktop_idx;
-    
-    wlr_log(WLR_INFO, "Switched from desktop %d to desktop %d", old_desktop, desktop_idx);
-    return true;
-}
+
 
 // Cleanup function
 void cleanup_virtual_desktops(struct tinywl_server *server) {
@@ -3785,6 +3789,14 @@ void cleanup_virtual_desktops(struct tinywl_server *server) {
     server->num_desktops = 0;
 }
 
+// New function to handle deferred desktop switch
+void handle_expo_end_desktop_switch(struct tinywl_server *server) {
+    if (server->pending_desktop_switch != -1) {
+        server->current_desktop = server->pending_desktop_switch;
+        wlr_log(WLR_INFO, "[OUTPUT_FRAME] Applied deferred desktop switch to desktop %d", server->current_desktop);
+        server->pending_desktop_switch = -1; // Clear pending switch
+    }
+}
 
 static void output_frame(struct wl_listener *listener, void *data) {
     struct tinywl_output *output_wrapper = wl_container_of(listener, output_wrapper, frame);
@@ -3852,6 +3864,9 @@ static void output_frame(struct wl_listener *listener, void *data) {
                     current_frame_fbo_path = false;
                     wlr_log(WLR_INFO, "[OUTPUT_FRAME:%s] Fullscreen Shader Effect DISABLED (animation to normal finished).", wlr_output->name);
                     
+                    // HANDLE DEFERRED DESKTOP SWITCH HERE
+                    handle_expo_end_desktop_switch(server);
+                    
                     struct tinywl_output *output_iter_redraw;
                     wl_list_for_each(output_iter_redraw, &server->outputs, link) {
                          if (output_iter_redraw->wlr_output && output_iter_redraw->wlr_output->enabled) {
@@ -3891,38 +3906,55 @@ static void output_frame(struct wl_listener *listener, void *data) {
     }
 
     if (current_frame_fbo_path) {
-        // STAGE 1: Render scene content to first intermediate framebuffer
-        glBindFramebuffer(GL_FRAMEBUFFER, server->desktop0_fbo);
-        glViewport(0, 0, server->intermediate_width0, server->intermediate_height0);
-        glScissor(0, 0, server->intermediate_width0, server->intermediate_height0);
-        glEnable(GL_SCISSOR_TEST);
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glDisable(GL_CULL_FACE);
-        glDisable(GL_DEPTH_TEST);
-
-        render_scene_content0(server, wlr_output, &rdata_scene_render);
-
-        glDisable(GL_SCISSOR_TEST);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        // When expo is active, use current framebuffer setup without allowing swaps
+        if (!setup_intermediate_framebuffer1(server, wlr_output->width, wlr_output->height)) {
+            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to setup intermediate FBO1.", wlr_output->name);
+            current_frame_fbo_path = false;
+        } else {
+            // CRITICAL: During expo, don't change framebuffers - use current setup
+            glBindFramebuffer(GL_FRAMEBUFFER, server->desktop0_fbo);
+            glViewport(0, 0, server->intermediate_width0, server->intermediate_height0);
+            glScissor(0, 0, server->intermediate_width0, server->intermediate_height0);
+            glEnable(GL_SCISSOR_TEST);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDisable(GL_CULL_FACE);
+            glDisable(GL_DEPTH_TEST);
+            
+            // Render current desktop content to maintain visual consistency
+            if (server->current_desktop == 0) {
+                render_scene_content0(server, wlr_output, &rdata_scene_render);
+            } else if (server->current_desktop == 1) {
+                render_scene_content1(server, wlr_output, &rdata_scene_render);
+            } else {
+                render_scene_content0(server, wlr_output, &rdata_scene_render);
+            }
+            
+            glDisable(GL_SCISSOR_TEST);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            
+            // Use consistent texture during expo
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, server->desktop_textures[0]);
+        }
     } else {
-        // Direct rendering path
+        // Direct rendering path - normal desktop switching is allowed here
         wlr_output_state_init(&output_state_direct);
         struct wlr_scene_output_state_options opts = {0};
         bool has_damage = wlr_scene_output_build_state(scene_output, &output_state_direct, &opts);
-
+        
         if (!has_damage && !(output_state_direct.committed & WLR_OUTPUT_STATE_BUFFER)) {
             wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Direct: No damage or buffer, skipping render.", wlr_output->name);
             wlr_output_state_finish(&output_state_direct);
             wlr_scene_output_send_frame_done(scene_output, &now);
             return;
         }
-
+        
         pixman_region32_t full_damage_for_direct_pass;
         pixman_region32_init_rect(&full_damage_for_direct_pass, 0, 0, wlr_output->width, wlr_output->height);
         wlr_output_state_set_damage(&output_state_direct, &full_damage_for_direct_pass);
         pixman_region32_fini(&full_damage_for_direct_pass);
-
+        
         current_screen_pass = wlr_output_begin_render_pass(wlr_output, &output_state_direct, NULL);
         if (!current_screen_pass) {
             wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Direct: wlr_output_begin_render_pass failed.", wlr_output->name);
@@ -3932,7 +3964,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
         }
         
         rdata_scene_render.pass = current_screen_pass;
-
+        
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         glViewport(0, 0, wlr_output->width, wlr_output->height);
@@ -3942,9 +3974,16 @@ static void output_frame(struct wl_listener *listener, void *data) {
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glDisable(GL_CULL_FACE);
         glDisable(GL_DEPTH_TEST);
-
-        render_scene_content0(server, wlr_output, &rdata_scene_render);
-
+        
+        // Normal desktop switching behavior when NOT in expo
+        if (server->current_desktop == 0) {
+            render_scene_content0(server, wlr_output, &rdata_scene_render);
+        } else if (server->current_desktop == 1) {
+            render_scene_content1(server, wlr_output, &rdata_scene_render);
+        } else {
+            render_scene_content0(server, wlr_output, &rdata_scene_render);
+        }
+        
         glDisable(GL_SCISSOR_TEST);
     }
 
@@ -3971,7 +4010,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
             render_scene_content1(server, wlr_output, &rdata_scene_render);
 
             glDisable(GL_SCISSOR_TEST);
-            glBindFramebuffer(GL_FRAMEBUFFER, 0); // FIXED: Was binding to 1 instead of 0
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
         }
     }
 
@@ -4013,17 +4052,23 @@ static void output_frame(struct wl_listener *listener, void *data) {
                 glUniformMatrix3fv(server->fullscreen_shader_mvp_loc, 1, GL_FALSE, effect_mvp);
             }
 
-            // Bind first texture
             if (server->fullscreen_shader_scene_tex0_loc != -1) {
                 glActiveTexture(GL_TEXTURE0);
-                glBindTexture(GL_TEXTURE_2D, server->intermediate_texture0);
+                if (server->current_desktop == 0) {
+                    glBindTexture(GL_TEXTURE_2D, server->intermediate_texture0);
+                } else {
+                    glBindTexture(GL_TEXTURE_2D, server->intermediate_texture1);
+                }
                 glUniform1i(server->fullscreen_shader_scene_tex0_loc, 0);
             }
 
-            // Bind second texture
             if (server->fullscreen_shader_scene_tex1_loc != -1) {
                 glActiveTexture(GL_TEXTURE1);
-                glBindTexture(GL_TEXTURE_2D, server->intermediate_texture1);
+                if (server->current_desktop == 0) {
+                    glBindTexture(GL_TEXTURE_2D, server->intermediate_texture1);
+                } else {
+                    glBindTexture(GL_TEXTURE_2D, server->intermediate_texture0);
+                }
                 glUniform1i(server->fullscreen_shader_scene_tex1_loc, 1);
             }
 
@@ -4035,14 +4080,14 @@ static void output_frame(struct wl_listener *listener, void *data) {
                 glUniform2fv(server->fullscreen_shader_zoom_center_loc, 1, center_for_shader);
             }
 
-            int target_quadrant = 0;
+             int target_quadrant = server->shrink_effect_active && server->pending_desktop_switch != -1 ?
+                                  server->pending_desktop_switch : server->current_desktop;
             if (server->fullscreen_shader_quadrant_loc != -1) {
                 glUniform1i(server->fullscreen_shader_quadrant_loc, target_quadrant);
             }
 
             glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
 
-            // Cleanup texture bindings
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, 0);
             glActiveTexture(GL_TEXTURE1);
@@ -4053,7 +4098,6 @@ static void output_frame(struct wl_listener *listener, void *data) {
         glDisable(GL_SCISSOR_TEST);
     }
 
-    // Submit the active screen pass 
     if (current_screen_pass) {
         if (!wlr_render_pass_submit(current_screen_pass)) {
             wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to submit render pass.", wlr_output->name);
@@ -4073,13 +4117,12 @@ static void output_frame(struct wl_listener *listener, void *data) {
                 rdp_transmit_surface(locked_buffer); 
                 wlr_buffer_unlock(locked_buffer); 
             } else {
-                 wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to lock buffer for RDP transmit.", wlr_output->name);
+                wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to lock buffer for RDP transmit.", wlr_output->name);
             }
             pthread_mutex_unlock(&rdp_transmit_mutex);
         }
     }
 
-    // Finish output states
     if (current_frame_fbo_path) {
         wlr_output_state_finish(&output_state_effect);
     } else {
