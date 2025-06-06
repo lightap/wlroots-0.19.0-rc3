@@ -272,6 +272,7 @@ struct render_data {
        GLint scale_uniform_loc; // Renamed to avoid conflict
     struct tinywl_server *server;
     struct wlr_output *output; // Add output for projection matrix
+     int desktop_index; 
 };
 
 // First, modify your server struct to support multiple desktops:
@@ -454,14 +455,17 @@ GLuint intermediate_rbo[4];
 
     int desktop_count;             // Number of active desktops
     int current_desktop;
-    
-    
-
-
      struct desktop_fb *desktops;
     int num_desktops;
 
      int pending_desktop_switch;
+
+       GLuint desktop_background_shaders[4];
+    GLint desktop_bg_shader_mvp_loc[4];
+    GLint desktop_bg_shader_time_loc[4];
+    GLint desktop_bg_shader_res_loc[4];
+    GLint desktop_bg_shader_color_loc[4]; // In case your shaders use a base color
+
    
 };
 
@@ -2541,7 +2545,6 @@ void check_scene_bypass_issue(struct wlr_scene_output *scene_output, struct wlr_
     wlr_log(WLR_INFO, "[BYPASS_CHECK:%s] If you see this but no rectangles, you might be bypassing scene rendering", output->name);
 }
 
-
 static void render_rect_node(struct wlr_scene_node *node, void *user_data) {
     struct render_data *rdata = user_data;
     struct wlr_output *output = rdata->output;
@@ -2554,112 +2557,80 @@ static void render_rect_node(struct wlr_scene_node *node, void *user_data) {
 
     int render_sx, render_sy;
     if (!wlr_scene_node_coords(node, &render_sx, &render_sy)) {
-        wlr_log(WLR_DEBUG, "[RENDER_RECT_NODE:%s] wlr_scene_node_coords failed for node %p. Skipping.",
-                output->name, (void*)node);
         return;
     }
 
     if (output->width == 0 || output->height == 0) return;
 
-    GLuint program_to_use;
-    GLint mvp_loc = -1, color_loc = -1, time_loc = -1, output_res_loc = -1, rect_dim_loc = -1;
-    GLint rect_dim_loc_for_current_shader = -1; 
+    GLuint program_to_use = 0;
+    GLint mvp_loc = -1, color_loc = -1, time_loc = -1, output_res_loc = -1;
+    
+    // Default to the color stored in the scene graph node.
+    const float *color_to_use = scene_rect->color; 
+
     bool is_main_background = (server->main_background_node == node);
 
     if (is_main_background) {
-        program_to_use = server->rect_shader_program; // "Melt"
-        mvp_loc = server->rect_shader_mvp_loc;
-        color_loc = server->rect_shader_color_loc;
-        time_loc = server->rect_shader_time_loc;
-        output_res_loc = server->rect_shader_resolution_loc;
-        rect_dim_loc = server->rect_shader_rect_res_loc; // If your Melt shader still uses this
-        rect_dim_loc_for_current_shader = rect_dim_loc; // Set this for consistency
-    } else { // SSD
+        int desktop_idx = rdata->desktop_index;
+        if (desktop_idx < 0 || desktop_idx >= 4) {
+            desktop_idx = 0;
+        }
+
+        program_to_use = server->desktop_background_shaders[desktop_idx];
+        mvp_loc = server->desktop_bg_shader_mvp_loc[desktop_idx];
+        color_loc = server->desktop_bg_shader_color_loc[desktop_idx];
+        time_loc = server->desktop_bg_shader_time_loc[desktop_idx];
+        output_res_loc = server->desktop_bg_shader_res_loc[desktop_idx];
+
+        // *** THE FIX IS HERE ***
+        // For any desktop other than 0, use a neutral white color
+        // to prevent tinting the shader's output.
+        if (desktop_idx != 0) {
+            static const float neutral_color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+            color_to_use = neutral_color;
+        }
+        // For desktop 0, color_to_use will remain pointing to the rect's red color.
+
+    } else { // SSD (Server-Side Decoration) logic
         program_to_use = server->ssd_shader_program;
         mvp_loc = server->ssd_shader_mvp_loc;
         color_loc = server->ssd_shader_color_loc;
         time_loc = server->ssd_shader_time_loc;
-        output_res_loc = server->ssd_shader_resolution_loc;  
-        rect_dim_loc_for_current_shader = server->ssd_shader_rect_pixel_dimensions_loc;
+        output_res_loc = server->ssd_shader_resolution_loc;
+        // color_to_use is already correctly pointing to the SSD's own color
     }
-    
 
     if (program_to_use == 0) {
-        wlr_log(WLR_ERROR, "Cannot render rect %dx%d, shader program ID is 0 for purpose %s.",
-                scene_rect->width, scene_rect->height, is_main_background ? "BG" : "SSD");
         return;
     }
     glUseProgram(program_to_use);
 
+    // MVP setup logic (remains the same)
     float mvp[9];
-    wlr_matrix_identity(mvp);
     float box_scale_x = (float)scene_rect->width * (2.0f / output->width);
     float box_scale_y = (float)scene_rect->height * (-2.0f / output->height);
     float box_translate_x = ((float)render_sx / output->width) * 2.0f - 1.0f;
     float box_translate_y = ((float)render_sy / output->height) * -2.0f + 1.0f;
-
-    float base_mvp[9] = {
-        box_scale_x, 0.0f, 0.0f,
-        0.0f, box_scale_y, 0.0f,
-        box_translate_x, box_translate_y, 1.0f
-    };
-
+    float base_mvp[9] = {box_scale_x, 0, 0, 0, box_scale_y, 0, box_translate_x, box_translate_y, 1};
     if (output->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
-        float output_transform_matrix[9];
-        wlr_matrix_identity(output_transform_matrix);
-        wlr_matrix_transform(output_transform_matrix, output->transform);
-        wlr_matrix_multiply(mvp, output_transform_matrix, base_mvp);
+        float transform_matrix[9];
+        wlr_matrix_transform(transform_matrix, output->transform);
+        wlr_matrix_multiply(mvp, transform_matrix, base_mvp);
     } else {
         memcpy(mvp, base_mvp, sizeof(base_mvp));
     }
 
+    // Set uniforms
     if (mvp_loc != -1) glUniformMatrix3fv(mvp_loc, 1, GL_FALSE, mvp);
-
-    // Set u_color (used by both Melt and current SSD shader for alpha)
-    if (color_loc != -1) {
-        // Log to confirm alpha for SSDs, especially
-        if (!is_main_background) {
-             wlr_log(WLR_ERROR, "[SSD_RENDER_UCOLOR] Node %p, Program %u: Setting u_color (loc %d) to (%.2f, %.2f, %.2f, %.2f)",
-                (void*)node, program_to_use, color_loc,
-                scene_rect->color[0], scene_rect->color[1], scene_rect->color[2], scene_rect->color[3]);
-        }
-        glUniform4fv(color_loc, 1, scene_rect->color);
-    }
-
-    // Set time (used by Melt and current SSD shader)
-    if (time_loc != -1) {
-        float current_time_value = get_monotonic_time_seconds_as_float();
-        // Log to confirm time is being set for SSDs
-        if (!is_main_background) {
-             wlr_log(WLR_ERROR, "[SSD_RENDER_TIME] Node %p, Program %u: Setting time (loc %d) to %.2f",
-                (void*)node, program_to_use, time_loc, current_time_value);
-        }
-        glUniform1f(time_loc, current_time_value);
-    } else {
-         if (!is_main_background) { // Log if time_loc is -1 specifically for SSD path
-             wlr_log(WLR_ERROR, "[SSD_RENDER_TIME_FAIL] Node %p, Program %u: time_loc is -1 for SSD shader.", (void*)node, program_to_use);
-         }
-    }
     
-    // Set rectangle dimensions for both shaders
-    if (rect_dim_loc_for_current_shader != -1) {
-        glUniform2f(rect_dim_loc_for_current_shader, scene_rect->width, scene_rect->height);
-        if (!is_main_background) {
-            wlr_log(WLR_ERROR, "[SSD_RENDER_RECT_DIM] Node %p: Setting rect_dimensions to (%.0f, %.0f)",
-                (void*)node, (float)scene_rect->width, (float)scene_rect->height);
-        }
-    } else {
-        if (!is_main_background) {
-            wlr_log(WLR_ERROR, "[SSD_RENDER_RECT_DIM_FAIL] Node %p: rect_dim_loc_for_current_shader is -1", (void*)node);
-        }
-    }
+    // This will now use the neutral white color for desktops 1, 2, and 3
+    if (color_loc != -1) glUniform4fv(color_loc, 1, color_to_use);
 
-  
-    glUniform2f(output_res_loc, scene_rect->width, scene_rect->height);
+    if (time_loc != -1) glUniform1f(time_loc, get_monotonic_time_seconds_as_float());
+    if (output_res_loc != -1) glUniform2f(output_res_loc, scene_rect->width, scene_rect->height);
 
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
 }
-
 static void render_panel_node(struct wlr_scene_node *node, void *user_data) {
     struct render_data *rdata = user_data;
     struct wlr_output *output = rdata->output;
@@ -2895,356 +2866,6 @@ static void render_panel_node(struct wlr_scene_node *node, void *user_data) {
     }
 }
 
-// PLACE THIS ENTIRE FUNCTION DEFINITION *BEFORE* your output_frame function
-
-static void render_scene_content0(struct tinywl_server *server,
-                                 struct wlr_output *wlr_output, // Final display output
-                                 struct render_data *current_rdata) { // Pass has target info
-    // Clear current target (FBO or screen)
-    glClearColor(0.0f, 0.0f, 0.0f, 0.0f); // Clear with transparent black for FBO
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    if (server->quad_vao == 0) {
-        wlr_log(WLR_ERROR, "[RENDER_SCENE_CONTENT:%s] Quad VAO is zero! Skipping custom draw.", wlr_output->name);
-        return;
-    }
-    glBindVertexArray(server->quad_vao);
-
- 
-
-    // --- Render Windows (Surface + Decorations Together) ---
-struct wlr_scene_node *iter_node_lvl1;
-
-// Static variable to track if panel has been rendered this frame
-static bool panel_rendered = false;
-
-
-wl_list_for_each(iter_node_lvl1, &server->scene->tree.children, link) {
-    if (!iter_node_lvl1->enabled) continue;
-    
-    // Skip panel - we've already rendered it above
-    if (iter_node_lvl1 == server->top_panel_node && iter_node_lvl1->type == WLR_SCENE_NODE_RECT) continue;
-    
-    if (iter_node_lvl1->type == WLR_SCENE_NODE_RECT) {
-        // Render standalone background rects (not part of windows)
-        render_rect_node(iter_node_lvl1, current_rdata);
-    } else if (iter_node_lvl1->type == WLR_SCENE_NODE_TREE) {
-        struct tinywl_toplevel *toplevel_ptr = iter_node_lvl1->data;
-        
-        if (toplevel_ptr && toplevel_ptr->type == TINYWL_TOPLEVEL_XDG) {
-            struct wlr_scene_tree *toplevel_s_tree = wlr_scene_tree_from_node(iter_node_lvl1);
-
-
-// Render panel once at the beginning if it exists and hasn't been rendered yet
-if (!panel_rendered && server->top_panel_node && server->top_panel_node->enabled &&
-    server->top_panel_node->type == WLR_SCENE_NODE_RECT && server->panel_shader_program != 0) {
-    render_panel_node(server->top_panel_node, current_rdata);
-    panel_rendered = true;
-}            
-            // First render SSD decorations if enabled
-            if (toplevel_ptr->ssd.enabled) {
-                struct wlr_scene_node *ssd_node_candidate;
-                wl_list_for_each(ssd_node_candidate, &toplevel_s_tree->children, link) {
-                    if (ssd_node_candidate->enabled && ssd_node_candidate->type == WLR_SCENE_NODE_RECT) {
-                        if ( (toplevel_ptr->ssd.title_bar && ssd_node_candidate == &toplevel_ptr->ssd.title_bar->node) ||
-                             (toplevel_ptr->ssd.border_left && ssd_node_candidate == &toplevel_ptr->ssd.border_left->node) ||
-                             (toplevel_ptr->ssd.border_right && ssd_node_candidate == &toplevel_ptr->ssd.border_right->node) ||
-                             (toplevel_ptr->ssd.border_bottom && ssd_node_candidate == &toplevel_ptr->ssd.border_bottom->node) ) {
-                            render_rect_node(ssd_node_candidate, current_rdata);
-                        }
-                    }
-                }
-            }
-            
-            // Then render the window surface/buffers for this specific window
-            if (server->shader_program != 0) {
-                glUseProgram(server->shader_program);
-                wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Rendering buffers for window with flame_shader ID %u",
-                        wlr_output->name, server->shader_program);
-                wlr_scene_node_for_each_buffer(&toplevel_s_tree->node, scene_buffer_iterator, current_rdata);
-            } else {
-                wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Client flame shader (shader_program) is 0.", wlr_output->name);
-            }
-        } else {
-            // For non-window trees, render any buffers they might contain
-            if (server->shader_program != 0) {
-                glUseProgram(server->shader_program);
-                wlr_scene_node_for_each_buffer(iter_node_lvl1, scene_buffer_iterator, current_rdata);
-            }
-        }
-    }
-}
-
-// Reset the static variable for the next frame (add this at the end of your frame rendering function)
-panel_rendered = false;
-
-
-    glBindVertexArray(0);
-    glUseProgram(0);
-}
-
-static void render_scene_content1(struct tinywl_server *server,
-                                 struct wlr_output *wlr_output, // Final display output
-                                 struct render_data *current_rdata) { // Pass has target info
-    // Clear current target (FBO or screen)
-    glClearColor(0.0f, 0.0f, 0.0f, 0.0f); // Clear with transparent black for FBO
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    if (server->quad_vao == 0) {
-        wlr_log(WLR_ERROR, "[RENDER_SCENE_CONTENT:%s] Quad VAO is zero! Skipping custom draw.", wlr_output->name);
-        return;
-    }
-    glBindVertexArray(server->quad_vao);
-
- 
-
-    // --- Render Windows (Surface + Decorations Together) ---
-struct wlr_scene_node *iter_node_lvl1;
-
-// Static variable to track if panel has been rendered this frame
-static bool panel_rendered = false;
-
-
-wl_list_for_each(iter_node_lvl1, &server->scene->tree.children, link) {
-    if (!iter_node_lvl1->enabled) continue;
-    
-    // Skip panel - we've already rendered it above
-    if (iter_node_lvl1 == server->top_panel_node && iter_node_lvl1->type == WLR_SCENE_NODE_RECT) continue;
-    
-    if (iter_node_lvl1->type == WLR_SCENE_NODE_RECT) {
-        // Render standalone background rects (not part of windows)
-        render_rect_node(iter_node_lvl1, current_rdata);
-    } else if (iter_node_lvl1->type == WLR_SCENE_NODE_TREE) {
-        struct tinywl_toplevel *toplevel_ptr = iter_node_lvl1->data;
-        
-        if (toplevel_ptr && toplevel_ptr->type == TINYWL_TOPLEVEL_XDG) {
-            struct wlr_scene_tree *toplevel_s_tree = wlr_scene_tree_from_node(iter_node_lvl1);
-
-/*
-// Render panel once at the beginning if it exists and hasn't been rendered yet
-if (!panel_rendered && server->top_panel_node && server->top_panel_node->enabled &&
-    server->top_panel_node->type == WLR_SCENE_NODE_RECT && server->panel_shader_program != 0) {
-    render_panel_node(server->top_panel_node, current_rdata);
-    panel_rendered = true;
-} */           
-            // First render SSD decorations if enabled
-            if (toplevel_ptr->ssd.enabled) {
-                struct wlr_scene_node *ssd_node_candidate;
-                wl_list_for_each(ssd_node_candidate, &toplevel_s_tree->children, link) {
-                    if (ssd_node_candidate->enabled && ssd_node_candidate->type == WLR_SCENE_NODE_RECT) {
-                        if ( (toplevel_ptr->ssd.title_bar && ssd_node_candidate == &toplevel_ptr->ssd.title_bar->node) ||
-                             (toplevel_ptr->ssd.border_left && ssd_node_candidate == &toplevel_ptr->ssd.border_left->node) ||
-                             (toplevel_ptr->ssd.border_right && ssd_node_candidate == &toplevel_ptr->ssd.border_right->node) ||
-                             (toplevel_ptr->ssd.border_bottom && ssd_node_candidate == &toplevel_ptr->ssd.border_bottom->node) ) {
-                            render_rect_node(ssd_node_candidate, current_rdata);
-                        }
-                    }
-                }
-            }
-            
-            // Then render the window surface/buffers for this specific window
-            if (server->shader_program != 0) {
-                glUseProgram(server->shader_program);
-                wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Rendering buffers for window with flame_shader ID %u",
-                        wlr_output->name, server->shader_program);
-                wlr_scene_node_for_each_buffer(&toplevel_s_tree->node, scene_buffer_iterator, current_rdata);
-            } else {
-                wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Client flame shader (shader_program) is 0.", wlr_output->name);
-            }
-        } else {
-            // For non-window trees, render any buffers they might contain
-            if (server->shader_program != 0) {
-                glUseProgram(server->shader_program);
-                wlr_scene_node_for_each_buffer(iter_node_lvl1, scene_buffer_iterator, current_rdata);
-            }
-        }
-    }
-}
-
-// Reset the static variable for the next frame (add this at the end of your frame rendering function)
-panel_rendered = false;
-
-
-    glBindVertexArray(0);
-    glUseProgram(0);
-}
-
-
-
-static void render_scene_content2(struct tinywl_server *server,
-                                 struct wlr_output *wlr_output, // Final display output
-                                 struct render_data *current_rdata) { // Pass has target info
-    // Clear current target (FBO or screen)
-    glClearColor(0.0f, 0.0f, 0.0f, 0.0f); // Clear with transparent black for FBO
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    if (server->quad_vao == 0) {
-        wlr_log(WLR_ERROR, "[RENDER_SCENE_CONTENT:%s] Quad VAO is zero! Skipping custom draw.", wlr_output->name);
-        return;
-    }
-    glBindVertexArray(server->quad_vao);
-
- 
-
-    // --- Render Windows (Surface + Decorations Together) ---
-struct wlr_scene_node *iter_node_lvl1;
-
-// Static variable to track if panel has been rendered this frame
-static bool panel_rendered = false;
-
-
-wl_list_for_each(iter_node_lvl1, &server->scene->tree.children, link) {
-    if (!iter_node_lvl1->enabled) continue;
-    
-    // Skip panel - we've already rendered it above
-    if (iter_node_lvl1 == server->top_panel_node && iter_node_lvl1->type == WLR_SCENE_NODE_RECT) continue;
-    
-    if (iter_node_lvl1->type == WLR_SCENE_NODE_RECT) {
-        // Render standalone background rects (not part of windows)
-        render_rect_node(iter_node_lvl1, current_rdata);
-    } else if (iter_node_lvl1->type == WLR_SCENE_NODE_TREE) {
-        struct tinywl_toplevel *toplevel_ptr = iter_node_lvl1->data;
-        
-        if (toplevel_ptr && toplevel_ptr->type == TINYWL_TOPLEVEL_XDG) {
-            struct wlr_scene_tree *toplevel_s_tree = wlr_scene_tree_from_node(iter_node_lvl1);
-
-
-// Render panel once at the beginning if it exists and hasn't been rendered yet
-if (!panel_rendered && server->top_panel_node && server->top_panel_node->enabled &&
-    server->top_panel_node->type == WLR_SCENE_NODE_RECT && server->panel_shader_program != 0) {
-    render_panel_node(server->top_panel_node, current_rdata);
-    panel_rendered = true;
-}            
-    /*        // First render SSD decorations if enabled
-            if (toplevel_ptr->ssd.enabled) {
-                struct wlr_scene_node *ssd_node_candidate;
-                wl_list_for_each(ssd_node_candidate, &toplevel_s_tree->children, link) {
-                    if (ssd_node_candidate->enabled && ssd_node_candidate->type == WLR_SCENE_NODE_RECT) {
-                        if ( (toplevel_ptr->ssd.title_bar && ssd_node_candidate == &toplevel_ptr->ssd.title_bar->node) ||
-                             (toplevel_ptr->ssd.border_left && ssd_node_candidate == &toplevel_ptr->ssd.border_left->node) ||
-                             (toplevel_ptr->ssd.border_right && ssd_node_candidate == &toplevel_ptr->ssd.border_right->node) ||
-                             (toplevel_ptr->ssd.border_bottom && ssd_node_candidate == &toplevel_ptr->ssd.border_bottom->node) ) {
-                            render_rect_node(ssd_node_candidate, current_rdata);
-                        }
-                    }
-                }
-            }
-      */    
-            // Then render the window surface/buffers for this specific window
-            if (server->shader_program != 0) {
-                glUseProgram(server->shader_program);
-                wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Rendering buffers for window with flame_shader ID %u",
-                        wlr_output->name, server->shader_program);
-                wlr_scene_node_for_each_buffer(&toplevel_s_tree->node, scene_buffer_iterator, current_rdata);
-            } else {
-                wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Client flame shader (shader_program) is 0.", wlr_output->name);
-            }
-        } else {
-            // For non-window trees, render any buffers they might contain
-            if (server->shader_program != 0) {
-                glUseProgram(server->shader_program);
-                wlr_scene_node_for_each_buffer(iter_node_lvl1, scene_buffer_iterator, current_rdata);
-            }
-        }
-    }
-}
-
-// Reset the static variable for the next frame (add this at the end of your frame rendering function)
-panel_rendered = false;
-
-
-    glBindVertexArray(0);
-    glUseProgram(0);
-}
-
-
-
-static void render_scene_content3(struct tinywl_server *server,
-                                 struct wlr_output *wlr_output, // Final display output
-                                 struct render_data *current_rdata) { // Pass has target info
-    // Clear current target (FBO or screen)
-    glClearColor(0.0f, 0.0f, 0.0f, 0.0f); // Clear with transparent black for FBO
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    if (server->quad_vao == 0) {
-        wlr_log(WLR_ERROR, "[RENDER_SCENE_CONTENT:%s] Quad VAO is zero! Skipping custom draw.", wlr_output->name);
-        return;
-    }
-    glBindVertexArray(server->quad_vao);
-
- 
-
-    // --- Render Windows (Surface + Decorations Together) ---
-struct wlr_scene_node *iter_node_lvl1;
-
-// Static variable to track if panel has been rendered this frame
-static bool panel_rendered = false;
-
-
-wl_list_for_each(iter_node_lvl1, &server->scene->tree.children, link) {
-    if (!iter_node_lvl1->enabled) continue;
-    
-    // Skip panel - we've already rendered it above
-    if (iter_node_lvl1 == server->top_panel_node && iter_node_lvl1->type == WLR_SCENE_NODE_RECT) continue;
-    
-    if (iter_node_lvl1->type == WLR_SCENE_NODE_RECT) {
-        // Render standalone background rects (not part of windows)
-        render_rect_node(iter_node_lvl1, current_rdata);
-    } else if (iter_node_lvl1->type == WLR_SCENE_NODE_TREE) {
-        struct tinywl_toplevel *toplevel_ptr = iter_node_lvl1->data;
-        
-        if (toplevel_ptr && toplevel_ptr->type == TINYWL_TOPLEVEL_XDG) {
-            struct wlr_scene_tree *toplevel_s_tree = wlr_scene_tree_from_node(iter_node_lvl1);
-
-/*
-// Render panel once at the beginning if it exists and hasn't been rendered yet
-if (!panel_rendered && server->top_panel_node && server->top_panel_node->enabled &&
-    server->top_panel_node->type == WLR_SCENE_NODE_RECT && server->panel_shader_program != 0) {
-    render_panel_node(server->top_panel_node, current_rdata);
-    panel_rendered = true;
-} */           
-            // First render SSD decorations if enabled
-            if (toplevel_ptr->ssd.enabled) {
-                struct wlr_scene_node *ssd_node_candidate;
-                wl_list_for_each(ssd_node_candidate, &toplevel_s_tree->children, link) {
-                    if (ssd_node_candidate->enabled && ssd_node_candidate->type == WLR_SCENE_NODE_RECT) {
-                        if ( (toplevel_ptr->ssd.title_bar && ssd_node_candidate == &toplevel_ptr->ssd.title_bar->node) ||
-                             (toplevel_ptr->ssd.border_left && ssd_node_candidate == &toplevel_ptr->ssd.border_left->node) ||
-                             (toplevel_ptr->ssd.border_right && ssd_node_candidate == &toplevel_ptr->ssd.border_right->node) ||
-                             (toplevel_ptr->ssd.border_bottom && ssd_node_candidate == &toplevel_ptr->ssd.border_bottom->node) ) {
-                            render_rect_node(ssd_node_candidate, current_rdata);
-                        }
-                    }
-                }
-            }
-           
-            // Then render the window surface/buffers for this specific window
-            if (server->shader_program != 0) {
-       //         glUseProgram(server->shader_program);
-         //       wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Rendering buffers for window with flame_shader ID %u",
-           //             wlr_output->name, server->shader_program);
-             //   wlr_scene_node_for_each_buffer(&toplevel_s_tree->node, scene_buffer_iterator, current_rdata);
-            } else {
-               // wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Client flame shader (shader_program) is 0.", wlr_output->name);
-            }
-        } else {
-            // For non-window trees, render any buffers they might contain
-            if (server->shader_program != 0) {
-             //   glUseProgram(server->shader_program);
-             //   wlr_scene_node_for_each_buffer(iter_node_lvl1, scene_buffer_iterator, current_rdata);
-            }
-        }
-    }
-}
-
-// Reset the static variable for the next frame (add this at the end of your frame rendering function)
-panel_rendered = false;
-
-
-    glBindVertexArray(0);
-    glUseProgram(0);
-}
-
 static void render_desktop_content(struct tinywl_server *server,
                                    struct wlr_output *wlr_output,
                                    struct render_data *current_rdata,
@@ -3258,16 +2879,42 @@ static void render_desktop_content(struct tinywl_server *server,
 
     // --- Render Desktop-Specific Chrome (Background, Panel, etc.) ---
     // We'll render these only when drawing desktop 0 to avoid duplication.
- //   if (desktop_to_render == 0) {
+    if (desktop_to_render == 0) {
         // Render the main background rectangle
         if (server->main_background_node && server->main_background_node->enabled) {
             render_rect_node(server->main_background_node, current_rdata);
         }
-        // Render the top panel
+        
+    }
+
+if (desktop_to_render == 1) {
+        // Render the main background rectangle
+        if (server->main_background_node && server->main_background_node->enabled) {
+            render_rect_node(server->main_background_node, current_rdata);
+        }
+        
+    }
+
+if (desktop_to_render == 2) {
+        // Render the main background rectangle
+        if (server->main_background_node && server->main_background_node->enabled) {
+            render_rect_node(server->main_background_node, current_rdata);
+        }
+        
+    }
+    
+if (desktop_to_render == 3) {
+        // Render the main background rectangle
+        if (server->main_background_node && server->main_background_node->enabled) {
+            render_rect_node(server->main_background_node, current_rdata);
+        }
+        
+    }    
+
+    // Render the top panel
         if (server->top_panel_node && server->top_panel_node->enabled) {
             render_panel_node(server->top_panel_node, current_rdata);
         }
-   // }
 
     // --- Render Windows (Surface + Decorations) ---
     struct wlr_scene_node *iter_node_lvl1;
@@ -3665,7 +3312,8 @@ static void output_frame(struct wl_listener *listener, void *data) {
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
       //  render_scene_content0(server, wlr_output, &rdata_scene_data);
-      render_desktop_content(server, wlr_output, &rdata_scene_data, 0);  
+      rdata_scene_data.desktop_index = 0; // <<< SET CONTEXT
+            render_desktop_content(server, wlr_output, &rdata_scene_data, 0);
       glDisable(GL_SCISSOR_TEST);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
@@ -3681,7 +3329,8 @@ static void output_frame(struct wl_listener *listener, void *data) {
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
        // render_scene_content1(server, wlr_output, &rdata_scene_data);
-       render_desktop_content(server, wlr_output, &rdata_scene_data, 1); 
+       rdata_scene_data.desktop_index = 1; // <<< SET CONTEXT
+            render_desktop_content(server, wlr_output, &rdata_scene_data, 1);
        glDisable(GL_SCISSOR_TEST);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
@@ -3697,7 +3346,8 @@ static void output_frame(struct wl_listener *listener, void *data) {
         glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
        // render_scene_content2(server, wlr_output, &rdata_scene_data);
-       render_desktop_content(server, wlr_output, &rdata_scene_data, 2); 
+       rdata_scene_data.desktop_index = 2; // <<< SET CONTEXT
+            render_desktop_content(server, wlr_output, &rdata_scene_data, 2);
        glDisable(GL_SCISSOR_TEST);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
@@ -3713,7 +3363,8 @@ static void output_frame(struct wl_listener *listener, void *data) {
         glClearColor(0.0f, 1.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
        // render_scene_content3(server, wlr_output, &rdata_scene_data);
-       render_desktop_content(server, wlr_output, &rdata_scene_data, 3); 
+      rdata_scene_data.desktop_index = 3; // <<< SET CONTEXT
+            render_desktop_content(server, wlr_output, &rdata_scene_data, 3);
        glDisable(GL_SCISSOR_TEST);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     } else {
@@ -3755,18 +3406,23 @@ static void output_frame(struct wl_listener *listener, void *data) {
         
         if (server->current_desktop == 0) {
    //         render_scene_content0(server, wlr_output, &rdata_scene_data);
+    rdata_scene_data.desktop_index = 0;
             render_desktop_content(server, wlr_output, &rdata_scene_data, 0);
         } else if (server->current_desktop == 1) {
     //        render_scene_content1(server, wlr_output, &rdata_scene_data);
+     rdata_scene_data.desktop_index = 1;
             render_desktop_content(server, wlr_output, &rdata_scene_data, 1);
         } else if (server->current_desktop == 2) {
     //        render_scene_content2(server, wlr_output, &rdata_scene_data);
+     rdata_scene_data.desktop_index = 2;
             render_desktop_content(server, wlr_output, &rdata_scene_data, 2);
         } else if (server->current_desktop == 3) {
     //        render_scene_content3(server, wlr_output, &rdata_scene_data);
+     rdata_scene_data.desktop_index = 3;
             render_desktop_content(server, wlr_output, &rdata_scene_data, 3);
         } else {
     //        render_scene_content0(server, wlr_output, &rdata_scene_data);
+     rdata_scene_data.desktop_index = 1;
             render_desktop_content(server, wlr_output, &rdata_scene_data, 0);
         }
         
@@ -5964,6 +5620,122 @@ static const char *fullscreen_fragment_shader_src =
 "    FragColor = color;\n"
 "}\n";
 
+// Place these near your other `const char *` shader definitions in main()
+
+// Shader for Desktop 1 (Starfield)
+static const char *desktop_1_fs_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "uniform float time;\n"
+    "uniform vec2 iResolution;\n"
+    "uniform vec4 u_color;\n"
+    "#define A 9.\n"
+    "#define T (time/3e2)\n"
+    "#define H(a) (cos(radians(vec3(180, 90, 0))+(a)*6.2832)*.5+.5)\n"
+    "float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }\n"
+    "mat2 rot(float a) { float s=sin(a), c=cos(a); return mat2(c,-s,s,c); }\n"
+    "float map(vec3 u, float v) {\n"
+    "    float t = T,\n"
+    "          l = 5.,\n"
+    "          f = 1e10, i = 0., y, z;\n"
+    "    u.xy = vec2(atan(u.x, u.y), length(u.xy));\n"
+    "    u.x += t*v*3.1416*.7;\n"
+    "    for (; i++<l;) {\n"
+    "        vec3 p = u;\n"
+    "        y = round((p.y-i)/l)*l+i;\n"
+    "        p.x *= y;\n"
+    "        p.x -= y*y*t*3.1416;\n"
+    "        p.x -= round(p.x/6.2832)*6.2832;\n"
+    "        p.y -= y;\n"
+    "        z = cos(y*t*6.2832)*.5+.5;\n"
+    "        f = min(f, max(length(p.xy), -p.z-z*A) -.1 -z*.2 -p.z/1e2);\n"
+    "    }\n"
+    "    return f;\n"
+    "}\n"
+    "void main() {\n"
+    "    vec2 R = iResolution.xy, j,\n"
+    "         U = gl_FragCoord.xy;\n"
+    "    vec2 m = vec2(0, .5);\n"
+    "    vec3 o = vec3(0, 0, -130.),\n"
+    "         u = normalize(vec3(U - R/2., R.y)),\n"
+    "         c = vec3(0),\n"
+    "         p, k;\n"
+    "    float t = T,\n"
+    "          v = -o.z/3.,\n"
+    "          i = 0., d = i,\n"
+    "          s, f, z, r;\n"
+    "    bool b;\n"
+    "    for (; i++<70.;) {\n"
+    "        p = u*d + o;\n"
+    "        p.xy /= v;\n"
+    "        r = length(p.xy);\n"
+    "        z = abs(1.-r*r);\n"
+    "        b = r < 1.;\n"
+    "        if (b) z = sqrt(z);\n"
+    "        p.xy /= z+1.;\n"
+    "        p.xy -= m;\n"
+    "        p.xy *= v;\n"
+    "        p.xy -= cos(p.z/8. +t*3e2 +vec2(0, 1.5708) +z/2.)*.2;\n"
+    "        s = map(p, v);\n"
+    "        r = length(p.xy);\n"
+    "        f = cos(round(r)*t*6.2832)*.5+.5;\n"
+    "        k = H(.2 -f/3. +t +p.z/2e2);\n"
+    "        if (b) k = 1.-k;\n"
+    "        c += min(exp(s/-.05), s)\n"
+    "           * (f+.01)\n"
+    "           * min(z, 1.)\n"
+    "           * sqrt(cos(r*6.2832)*.5+.5)\n"
+    "           * k*k;\n"
+    "        if (s < 1e-3 || d > 1e3) break;\n"
+    "        d += s*clamp(z, .2, .9);\n"
+    "    }\n"
+    "    c += min(exp(-p.z-f*A)*z*k*.01/s, 1.);\n"
+    "    j = p.xy/v+m;\n"
+    "    c /= clamp(dot(j, j)*4., .04, 4.);\n"
+    "    frag_color = vec4(exp(log(c * u_color.rgb)/2.2), 1.0).bgra;\n"
+    "}\n";
+
+// Shader for Desktop 2 (Tunnel)
+static const char *desktop_2_fs_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "uniform float time;\n"
+    "uniform vec2 iResolution;\n"
+    "uniform vec4 u_color;\n"
+    "void main() {\n"
+    "    vec2 uv = (gl_FragCoord.xy * 2.0 - iResolution.xy) / iResolution.y;\n"
+    "    float t = time * 0.5;\n"
+    "    vec2 p = uv;\n"
+    "    float len = length(p);\n"
+    "    p.x += sin(len * 4.0 + t) * 0.1;\n"
+    "    p.y += cos(len * 4.0 + t) * 0.1;\n"
+    "    float a = atan(p.y, p.x);\n"
+    "    float r = length(p);\n"
+    "    float pattern = 0.5 + 0.5 * sin(a * 10.0 + r * 5.0 - t * 2.0);\n"
+    "    vec3 col = u_color.rgb * pattern * (1.0 - r * 0.5);\n"
+    "    frag_color = vec4(col, 1.0).bgra;\n"
+    "}\n";
+
+// Shader for Desktop 3 (Simple Noise)
+static const char *desktop_3_fs_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "uniform float time;\n"
+    "uniform vec2 iResolution;\n"
+    "uniform vec4 u_color;\n"
+    "float rand(vec2 n) { return fract(sin(dot(n, vec2(12.9898, 4.1414))) * 43758.5453); }\n"
+    "void main() {\n"
+    "    vec2 uv = gl_FragCoord.xy / iResolution.xy;\n"
+    "    float noise = rand(uv + time);\n"
+    "    frag_color = vec4(vec3(noise) * u_color.rgb, 1.0).bgra;\n"
+    "}\n";
+
     setenv("MESA_VK_VERSION_OVERRIDE", "1.2", 1);
     setenv("MESA_LOADER_DRIVER_OVERRIDE", "zink", 1);
    // setenv("GALLIUM_DRIVER", "zink", 1);
@@ -6207,6 +5979,35 @@ if (!create_generic_shader_program(server.renderer, "ScaledSceneViewShader",
     wlr_log(WLR_ERROR, "Failed to create scaled scene view shader program.");
     server_destroy(&server); 
     return 1;
+}
+
+const char *desktop_fs_sources[] = {
+    rect_fragment_shader_src, // Desktop 0 uses the "Melt" shader
+    desktop_1_fs_src,         // Desktop 1 uses "Starfield"
+    desktop_2_fs_src,         // Desktop 2 uses "Tunnel"
+    desktop_3_fs_src          // Desktop 3 uses "Noise"
+};
+
+for (int i = 0; i < 4; ++i) {
+    char log_name[64];
+    snprintf(log_name, sizeof(log_name), "DesktopBGShader%d", i);
+
+    struct shader_uniform_spec bg_uniforms[] = {
+        {"mvp", &server.desktop_bg_shader_mvp_loc[i]},
+        {"time", &server.desktop_bg_shader_time_loc[i]},
+        {"iResolution", &server.desktop_bg_shader_res_loc[i]},
+        {"u_color", &server.desktop_bg_shader_color_loc[i]}
+    };
+
+    if (!create_generic_shader_program(server.renderer, log_name,
+                                     rect_vertex_shader_src, // All use the same vertex shader
+                                     desktop_fs_sources[i],
+                                     &server.desktop_background_shaders[i],
+                                     bg_uniforms, sizeof(bg_uniforms) / sizeof(bg_uniforms[0]))) {
+        wlr_log(WLR_ERROR, "Failed to create desktop background shader %d.", i);
+        server_destroy(&server);
+        return 1;
+    }
 }
 
     // Initialize zoom effect variables
