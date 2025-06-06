@@ -550,6 +550,8 @@ struct wlr_xdg_toplevel_decoration_v1 *decoration;
 
      // Decoration fields
      bool ssd_pending_enable;
+
+     int desktop;
     
 };
 
@@ -624,7 +626,7 @@ static void decoration_handle_request_mode(struct wl_listener *listener, void *d
 static void update_decoration_geometry(struct tinywl_toplevel *toplevel);
  void ensure_ssd_enabled(struct tinywl_toplevel *toplevel);
  static bool setup_desktop_framebuffer(struct tinywl_server *server, int desktop_idx, int width, int height);
-
+ void update_toplevel_visibility(struct tinywl_server *server) ;
 // Function to compile a shader
 static GLuint compile_shader(GLenum type, const char *source) {
     GLuint shader = glCreateShader(type);
@@ -1011,17 +1013,23 @@ static bool handle_keybinding(struct tinywl_server *server, xkb_keysym_t sym) {
     return true;
 }
 
+/**
+ * Handles all keyboard key events.
+ *
+ * This function processes key presses in the following order of priority:
+ * 1. Alt+Shift+[1-4]: Move the focused window to the specified desktop.
+ * 2. P (no modifiers): Toggle the "expo" overview effect.
+ * 3. O (no modifiers): Cycle to the next virtual desktop.
+ * 4. Alt+[Key] (e.g., F1, Escape): Handle compositor-level shortcuts like focus cycling or exit.
+ *
+ * If a key combination is not handled by the compositor, it is forwarded to the
+ * currently focused client application.
+ */
 static void keyboard_handle_key(struct wl_listener *listener, void *data) {
     struct tinywl_keyboard *keyboard = wl_container_of(listener, keyboard, key);
     struct tinywl_server *server = keyboard->server;
     struct wlr_keyboard_key_event *event = data;
     struct wlr_seat *seat = server->seat;
-
-    wlr_log(WLR_DEBUG, "Key event: keycode=%u, state=%s, time=%u, modifiers=0x%x",
-            event->keycode,
-            event->state == WL_KEYBOARD_KEY_STATE_PRESSED ? "pressed" : "released",
-            event->time_msec,
-            wlr_keyboard_get_modifiers(keyboard->wlr_keyboard));
 
     // --- Duplicate event detection ---
     static uint32_t last_keycode_event_kbd = 0;
@@ -1038,6 +1046,7 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
     last_state_event_kbd = event->state;
     last_time_event_kbd = event->time_msec;
 
+    // --- Phantom release key detection ---
     if (event->state == WL_KEYBOARD_KEY_STATE_RELEASED && !seat->keyboard_state.focused_surface) {
         xkb_keycode_t xkb_keycode_check = event->keycode + 8;
         struct xkb_state *state_check = keyboard->wlr_keyboard->xkb_state;
@@ -1051,95 +1060,86 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
     const xkb_keysym_t *syms;
     int nsyms = xkb_state_key_get_syms(keyboard->wlr_keyboard->xkb_state, keycode_xkb, &syms);
 
-    if (nsyms <= 0) {
-        // Optional log
-    } else {
-        // Optional syms logging
-    }
-
     bool handled_by_compositor = false;
     uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
     bool needs_redraw = false;
 
-    if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-        // Handle 'P' key (without any modifiers)
-        if (!(modifiers & WLR_MODIFIER_CTRL) &&
-            !(modifiers & WLR_MODIFIER_ALT) &&
-            !(modifiers & WLR_MODIFIER_SHIFT) &&
-            !(modifiers & WLR_MODIFIER_LOGO)) {
+    // --- BINDING: Move window to a desktop (Alt + Shift + [1-4]) ---
+    if ((modifiers & (WLR_MODIFIER_ALT | WLR_MODIFIER_SHIFT)) == (WLR_MODIFIER_ALT | WLR_MODIFIER_SHIFT)) {
+        if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+            struct wlr_surface *focused_surface = server->seat->keyboard_state.focused_surface;
+            if (focused_surface) {
+                struct wlr_xdg_toplevel *xdg_toplevel = wlr_xdg_toplevel_try_from_wlr_surface(focused_surface);
+                // Check that we have our toplevel wrapper struct
+                if (xdg_toplevel && xdg_toplevel->base && xdg_toplevel->base->data) {
+                    struct tinywl_toplevel *toplevel = xdg_toplevel->base->data;
+                    int target_desktop = -1;
+
+                    for (int i = 0; i < nsyms; i++) {
+                        if (syms[i] >= XKB_KEY_1 && syms[i] <= XKB_KEY_4) {
+                            target_desktop = syms[i] - XKB_KEY_1;
+                            break;
+                        }
+                    }
+
+                    if (target_desktop != -1 && target_desktop < server->num_desktops) {
+                        wlr_log(WLR_INFO, "Moving toplevel '%s' to desktop %d",
+                                toplevel->xdg_toplevel->title, target_desktop);
+                        toplevel->desktop = target_desktop;
+                        update_toplevel_visibility(server); // Hide the window if we are not in expo mode
+                        handled_by_compositor = true;
+                    }
+                }
+            }
+        }
+    }
+
+
+    if (!handled_by_compositor && event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+        // --- BINDING: Toggle Expo View ('P' key) ---
+        if (!(modifiers & (WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT | WLR_MODIFIER_SHIFT | WLR_MODIFIER_LOGO))) {
             for (int i = 0; i < nsyms; i++) {
                 if (syms[i] == XKB_KEY_p || syms[i] == XKB_KEY_P) {
-                    if (!server->shrink_effect_active) {
-                        // --- FBO Effect is currently OFF. ---
+                     if (!server->shrink_effect_active) {
                         server->shrink_effect_active = true;
                         wlr_log(WLR_INFO, "Fullscreen Shader Effect ENABLED via 'P'.");
                         server->effect_is_target_zoomed = true;
                         server->effect_anim_start_factor = server->effect_zoom_factor_normal;
                         server->effect_anim_target_factor = server->effect_zoom_factor_zoomed;
-                        
                         if (fabs(server->effect_anim_start_factor - server->effect_anim_target_factor) > 1e-4f) {
                             server->effect_anim_start_time_sec = get_monotonic_time_seconds_as_float();
                             server->effect_is_animating_zoom = true;
-                            wlr_log(WLR_INFO, "Initial Zoom-IN Animation Started (to %.2f from %.2f)",
-                                    server->effect_anim_target_factor, server->effect_anim_start_factor);
-                        } else {
-                            server->effect_anim_current_factor = server->effect_anim_target_factor;
-                            server->effect_is_animating_zoom = false;
                         }
                     } else {
-                        // --- FBO Effect is already ON. Toggle zoom animation target state. ---
                         server->effect_is_target_zoomed = !server->effect_is_target_zoomed;
                         server->effect_anim_start_factor = server->effect_anim_current_factor;
-
-                        if (server->effect_is_target_zoomed) {
-                            server->effect_anim_target_factor = server->effect_zoom_factor_zoomed;
-                            wlr_log(WLR_INFO, "Zoom-IN Animation Triggered by 'P'.");
-                        } else {
-                            server->effect_anim_target_factor = server->effect_zoom_factor_normal;
-                            wlr_log(WLR_INFO, "Zoom-OUT Animation (to turn off effect) Triggered by 'P'.");
-                        }
-
+                        server->effect_anim_target_factor = server->effect_is_target_zoomed ?
+                            server->effect_zoom_factor_zoomed : server->effect_zoom_factor_normal;
                         if (fabs(server->effect_anim_start_factor - server->effect_anim_target_factor) > 1e-4f) {
                             server->effect_anim_start_time_sec = get_monotonic_time_seconds_as_float();
                             server->effect_is_animating_zoom = true;
-                            wlr_log(WLR_DEBUG, "Animation params: TargetFactor=%.2f, StartFactor=%.2f",
-                                    server->effect_anim_target_factor, server->effect_anim_start_factor);
-                        } else {
-                            wlr_log(WLR_INFO, "'P' pressed (effect on): Already at target factor %.2f.", server->effect_anim_target_factor);
-                            server->effect_anim_current_factor = server->effect_anim_target_factor;
-                            server->effect_is_animating_zoom = false;
                         }
                     }
+                    update_toplevel_visibility(server); // Show/hide windows based on new state
                     handled_by_compositor = true;
-                    needs_redraw = true;
                     break;
                 }
             }
         }
 
-        // Handle 'O' key for desktop switching
-        if (!(modifiers & (WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT | WLR_MODIFIER_SHIFT))) {
+        // --- BINDING: Switch Desktop ('O' key) ---
+        if (!handled_by_compositor && !(modifiers & (WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT | WLR_MODIFIER_SHIFT | WLR_MODIFIER_LOGO))) {
             for (int i = 0; i < nsyms; i++) {
                 if (syms[i] == XKB_KEY_o) {
-                    // *** CHANGED: Cycle through all desktops ***
                     int target_desktop = (server->current_desktop + 1) % server->num_desktops;
-
                     if (server->shrink_effect_active) {
-                        // Defer the desktop switch until effect is inactive
                         server->pending_desktop_switch = target_desktop;
-                        wlr_log(WLR_INFO, "Desktop switch to %d deferred until shrink effect is inactive", target_desktop);
+                        wlr_log(WLR_INFO, "Desktop switch to %d deferred.", target_desktop);
                     } else {
-                        // Perform switch immediately if effect is inactive
                         server->current_desktop = target_desktop;
-                        server->pending_desktop_switch = -1; // Clear pending switch
+                        server->pending_desktop_switch = -1;
                         wlr_log(WLR_INFO, "Switched to desktop %d", server->current_desktop);
-                        // Schedule a frame to show the change
-                        struct tinywl_output *output;
-                        wl_list_for_each(output, &server->outputs, link) {
-                            if (output->wlr_output && output->wlr_output->enabled) {
-                                wlr_output_schedule_frame(output->wlr_output);
-                            }
-                        }
+                        update_toplevel_visibility(server); // Update which windows are visible
                     }
                     handled_by_compositor = true;
                     break;
@@ -1148,17 +1148,18 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
         }
     }
 
-    // Handle Alt+Key bindings (like F1, Escape) if 'P' or 'O' wasn't handled
-    if (!handled_by_compositor && (modifiers & WLR_MODIFIER_ALT)) {
+    // --- BINDING: Compositor shortcuts (Alt + [Key]) ---
+    // Make sure Shift isn't pressed to avoid conflict with "move window" binding
+    if (!handled_by_compositor && (modifiers & WLR_MODIFIER_ALT) && !(modifiers & WLR_MODIFIER_SHIFT)) {
         for (int i = 0; i < nsyms; i++) {
             if (handle_keybinding(server, syms[i])) {
                 handled_by_compositor = true;
-                needs_redraw = true; 
+                needs_redraw = true;
                 break;
             }
         }
     }
-    
+
     if (needs_redraw) {
         struct tinywl_output *output_iter;
         wl_list_for_each(output_iter, &server->outputs, link) {
@@ -1168,7 +1169,7 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
         }
     }
 
-    // Forward key event to the focused client if not handled by the compositor
+    // --- Forward key event to the client if not handled by us ---
     if (!handled_by_compositor) {
         static struct wlr_keyboard *last_keyboard_set_on_seat = NULL;
         if (last_keyboard_set_on_seat != keyboard->wlr_keyboard) {
@@ -3244,6 +3245,68 @@ panel_rendered = false;
     glUseProgram(0);
 }
 
+static void render_desktop_content(struct tinywl_server *server,
+                                   struct wlr_output *wlr_output,
+                                   struct render_data *current_rdata,
+                                   int desktop_to_render) {
+    // Clear the target (FBO or screen)
+    glClearColor(0.0f, 0.0f, 0.0, 0.0f); // Clear with transparent black for FBOs
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    if (server->quad_vao == 0) return;
+    glBindVertexArray(server->quad_vao);
+
+    // --- Render Desktop-Specific Chrome (Background, Panel, etc.) ---
+    // We'll render these only when drawing desktop 0 to avoid duplication.
+ //   if (desktop_to_render == 0) {
+        // Render the main background rectangle
+        if (server->main_background_node && server->main_background_node->enabled) {
+            render_rect_node(server->main_background_node, current_rdata);
+        }
+        // Render the top panel
+        if (server->top_panel_node && server->top_panel_node->enabled) {
+            render_panel_node(server->top_panel_node, current_rdata);
+        }
+   // }
+
+    // --- Render Windows (Surface + Decorations) ---
+    struct wlr_scene_node *iter_node_lvl1;
+    wl_list_for_each(iter_node_lvl1, &server->scene->tree.children, link) {
+        // Skip nodes that are disabled or are part of the desktop chrome we handled above
+        if (!iter_node_lvl1->enabled || iter_node_lvl1 == server->main_background_node || iter_node_lvl1 == server->top_panel_node) {
+            continue;
+        }
+
+        if (iter_node_lvl1->type == WLR_SCENE_NODE_TREE) {
+            struct tinywl_toplevel *toplevel_ptr = iter_node_lvl1->data;
+
+            // THIS IS THE KEY CHECK: Only render toplevels belonging to the target desktop
+            if (toplevel_ptr && toplevel_ptr->type == TINYWL_TOPLEVEL_XDG && toplevel_ptr->desktop == desktop_to_render) {
+                struct wlr_scene_tree *toplevel_s_tree = wlr_scene_tree_from_node(iter_node_lvl1);
+
+                // First render SSD decorations if enabled
+                if (toplevel_ptr->ssd.enabled) {
+                    struct wlr_scene_node *ssd_node_candidate;
+                    wl_list_for_each(ssd_node_candidate, &toplevel_s_tree->children, link) {
+                        if (ssd_node_candidate->enabled && ssd_node_candidate->type == WLR_SCENE_NODE_RECT) {
+                            render_rect_node(ssd_node_candidate, current_rdata);
+                        }
+                    }
+                }
+
+                // Then render the window surface/buffers
+                if (server->shader_program != 0) {
+                    glUseProgram(server->shader_program);
+                    wlr_scene_node_for_each_buffer(&toplevel_s_tree->node, scene_buffer_iterator, current_rdata);
+                }
+            }
+        }
+    }
+
+    glBindVertexArray(0);
+    glUseProgram(0);
+}
+
 
 // Helper function to manually create a texture transform matrix (if wlr_matrix_texture_transform is missing)
 // This is a simplified version. A full one would handle all 8 transforms.
@@ -3601,8 +3664,9 @@ static void output_frame(struct wl_listener *listener, void *data) {
         glDisable(GL_DEPTH_TEST);
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
-        render_scene_content0(server, wlr_output, &rdata_scene_data);
-        glDisable(GL_SCISSOR_TEST);
+      //  render_scene_content0(server, wlr_output, &rdata_scene_data);
+      render_desktop_content(server, wlr_output, &rdata_scene_data, 0);  
+      glDisable(GL_SCISSOR_TEST);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
         // Render desktop 1 to desktop_fbos[1]
@@ -3616,8 +3680,9 @@ static void output_frame(struct wl_listener *listener, void *data) {
         glDisable(GL_DEPTH_TEST);
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
-        render_scene_content1(server, wlr_output, &rdata_scene_data);
-        glDisable(GL_SCISSOR_TEST);
+       // render_scene_content1(server, wlr_output, &rdata_scene_data);
+       render_desktop_content(server, wlr_output, &rdata_scene_data, 1); 
+       glDisable(GL_SCISSOR_TEST);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
         // Render desktop 2 to desktop_fbos[1]
@@ -3631,8 +3696,9 @@ static void output_frame(struct wl_listener *listener, void *data) {
         glDisable(GL_DEPTH_TEST);
         glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
-        render_scene_content2(server, wlr_output, &rdata_scene_data);
-        glDisable(GL_SCISSOR_TEST);
+       // render_scene_content2(server, wlr_output, &rdata_scene_data);
+       render_desktop_content(server, wlr_output, &rdata_scene_data, 2); 
+       glDisable(GL_SCISSOR_TEST);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
         // Render desktop 3 to desktop_fbos[1]
@@ -3646,8 +3712,9 @@ static void output_frame(struct wl_listener *listener, void *data) {
         glDisable(GL_DEPTH_TEST);
         glClearColor(0.0f, 1.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
-        render_scene_content3(server, wlr_output, &rdata_scene_data);
-        glDisable(GL_SCISSOR_TEST);
+       // render_scene_content3(server, wlr_output, &rdata_scene_data);
+       render_desktop_content(server, wlr_output, &rdata_scene_data, 3); 
+       glDisable(GL_SCISSOR_TEST);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     } else {
         wlr_output_state_init(&output_state_direct);
@@ -3687,15 +3754,20 @@ static void output_frame(struct wl_listener *listener, void *data) {
         glDisable(GL_DEPTH_TEST);
         
         if (server->current_desktop == 0) {
-            render_scene_content0(server, wlr_output, &rdata_scene_data);
+   //         render_scene_content0(server, wlr_output, &rdata_scene_data);
+            render_desktop_content(server, wlr_output, &rdata_scene_data, 0);
         } else if (server->current_desktop == 1) {
-            render_scene_content1(server, wlr_output, &rdata_scene_data);
+    //        render_scene_content1(server, wlr_output, &rdata_scene_data);
+            render_desktop_content(server, wlr_output, &rdata_scene_data, 1);
         } else if (server->current_desktop == 2) {
-            render_scene_content2(server, wlr_output, &rdata_scene_data);
+    //        render_scene_content2(server, wlr_output, &rdata_scene_data);
+            render_desktop_content(server, wlr_output, &rdata_scene_data, 2);
         } else if (server->current_desktop == 3) {
-            render_scene_content3(server, wlr_output, &rdata_scene_data);
+    //        render_scene_content3(server, wlr_output, &rdata_scene_data);
+            render_desktop_content(server, wlr_output, &rdata_scene_data, 3);
         } else {
-            render_scene_content0(server, wlr_output, &rdata_scene_data);
+    //        render_scene_content0(server, wlr_output, &rdata_scene_data);
+            render_desktop_content(server, wlr_output, &rdata_scene_data, 0);
         }
         
         glDisable(GL_SCISSOR_TEST);
@@ -4479,6 +4551,9 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
         return;
     }
 
+    toplevel->desktop = server->current_desktop; // Assign to current desktop
+    wlr_log(WLR_INFO, "New toplevel created on desktop %d", toplevel->desktop);
+
     toplevel->server = server;
     toplevel->xdg_toplevel = xdg_toplevel;
     wl_list_init(&toplevel->link);
@@ -4541,6 +4616,29 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
             (void*)toplevel, xdg_toplevel->title ? xdg_toplevel->title : "N/A");
 }
 
+void update_toplevel_visibility(struct tinywl_server *server) {
+    wlr_log(WLR_DEBUG, "Updating toplevel visibility. Current desktop: %d, Expo active: %d",
+            server->current_desktop, server->shrink_effect_active);
+
+    struct tinywl_toplevel *toplevel;
+    wl_list_for_each(toplevel, &server->toplevels, link) {
+        if (toplevel->scene_tree) {
+            // A toplevel is visible if expo is on, OR if its desktop matches the current one.
+            bool visible = server->shrink_effect_active || (toplevel->desktop == server->current_desktop);
+            wlr_scene_node_set_enabled(&toplevel->scene_tree->node, visible);
+            wlr_log(WLR_DEBUG, "  Toplevel on desktop %d is now %s.",
+                    toplevel->desktop, visible ? "ENABLED" : "DISABLED");
+        }
+    }
+
+    // Schedule a frame on all outputs to reflect the change
+    struct tinywl_output *output;
+    wl_list_for_each(output, &server->outputs, link) {
+        if (output->wlr_output && output->wlr_output->enabled) {
+            wlr_output_schedule_frame(output->wlr_output);
+        }
+    }
+}
 
 
 static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
