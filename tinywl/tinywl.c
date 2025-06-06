@@ -444,23 +444,19 @@ struct wl_listener pointer_motion;
     struct wlr_xdg_decoration_manager_v1 *xdg_decoration_manager;
 struct wl_listener xdg_decoration_new;
 
- // Instead of single desktop0_fbo, use arrays or separate fields:
+ // Instead of single desktop_fbos[0], use arrays or separate fields:
     GLuint desktop_fbos[4];        // Support up to 4 virtual desktops
     GLuint desktop_textures[4];    // Corresponding textures
     GLuint desktop_rbos[4];        // Render buffer objects if needed
+int intermediate_width[4];
+int intermediate_height[4];
+GLuint intermediate_texture[4];
+GLuint intermediate_rbo[4];
+
     int desktop_count;             // Number of active desktops
-    int current_desktop;  
-GLuint desktop0_fbo;
-    GLuint intermediate_texture0;
-    GLuint intermediate_rbo0; // render buffer for depth if needed
-    int intermediate_width0, intermediate_height0;
-
-
-GLuint desktop1_fbo;
-  
-    GLuint intermediate_texture1;
-    GLuint intermediate_rbo1; // render buffer for depth if needed
-    int intermediate_width1, intermediate_height1;
+    int current_desktop;
+    
+    
 
 
      struct desktop_fb *desktops;
@@ -3157,34 +3153,35 @@ static void manual_texture_transform(float mat[static 9], enum wl_output_transfo
 }
 
 
-
-
-static bool setup_intermediate_framebuffer1(struct tinywl_server *server, int width, int height) {
+static bool setup_intermediate_framebuffer(struct tinywl_server *server, int width, int height, int desktop){
     GLenum err;
 
     struct wlr_egl *egl = wlr_gles2_renderer_get_egl(server->renderer);
     if (!egl) {
-        wlr_log(WLR_ERROR, "setup_intermediate_framebuffer: Failed to get EGL from renderer.");
+        wlr_log(WLR_ERROR, "setup_intermediate_framebuffer%d: Failed to get EGL from renderer.",desktop);
         return false;
     }
     struct wlr_egl_context saved_ctx;
     if (!wlr_egl_make_current(egl, &saved_ctx)) {
-        wlr_log(WLR_ERROR, "setup_intermediate_framebuffer: Failed to make EGL context current.");
+        wlr_log(WLR_ERROR, "setup_intermediate_framebuffer%d: Failed to make EGL context current.",desktop);
         return false;
     }
 
     while ((err = glGetError()) != GL_NO_ERROR) {
-        wlr_log(WLR_DEBUG, "setup_intermediate_framebuffer: Clearing pre-existing GL error: 0x%x", err);
-    }
+        wlr_log(WLR_DEBUG, "setup_intermediate_framebuffer%d: Clearing pre-existing GL error: 0x%x",desktop, err);
+    }    
 
-    if (server->desktop0_fbo != 0) {
-        if (server->intermediate_width0 != width || server->intermediate_height0 != height) {
+
+   
+
+    if (server->desktop_fbos[desktop] != 0) {
+        if (server->intermediate_width[desktop] != width || server->intermediate_height[desktop] != height) {
             wlr_log(WLR_INFO, "setup_intermediate_framebuffer: Resizing FBO from %dx%d to %dx%d",
-                    server->intermediate_width0, server->intermediate_height0, width, height);
-            glDeleteFramebuffers(1, &server->desktop0_fbo); server->desktop0_fbo = 0;
-            glDeleteTextures(1, &server->intermediate_texture0); server->intermediate_texture0 = 0;
-            if (server->intermediate_rbo0 != 0) {
-                glDeleteRenderbuffers(1, &server->intermediate_rbo0); server->intermediate_rbo0 = 0;
+                    server->intermediate_width[desktop], server->intermediate_height[desktop], width, height);
+            glDeleteFramebuffers(1, &server->desktop_fbos[desktop]); server->desktop_fbos[desktop] = 0;
+            glDeleteTextures(1, &server->intermediate_texture[desktop]); server->intermediate_texture[desktop] = 0;
+            if (server->intermediate_rbo[desktop] != 0) {
+                glDeleteRenderbuffers(1, &server->intermediate_rbo[desktop]); server->intermediate_rbo[desktop] = 0;
             }
         } else {
             // Dimensions are the same, FBO can be reused.
@@ -3193,10 +3190,10 @@ static bool setup_intermediate_framebuffer1(struct tinywl_server *server, int wi
         }
     }
     
-    glGenTextures(1, &server->intermediate_texture0);
+    glGenTextures(1, &server->intermediate_texture[desktop]);
     if ((err = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL error after glGenTextures: 0x%x", err); goto error_cleanup; }
     
-    glBindTexture(GL_TEXTURE_2D, server->intermediate_texture0);
+    glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[desktop]);
     if ((err = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL error after glBindTexture: 0x%x", err); goto error_cleanup; }
     
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
@@ -3217,13 +3214,13 @@ static bool setup_intermediate_framebuffer1(struct tinywl_server *server, int wi
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     if ((err = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL error after glTexParameteri: 0x%x", err); goto error_cleanup; }
 
-    glGenFramebuffers(1, &server->desktop0_fbo);
+    glGenFramebuffers(1, &server->desktop_fbos[desktop]);
     if ((err = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL error after glGenFramebuffers: 0x%x", err); goto error_cleanup; }
     
-    glBindFramebuffer(GL_FRAMEBUFFER, server->desktop0_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, server->desktop_fbos[desktop]);
     if ((err = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL error after glBindFramebuffer: 0x%x", err); goto error_cleanup; }
     
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, server->intermediate_texture0, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, server->intermediate_texture[desktop], 0);
     if ((err = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL error after glFramebufferTexture2D: 0x%x", err); goto error_cleanup; }
 
     GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
@@ -3266,159 +3263,35 @@ static bool setup_intermediate_framebuffer1(struct tinywl_server *server, int wi
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glBindTexture(GL_TEXTURE_2D, 0);    
     
-    server->intermediate_width0 = width;
-    server->intermediate_height0 = height;
+    server->intermediate_width[desktop] = width;
+    server->intermediate_height[desktop] = height;
     
     wlr_log(WLR_INFO, "Intermediate framebuffer created/verified: %dx%d, FBO ID: %u, Texture ID: %u",
-            width, height, server->desktop0_fbo, server->intermediate_texture0);
+           width, height, server->desktop_fbos[desktop], server->intermediate_texture[desktop]);
     wlr_egl_restore_context(&saved_ctx);
     return true;
 
+
 error_cleanup:
-    if (server->desktop0_fbo != 0) {
-        glDeleteFramebuffers(1, &server->desktop0_fbo);
-        server->desktop0_fbo = 0;
+
+
+
+    if (server->desktop_fbos[desktop] != 0) {
+        glDeleteFramebuffers(1, &server->desktop_fbos[desktop]);
+        server->desktop_fbos[desktop] = 0;
     }
-    if (server->intermediate_texture0 != 0) {
-        glDeleteTextures(1, &server->intermediate_texture0);
-        server->intermediate_texture0 = 0;
+    if (server->intermediate_texture[desktop] != 0) {
+        glDeleteTextures(1, &server->intermediate_texture[desktop]);
+        server->intermediate_texture[desktop] = 0;
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glBindTexture(GL_TEXTURE_2D, 0);
     wlr_egl_restore_context(&saved_ctx);
     return false;
+
+
+
 }
-
-
-static bool setup_intermediate_framebuffer2(struct tinywl_server *server, int width, int height) {
-    GLenum err;
-
-    struct wlr_egl *egl = wlr_gles2_renderer_get_egl(server->renderer);
-    if (!egl) {
-        wlr_log(WLR_ERROR, "setup_intermediate_framebuffer2: Failed to get EGL from renderer.");
-        return false;
-    }
-    struct wlr_egl_context saved_ctx;
-    if (!wlr_egl_make_current(egl, &saved_ctx)) {
-        wlr_log(WLR_ERROR, "setup_intermediate_framebuffer2: Failed to make EGL context current.");
-        return false;
-    }
-
-    while ((err = glGetError()) != GL_NO_ERROR) {
-        wlr_log(WLR_DEBUG, "setup_intermediate_framebuffer2: Clearing pre-existing GL error: 0x%x", err);
-    }
-
-    if (server->desktop1_fbo != 0) {
-        if (server->intermediate_width1 != width || server->intermediate_height1 != height) {
-            wlr_log(WLR_INFO, "setup_intermediate_framebuffer2: Resizing FBO from %dx%d to %dx%d",
-                    server->intermediate_width1, server->intermediate_height1, width, height);
-            glDeleteFramebuffers(1, &server->desktop1_fbo); server->desktop1_fbo = 0;
-            // FIX: Delete the correct texture (texture1, not texture0)
-            glDeleteTextures(1, &server->intermediate_texture1); server->intermediate_texture1 = 0;
-            if (server->intermediate_rbo1 != 0) {
-                glDeleteRenderbuffers(1, &server->intermediate_rbo1); server->intermediate_rbo1 = 0;
-            }
-        } else {
-            // Dimensions are the same, FBO can be reused.
-            // Context is already current from above.
-            return true; // No need to restore yet if FBO is fine
-        }
-    }
-    
-    // FIX: Generate texture1, not texture0
-    glGenTextures(1, &server->intermediate_texture1);
-    if ((err = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL error after glGenTextures: 0x%x", err); goto error_cleanup; }
-    
-    // FIX: Bind texture1, not texture0
-    glBindTexture(GL_TEXTURE_2D, server->intermediate_texture1);
-    if ((err = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL error after glBindTexture: 0x%x", err); goto error_cleanup; }
-    
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-    if ((err = glGetError()) != GL_NO_ERROR) {
-        wlr_log(WLR_ERROR, "GL error after glTexImage2D(GL_RGBA8, %dx%d): 0x%x. Trying GL_RGBA.", width, height, err);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-        if ((err = glGetError()) != GL_NO_ERROR) {
-             wlr_log(WLR_ERROR, "GL error after fallback glTexImage2D(GL_RGBA, %dx%d): 0x%x", width, height, err);
-             goto error_cleanup;
-        } else {
-            wlr_log(WLR_INFO, "Used fallback GL_RGBA for intermediate texture1.");
-        }
-    }
-    
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    if ((err = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL error after glTexParameteri: 0x%x", err); goto error_cleanup; }
-
-    glGenFramebuffers(1, &server->desktop1_fbo);
-    if ((err = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL error after glGenFramebuffers: 0x%x", err); goto error_cleanup; }
-    
-    glBindFramebuffer(GL_FRAMEBUFFER, server->desktop1_fbo);
-    if ((err = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL error after glBindFramebuffer: 0x%x", err); goto error_cleanup; }
-    
-    // FIX: Attach texture1, not texture0
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, server->intermediate_texture1, 0);
-    if ((err = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL error after glFramebufferTexture2D: 0x%x", err); goto error_cleanup; }
-
-    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    if ((err = glGetError()) != GL_NO_ERROR) {
-        wlr_log(WLR_ERROR, "GL error *during* glCheckFramebufferStatus call: 0x%x. FBO Status was reported as: 0x%x", err, status);
-    }
-
-    if (status != GL_FRAMEBUFFER_COMPLETE) {
-        wlr_log(WLR_ERROR, "Intermediate framebuffer2 not complete. Status: 0x%x (width: %d, height: %d)", status, width, height);
-        switch (status) {
-            case GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT: 
-                wlr_log(WLR_ERROR, " Reason: GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT"); break;
-            case GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT: 
-                wlr_log(WLR_ERROR, " Reason: GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT"); break;
-            case GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS:
-                wlr_log(WLR_ERROR, " Reason: GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS"); break;
-            case GL_FRAMEBUFFER_UNSUPPORTED: 
-                wlr_log(WLR_ERROR, " Reason: GL_FRAMEBUFFER_UNSUPPORTED (format combination not supported)"); break;
-#ifdef GL_FRAMEBUFFER_UNDEFINED 
-            case GL_FRAMEBUFFER_UNDEFINED: 
-                wlr_log(WLR_ERROR, " Reason: GL_FRAMEBUFFER_UNDEFINED (should not happen for non-default FBO)"); break;
-#endif
-#ifdef GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE
-            case GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE: 
-                wlr_log(WLR_ERROR, " Reason: GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE (GLES 3.0+)"); break;
-#endif
-            default: 
-                wlr_log(WLR_ERROR, " Reason: Unknown or less common FBO status code (0x%x). Could be 0 if glCheckFramebufferStatus itself failed.", status); break;
-        }
-        goto error_cleanup;
-    }
-
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glBindTexture(GL_TEXTURE_2D, 0);    
-    
-    server->intermediate_width1 = width;
-    server->intermediate_height1 = height;
-    
-    // FIX: Log the correct texture ID (texture1)
-    wlr_log(WLR_INFO, "Intermediate framebuffer2 created/verified: %dx%d, FBO ID: %u, Texture ID: %u",
-            width, height, server->desktop1_fbo, server->intermediate_texture1);
-    wlr_egl_restore_context(&saved_ctx);
-    return true;
-
-error_cleanup:
-    if (server->desktop1_fbo != 0) {
-        glDeleteFramebuffers(1, &server->desktop1_fbo);
-        server->desktop1_fbo = 0;
-    }
-    // FIX: Clean up the correct texture (texture1, not texture0)
-    if (server->intermediate_texture1 != 0) {
-        glDeleteTextures(1, &server->intermediate_texture1);
-        server->intermediate_texture1 = 0;
-    }
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glBindTexture(GL_TEXTURE_2D, 0);
-    wlr_egl_restore_context(&saved_ctx);
-    return false;
-}
-
 
 GLuint create_red_texture() {
     GLuint texture;
@@ -3527,8 +3400,8 @@ static bool setup_all_desktops(struct tinywl_server *server, int width, int heig
             server->num_desktops, width, height);
     
     // Set up intermediate dimensions
-    server->intermediate_width0 = width;
-    server->intermediate_height0 = height;
+    server->intermediate_width[0] = width;
+    server->intermediate_height[0] = height;
     
     // Set up all desktop framebuffers
     for (int i = 0; i < server->num_desktops; i++) {
@@ -3890,21 +3763,22 @@ static void output_frame(struct wl_listener *listener, void *data) {
     };
 
     if (current_frame_fbo_path) {
-        if (!setup_intermediate_framebuffer1(server, wlr_output->width, wlr_output->height)) {
+        if (!setup_intermediate_framebuffer(server, wlr_output->width, wlr_output->height,0))
+         {
             wlr_log(WLR_ERROR, "[%s] Failed to setup FBO1.", wlr_output->name);
             current_frame_fbo_path = false;
         }
-        if (!setup_intermediate_framebuffer2(server, wlr_output->width, wlr_output->height)) {
+        if (!setup_intermediate_framebuffer(server, wlr_output->width, wlr_output->height,1)) {
             wlr_log(WLR_ERROR, "[%s] Failed to setup FBO2.", wlr_output->name);
             current_frame_fbo_path = false;
         }
     }
 
     if (current_frame_fbo_path) {
-        // Render desktop 0 to desktop0_fbo
-        glBindFramebuffer(GL_FRAMEBUFFER, server->desktop0_fbo);
-        glViewport(0, 0, server->intermediate_width0, server->intermediate_height0);
-        glScissor(0, 0, server->intermediate_width0, server->intermediate_height0);
+        // Render desktop 0 to desktop_fbos[0]
+        glBindFramebuffer(GL_FRAMEBUFFER, server->desktop_fbos[0]);
+        glViewport(0, 0, server->intermediate_width[0], server->intermediate_height[0]);
+        glScissor(0, 0, server->intermediate_width[0], server->intermediate_height[0]);
         glEnable(GL_SCISSOR_TEST);
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -3916,10 +3790,10 @@ static void output_frame(struct wl_listener *listener, void *data) {
         glDisable(GL_SCISSOR_TEST);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-        // Render desktop 1 to desktop1_fbo
-        glBindFramebuffer(GL_FRAMEBUFFER, server->desktop1_fbo);
-        glViewport(0, 0, server->intermediate_width1, server->intermediate_height1);
-        glScissor(0, 0, server->intermediate_width1, server->intermediate_height1);
+        // Render desktop 1 to desktop_fbos[1]
+        glBindFramebuffer(GL_FRAMEBUFFER, server->desktop_fbos[1]);
+        glViewport(0, 0, server->intermediate_width[1], server->intermediate_height[1]);
+        glScissor(0, 0, server->intermediate_width[1], server->intermediate_height[1]);
         glEnable(GL_SCISSOR_TEST);
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -4017,16 +3891,16 @@ static void output_frame(struct wl_listener *listener, void *data) {
 
             if (server->fullscreen_shader_scene_tex0_loc != -1) {
                 glActiveTexture(GL_TEXTURE0);
-                glBindTexture(GL_TEXTURE_2D, server->intermediate_texture0);
+                glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[0]);
                 glUniform1i(server->fullscreen_shader_scene_tex0_loc, 0);
-                wlr_log(WLR_DEBUG, "[%s] Bound texture0 (ID %d) for desktop 0", wlr_output->name, server->intermediate_texture0);
+                wlr_log(WLR_DEBUG, "[%s] Bound texture0 (ID %d) for desktop 0", wlr_output->name, server->intermediate_texture[0]);
             }
 
             if (server->fullscreen_shader_scene_tex1_loc != -1) {
                 glActiveTexture(GL_TEXTURE1);
-                glBindTexture(GL_TEXTURE_2D, server->intermediate_texture1);
+                glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[1]);
                 glUniform1i(server->fullscreen_shader_scene_tex1_loc, 1);
-                wlr_log(WLR_DEBUG, "[%s] Bound texture1 (ID %d) for desktop 1", wlr_output->name, server->intermediate_texture1);
+                wlr_log(WLR_DEBUG, "[%s] Bound texture1 (ID %d) for desktop 1", wlr_output->name, server->intermediate_texture[1]);
             }
 
             if (server->fullscreen_shader_zoom_loc != -1) {
