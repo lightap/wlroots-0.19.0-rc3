@@ -446,7 +446,6 @@ struct wl_listener xdg_decoration_new;
 
  // Instead of single desktop_fbos[0], use arrays or separate fields:
     GLuint desktop_fbos[4];        // Support up to 4 virtual desktops
-    GLuint desktop_textures[4];    // Corresponding textures
     GLuint desktop_rbos[4];        // Render buffer objects if needed
 int intermediate_width[4];
 int intermediate_height[4];
@@ -1122,8 +1121,9 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
         if (!(modifiers & (WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT | WLR_MODIFIER_SHIFT))) {
             for (int i = 0; i < nsyms; i++) {
                 if (syms[i] == XKB_KEY_o) {
-                    // Calculate target desktop
-                    int target_desktop = 1 - server->current_desktop;
+                    // *** CHANGED: Cycle through all desktops ***
+                    int target_desktop = (server->current_desktop + 1) % server->num_desktops;
+
                     if (server->shrink_effect_active) {
                         // Defer the desktop switch until effect is inactive
                         server->pending_desktop_switch = target_desktop;
@@ -1859,22 +1859,6 @@ float get_monotonic_time_seconds_as_float(void) {
 
 
 
-
-// Function to switch desktops
-void switch_to_desktop(struct tinywl_server *server, int desktop_num) {
-    if (desktop_num >= 0 && desktop_num < server->desktop_count) {
-        server->current_desktop = desktop_num;
-        wlr_log(WLR_INFO, "Switched to desktop %d", desktop_num);
-        
-        // Schedule frame updates for all outputs
-        struct tinywl_output *output_iter;
-        wl_list_for_each(output_iter, &server->outputs, link) {
-            if (output_iter->wlr_output && output_iter->wlr_output->enabled) {
-                wlr_output_schedule_frame(output_iter->wlr_output);
-            }
-        }
-    }
-}
 
 
 
@@ -3086,6 +3070,181 @@ panel_rendered = false;
 
 
 
+static void render_scene_content2(struct tinywl_server *server,
+                                 struct wlr_output *wlr_output, // Final display output
+                                 struct render_data *current_rdata) { // Pass has target info
+    // Clear current target (FBO or screen)
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f); // Clear with transparent black for FBO
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    if (server->quad_vao == 0) {
+        wlr_log(WLR_ERROR, "[RENDER_SCENE_CONTENT:%s] Quad VAO is zero! Skipping custom draw.", wlr_output->name);
+        return;
+    }
+    glBindVertexArray(server->quad_vao);
+
+ 
+
+    // --- Render Windows (Surface + Decorations Together) ---
+struct wlr_scene_node *iter_node_lvl1;
+
+// Static variable to track if panel has been rendered this frame
+static bool panel_rendered = false;
+
+
+wl_list_for_each(iter_node_lvl1, &server->scene->tree.children, link) {
+    if (!iter_node_lvl1->enabled) continue;
+    
+    // Skip panel - we've already rendered it above
+    if (iter_node_lvl1 == server->top_panel_node && iter_node_lvl1->type == WLR_SCENE_NODE_RECT) continue;
+    
+    if (iter_node_lvl1->type == WLR_SCENE_NODE_RECT) {
+        // Render standalone background rects (not part of windows)
+        render_rect_node(iter_node_lvl1, current_rdata);
+    } else if (iter_node_lvl1->type == WLR_SCENE_NODE_TREE) {
+        struct tinywl_toplevel *toplevel_ptr = iter_node_lvl1->data;
+        
+        if (toplevel_ptr && toplevel_ptr->type == TINYWL_TOPLEVEL_XDG) {
+            struct wlr_scene_tree *toplevel_s_tree = wlr_scene_tree_from_node(iter_node_lvl1);
+
+
+// Render panel once at the beginning if it exists and hasn't been rendered yet
+if (!panel_rendered && server->top_panel_node && server->top_panel_node->enabled &&
+    server->top_panel_node->type == WLR_SCENE_NODE_RECT && server->panel_shader_program != 0) {
+    render_panel_node(server->top_panel_node, current_rdata);
+    panel_rendered = true;
+}            
+    /*        // First render SSD decorations if enabled
+            if (toplevel_ptr->ssd.enabled) {
+                struct wlr_scene_node *ssd_node_candidate;
+                wl_list_for_each(ssd_node_candidate, &toplevel_s_tree->children, link) {
+                    if (ssd_node_candidate->enabled && ssd_node_candidate->type == WLR_SCENE_NODE_RECT) {
+                        if ( (toplevel_ptr->ssd.title_bar && ssd_node_candidate == &toplevel_ptr->ssd.title_bar->node) ||
+                             (toplevel_ptr->ssd.border_left && ssd_node_candidate == &toplevel_ptr->ssd.border_left->node) ||
+                             (toplevel_ptr->ssd.border_right && ssd_node_candidate == &toplevel_ptr->ssd.border_right->node) ||
+                             (toplevel_ptr->ssd.border_bottom && ssd_node_candidate == &toplevel_ptr->ssd.border_bottom->node) ) {
+                            render_rect_node(ssd_node_candidate, current_rdata);
+                        }
+                    }
+                }
+            }
+      */    
+            // Then render the window surface/buffers for this specific window
+            if (server->shader_program != 0) {
+                glUseProgram(server->shader_program);
+                wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Rendering buffers for window with flame_shader ID %u",
+                        wlr_output->name, server->shader_program);
+                wlr_scene_node_for_each_buffer(&toplevel_s_tree->node, scene_buffer_iterator, current_rdata);
+            } else {
+                wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Client flame shader (shader_program) is 0.", wlr_output->name);
+            }
+        } else {
+            // For non-window trees, render any buffers they might contain
+            if (server->shader_program != 0) {
+                glUseProgram(server->shader_program);
+                wlr_scene_node_for_each_buffer(iter_node_lvl1, scene_buffer_iterator, current_rdata);
+            }
+        }
+    }
+}
+
+// Reset the static variable for the next frame (add this at the end of your frame rendering function)
+panel_rendered = false;
+
+
+    glBindVertexArray(0);
+    glUseProgram(0);
+}
+
+
+
+static void render_scene_content3(struct tinywl_server *server,
+                                 struct wlr_output *wlr_output, // Final display output
+                                 struct render_data *current_rdata) { // Pass has target info
+    // Clear current target (FBO or screen)
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f); // Clear with transparent black for FBO
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    if (server->quad_vao == 0) {
+        wlr_log(WLR_ERROR, "[RENDER_SCENE_CONTENT:%s] Quad VAO is zero! Skipping custom draw.", wlr_output->name);
+        return;
+    }
+    glBindVertexArray(server->quad_vao);
+
+ 
+
+    // --- Render Windows (Surface + Decorations Together) ---
+struct wlr_scene_node *iter_node_lvl1;
+
+// Static variable to track if panel has been rendered this frame
+static bool panel_rendered = false;
+
+
+wl_list_for_each(iter_node_lvl1, &server->scene->tree.children, link) {
+    if (!iter_node_lvl1->enabled) continue;
+    
+    // Skip panel - we've already rendered it above
+    if (iter_node_lvl1 == server->top_panel_node && iter_node_lvl1->type == WLR_SCENE_NODE_RECT) continue;
+    
+    if (iter_node_lvl1->type == WLR_SCENE_NODE_RECT) {
+        // Render standalone background rects (not part of windows)
+        render_rect_node(iter_node_lvl1, current_rdata);
+    } else if (iter_node_lvl1->type == WLR_SCENE_NODE_TREE) {
+        struct tinywl_toplevel *toplevel_ptr = iter_node_lvl1->data;
+        
+        if (toplevel_ptr && toplevel_ptr->type == TINYWL_TOPLEVEL_XDG) {
+            struct wlr_scene_tree *toplevel_s_tree = wlr_scene_tree_from_node(iter_node_lvl1);
+
+/*
+// Render panel once at the beginning if it exists and hasn't been rendered yet
+if (!panel_rendered && server->top_panel_node && server->top_panel_node->enabled &&
+    server->top_panel_node->type == WLR_SCENE_NODE_RECT && server->panel_shader_program != 0) {
+    render_panel_node(server->top_panel_node, current_rdata);
+    panel_rendered = true;
+} */           
+            // First render SSD decorations if enabled
+            if (toplevel_ptr->ssd.enabled) {
+                struct wlr_scene_node *ssd_node_candidate;
+                wl_list_for_each(ssd_node_candidate, &toplevel_s_tree->children, link) {
+                    if (ssd_node_candidate->enabled && ssd_node_candidate->type == WLR_SCENE_NODE_RECT) {
+                        if ( (toplevel_ptr->ssd.title_bar && ssd_node_candidate == &toplevel_ptr->ssd.title_bar->node) ||
+                             (toplevel_ptr->ssd.border_left && ssd_node_candidate == &toplevel_ptr->ssd.border_left->node) ||
+                             (toplevel_ptr->ssd.border_right && ssd_node_candidate == &toplevel_ptr->ssd.border_right->node) ||
+                             (toplevel_ptr->ssd.border_bottom && ssd_node_candidate == &toplevel_ptr->ssd.border_bottom->node) ) {
+                            render_rect_node(ssd_node_candidate, current_rdata);
+                        }
+                    }
+                }
+            }
+           
+            // Then render the window surface/buffers for this specific window
+            if (server->shader_program != 0) {
+       //         glUseProgram(server->shader_program);
+         //       wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Rendering buffers for window with flame_shader ID %u",
+           //             wlr_output->name, server->shader_program);
+             //   wlr_scene_node_for_each_buffer(&toplevel_s_tree->node, scene_buffer_iterator, current_rdata);
+            } else {
+               // wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Client flame shader (shader_program) is 0.", wlr_output->name);
+            }
+        } else {
+            // For non-window trees, render any buffers they might contain
+            if (server->shader_program != 0) {
+             //   glUseProgram(server->shader_program);
+             //   wlr_scene_node_for_each_buffer(iter_node_lvl1, scene_buffer_iterator, current_rdata);
+            }
+        }
+    }
+}
+
+// Reset the static variable for the next frame (add this at the end of your frame rendering function)
+panel_rendered = false;
+
+
+    glBindVertexArray(0);
+    glUseProgram(0);
+}
+
+
 // Helper function to manually create a texture transform matrix (if wlr_matrix_texture_transform is missing)
 // This is a simplified version. A full one would handle all 8 transforms.
 // tex_coords are typically (0,0) top-left, (1,1) bottom-right.
@@ -3293,343 +3452,11 @@ error_cleanup:
 
 }
 
-GLuint create_red_texture() {
-    GLuint texture;
-    glGenTextures(1, &texture);
-    glBindTexture(GL_TEXTURE_2D, texture);
-    
-    // 1x1 red pixel
-    unsigned char red_pixel[4] = {255, 0, 0, 255}; // RGBA
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, red_pixel);
-    
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-    
-    return texture;
-}
-// Initialize the desktop system
-bool init_desktop_system(struct tinywl_server *server, int num_desktops) {
-    if (!server) {
-        wlr_log(WLR_ERROR, "init_desktop_system: server is NULL");
-        return false;
-    }
-    
-    if (num_desktops <= 0 || num_desktops > 16) { // reasonable limit
-        wlr_log(WLR_ERROR, "init_desktop_system: Invalid num_desktops: %d", num_desktops);
-        return false;
-    }
-    
-   
-    
-    // Allocate desktop array
-    server->desktops = calloc(num_desktops, sizeof(struct desktop_fb));
-    if (!server->desktops) {
-        wlr_log(WLR_ERROR, "init_desktop_system: Failed to allocate memory for %d desktops", num_desktops);
-        return false;
-    }
-    
-    server->num_desktops = num_desktops;
-    server->current_desktop = 0; // Start with desktop 0
-    
-    // Initialize all desktop structures to zero (calloc already did this, but be explicit)
-    for (int i = 0; i < num_desktops; i++) {
-        server->desktops[i].fbo = 0;
-        server->desktops[i].texture = 0;
-        server->desktops[i].rbo = 0;
-        server->desktops[i].width = 0;
-        server->desktops[i].height = 0;
-    }
-    
-    wlr_log(WLR_INFO, "Desktop system initialized with %d desktops", num_desktops);
-    return true;
-}
-
-// Cleanup function
-void cleanup_desktop_system(struct tinywl_server *server) {
-    if (!server || !server->desktops) {
-        return;
-    }
-    
-    wlr_log(WLR_INFO, "Cleaning up desktop system (%d desktops)", server->num_desktops);
-    
-    // Clean up OpenGL resources
-    for (int i = 0; i < server->num_desktops; i++) {
-        struct desktop_fb *desktop = &server->desktops[i];
-        
-        if (desktop->fbo != 0) {
-            glDeleteFramebuffers(1, &desktop->fbo);
-            desktop->fbo = 0;
-        }
-        if (desktop->texture != 0) {
-            glDeleteTextures(1, &desktop->texture);
-            desktop->texture = 0;
-        }
-        if (desktop->rbo != 0) {
-            glDeleteRenderbuffers(1, &desktop->rbo);
-            desktop->rbo = 0;
-        }
-    }
-    
-    // Free the array
-    free(server->desktops);
-    server->desktops = NULL;
-    server->num_desktops = 0;
-    server->current_desktop = 0;
-}
-
-static bool setup_all_desktops(struct tinywl_server *server, int width, int height) {
-    if (!server) {
-        wlr_log(WLR_ERROR, "setup_all_desktops: server is NULL");
-        return false;
-    }
-    
-    // Check if desktop system is initialized
-    if (!server->desktops) {
-        wlr_log(WLR_ERROR, "setup_all_desktops: Desktop system not initialized (desktops array is NULL)");
-        return false;
-    }
-    
-    if (server->num_desktops <= 0) {
-        wlr_log(WLR_ERROR, "setup_all_desktops: Invalid num_desktops: %d", server->num_desktops);
-        return false;
-    }
-    
-    wlr_log(WLR_DEBUG, "setup_all_desktops: Setting up %d desktops at %dx%d", 
-            server->num_desktops, width, height);
-    
-    // Set up intermediate dimensions
-    server->intermediate_width[0] = width;
-    server->intermediate_height[0] = height;
-    
-    // Set up all desktop framebuffers
-    for (int i = 0; i < server->num_desktops; i++) {
-        if (!setup_desktop_framebuffer(server, i, width, height)) {
-            wlr_log(WLR_ERROR, "setup_all_desktops: Failed to setup desktop %d", i);
-            return false;
-        }
-    }
-    
-    wlr_log(WLR_INFO, "setup_all_desktops: Successfully set up %d desktops", server->num_desktops);
-    return true;
-}
-
-// Modified setup function that takes a desktop index
-static bool setup_desktop_framebuffer(struct tinywl_server *server, int desktop_idx, int width, int height) {
-    // Safety checks first
-    if (!server) {
-        wlr_log(WLR_ERROR, "setup_desktop_framebuffer: server is NULL");
-        return false;
-    }
-    
-    if (!server->desktops) {
-        wlr_log(WLR_ERROR, "setup_desktop_framebuffer: server->desktops is NULL - desktop system not initialized");
-        return false;
-    }
-    
-    if (desktop_idx < 0 || desktop_idx >= server->num_desktops) {
-        wlr_log(WLR_ERROR, "setup_desktop_framebuffer: Invalid desktop index: %d (num_desktops: %d)", 
-                desktop_idx, server->num_desktops);
-        return false;
-    }
-    
-    if (server->num_desktops <= 0) {
-        wlr_log(WLR_ERROR, "setup_desktop_framebuffer: num_desktops is %d", server->num_desktops);
-        return false;
-    }
-    
-    GLenum err;
-    struct desktop_fb *desktop = &server->desktops[desktop_idx];
-
-    struct wlr_egl *egl = wlr_gles2_renderer_get_egl(server->renderer);
-    if (!egl) {
-        wlr_log(WLR_ERROR, "setup_desktop_framebuffer: Failed to get EGL from renderer.");
-        return false;
-    }
-    struct wlr_egl_context saved_ctx;
-    if (!wlr_egl_make_current(egl, &saved_ctx)) {
-        wlr_log(WLR_ERROR, "setup_desktop_framebuffer: Failed to make EGL context current.");
-        return false;
-    }
-
-    while ((err = glGetError()) != GL_NO_ERROR) {
-        wlr_log(WLR_DEBUG, "setup_desktop_framebuffer: Clearing pre-existing GL error: 0x%x", err);
-    }
-
-    if (desktop->fbo != 0) {
-        if (desktop->width != width || desktop->height != height) {
-            wlr_log(WLR_INFO, "setup_desktop_framebuffer: Resizing desktop %d FBO from %dx%d to %dx%d",
-                    desktop_idx, desktop->width, desktop->height, width, height);
-            glDeleteFramebuffers(1, &desktop->fbo); desktop->fbo = 0;
-            glDeleteTextures(1, &desktop->texture); desktop->texture = 0;
-            if (desktop->rbo != 0) {
-                glDeleteRenderbuffers(1, &desktop->rbo); desktop->rbo = 0;
-            }
-        } else {
-            // Dimensions are the same, FBO can be reused.
-            wlr_egl_restore_context(&saved_ctx);
-            return true;
-        }
-    }
-    
-    // Rest of the function remains the same...
-    glGenTextures(1, &desktop->texture);
-    if ((err = glGetError()) != GL_NO_ERROR) { 
-        wlr_log(WLR_ERROR, "GL error after glGenTextures: 0x%x", err); 
-        goto error_cleanup; 
-    }
-    
-    glBindTexture(GL_TEXTURE_2D, desktop->texture);
-    if ((err = glGetError()) != GL_NO_ERROR) { 
-        wlr_log(WLR_ERROR, "GL error after glBindTexture: 0x%x", err); 
-        goto error_cleanup; 
-    }
-    
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-    if ((err = glGetError()) != GL_NO_ERROR) {
-        wlr_log(WLR_ERROR, "GL error after glTexImage2D(GL_RGBA8, %dx%d): 0x%x. Trying GL_RGBA.", width, height, err);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-        if ((err = glGetError()) != GL_NO_ERROR) {
-             wlr_log(WLR_ERROR, "GL error after fallback glTexImage2D(GL_RGBA, %dx%d): 0x%x", width, height, err);
-             goto error_cleanup;
-        } else {
-            wlr_log(WLR_INFO, "Used fallback GL_RGBA for desktop %d texture.", desktop_idx);
-        }
-    }
-    
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    if ((err = glGetError()) != GL_NO_ERROR) { 
-        wlr_log(WLR_ERROR, "GL error after glTexParameteri: 0x%x", err); 
-        goto error_cleanup; 
-    }
-
-    glGenFramebuffers(1, &desktop->fbo);
-    if ((err = glGetError()) != GL_NO_ERROR) { 
-        wlr_log(WLR_ERROR, "GL error after glGenFramebuffers: 0x%x", err); 
-        goto error_cleanup; 
-    }
-    
-    glBindFramebuffer(GL_FRAMEBUFFER, desktop->fbo);
-    if ((err = glGetError()) != GL_NO_ERROR) { 
-        wlr_log(WLR_ERROR, "GL error after glBindFramebuffer: 0x%x", err); 
-        goto error_cleanup; 
-    }
-    
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, desktop->texture, 0);
-    if ((err = glGetError()) != GL_NO_ERROR) { 
-        wlr_log(WLR_ERROR, "GL error after glFramebufferTexture2D: 0x%x", err); 
-        goto error_cleanup; 
-    }
-
-    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    if ((err = glGetError()) != GL_NO_ERROR) {
-        wlr_log(WLR_ERROR, "GL error *during* glCheckFramebufferStatus call: 0x%x. FBO Status was reported as: 0x%x", err, status);
-    }
-
-    if (status != GL_FRAMEBUFFER_COMPLETE) {
-        wlr_log(WLR_ERROR, "Desktop %d framebuffer not complete. Status: 0x%x (width: %d, height: %d)", 
-                desktop_idx, status, width, height);
-        switch (status) {
-            case GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT: 
-                wlr_log(WLR_ERROR, " Reason: GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT"); break;
-            case GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT: 
-                wlr_log(WLR_ERROR, " Reason: GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT"); break;
-            case GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS:
-                wlr_log(WLR_ERROR, " Reason: GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS"); break;
-            case GL_FRAMEBUFFER_UNSUPPORTED: 
-                wlr_log(WLR_ERROR, " Reason: GL_FRAMEBUFFER_UNSUPPORTED (format combination not supported)"); break;
-#ifdef GL_FRAMEBUFFER_UNDEFINED 
-            case GL_FRAMEBUFFER_UNDEFINED: 
-                wlr_log(WLR_ERROR, " Reason: GL_FRAMEBUFFER_UNDEFINED (should not happen for non-default FBO)"); break;
-#endif
-#ifdef GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE
-            case GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE: 
-                wlr_log(WLR_ERROR, " Reason: GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE (GLES 3.0+)"); break;
-#endif
-            default: 
-                wlr_log(WLR_ERROR, " Reason: Unknown or less common FBO status code (0x%x). Could be 0 if glCheckFramebufferStatus itself failed.", status); break;
-        }
-        goto error_cleanup;
-    }
-
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glBindTexture(GL_TEXTURE_2D, 0);    
-    
-    desktop->width = width;
-    desktop->height = height;
-    
-    wlr_log(WLR_INFO, "Desktop %d framebuffer created/verified: %dx%d, FBO ID: %u, Texture ID: %u",
-            desktop_idx, width, height, desktop->fbo, desktop->texture);
-    wlr_egl_restore_context(&saved_ctx);
-    return true;
-
-error_cleanup:
-    if (desktop->fbo != 0) {
-        glDeleteFramebuffers(1, &desktop->fbo);
-        desktop->fbo = 0;
-    }
-    if (desktop->texture != 0) {
-        glDeleteTextures(1, &desktop->texture);
-        desktop->texture = 0;
-    }
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glBindTexture(GL_TEXTURE_2D, 0);
-    wlr_egl_restore_context(&saved_ctx);
-    return false;
-}
-// Helper functions you'll need:
-
-// Initialize the desktop system
-bool init_virtual_desktops(struct tinywl_server *server, int num_desktops) {
-    server->num_desktops = num_desktops;
-    server->current_desktop = 0;
-    server->desktops = calloc(num_desktops, sizeof(struct desktop_fb));
-    if (!server->desktops) {
-        wlr_log(WLR_ERROR, "Failed to allocate memory for virtual desktops");
-        return false;
-    }
-    return true;
-}
 
 
 
-// Get the current desktop's framebuffer
-GLuint get_current_desktop_fbo(struct tinywl_server *server) {
-    // Safety checks to prevent segfault
-    if (!server) {
-        wlr_log(WLR_ERROR, "get_current_desktop_fbo: server is NULL");
-        return 0;
-    }
-    
-    if (!server->desktops) {
-        wlr_log(WLR_ERROR, "get_current_desktop_fbo: server->desktops is NULL");
-        return 0;
-    }
-    
-    if (server->num_desktops <= 0) {
-        wlr_log(WLR_ERROR, "get_current_desktop_fbo: num_desktops is %d", server->num_desktops);
-        return 0;
-    }
-    
-    if (server->current_desktop < 0 || server->current_desktop >= server->num_desktops) {
-        wlr_log(WLR_ERROR, "get_current_desktop_fbo: current_desktop %d is out of bounds (num_desktops: %d)", 
-                server->current_desktop, server->num_desktops);
-        return 0;
-    }
-    
-    // Additional check: ensure the FBO is actually valid
-    GLuint fbo = server->desktops[server->current_desktop].fbo;
-    if (fbo == 0) {
-        wlr_log(WLR_ERROR, "get_current_desktop_fbo: desktop %d has invalid FBO (0)", server->current_desktop);
-        return 0;
-    }
-    
-    return fbo;
-}
+
+
 // Get a specific desktop's framebuffer
 GLuint get_desktop_fbo(struct tinywl_server *server, int desktop_idx) {
     if (desktop_idx < 0 || desktop_idx >= server->num_desktops) {
@@ -3639,28 +3466,6 @@ GLuint get_desktop_fbo(struct tinywl_server *server, int desktop_idx) {
 }
 
 
-
-// Cleanup function
-void cleanup_virtual_desktops(struct tinywl_server *server) {
-    if (!server->desktops) return;
-    
-    for (int i = 0; i < server->num_desktops; i++) {
-        struct desktop_fb *desktop = &server->desktops[i];
-        if (desktop->fbo != 0) {
-            glDeleteFramebuffers(1, &desktop->fbo);
-        }
-        if (desktop->texture != 0) {
-            glDeleteTextures(1, &desktop->texture);
-        }
-        if (desktop->rbo != 0) {
-            glDeleteRenderbuffers(1, &desktop->rbo);
-        }
-    }
-    
-    free(server->desktops);
-    server->desktops = NULL;
-    server->num_desktops = 0;
-}
 
 // New function to handle deferred desktop switch
 void handle_expo_end_desktop_switch(struct tinywl_server *server) {
@@ -3768,8 +3573,18 @@ static void output_frame(struct wl_listener *listener, void *data) {
             wlr_log(WLR_ERROR, "[%s] Failed to setup FBO1.", wlr_output->name);
             current_frame_fbo_path = false;
         }
-        if (!setup_intermediate_framebuffer(server, wlr_output->width, wlr_output->height,1)) {
+        if (!setup_intermediate_framebuffer(server, wlr_output->width, wlr_output->height,1)) 
+        {
             wlr_log(WLR_ERROR, "[%s] Failed to setup FBO2.", wlr_output->name);
+            current_frame_fbo_path = false;
+        }
+        if (!setup_intermediate_framebuffer(server, wlr_output->width, wlr_output->height,2))
+         {
+            wlr_log(WLR_ERROR, "[%s] Failed to setup FBO3.", wlr_output->name);
+            current_frame_fbo_path = false;
+        }
+        if (!setup_intermediate_framebuffer(server, wlr_output->width, wlr_output->height,3)) {
+            wlr_log(WLR_ERROR, "[%s] Failed to setup FBO4.", wlr_output->name);
             current_frame_fbo_path = false;
         }
     }
@@ -3802,6 +3617,36 @@ static void output_frame(struct wl_listener *listener, void *data) {
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         render_scene_content1(server, wlr_output, &rdata_scene_data);
+        glDisable(GL_SCISSOR_TEST);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+        // Render desktop 2 to desktop_fbos[1]
+        glBindFramebuffer(GL_FRAMEBUFFER, server->desktop_fbos[2]);
+        glViewport(0, 0, server->intermediate_width[2], server->intermediate_height[2]);
+        glScissor(0, 0, server->intermediate_width[2], server->intermediate_height[2]);
+        glEnable(GL_SCISSOR_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_DEPTH_TEST);
+        glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        render_scene_content2(server, wlr_output, &rdata_scene_data);
+        glDisable(GL_SCISSOR_TEST);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+        // Render desktop 3 to desktop_fbos[1]
+        glBindFramebuffer(GL_FRAMEBUFFER, server->desktop_fbos[3]);
+        glViewport(0, 0, server->intermediate_width[3], server->intermediate_height[3]);
+        glScissor(0, 0, server->intermediate_width[3], server->intermediate_height[3]);
+        glEnable(GL_SCISSOR_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_DEPTH_TEST);
+        glClearColor(0.0f, 1.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        render_scene_content3(server, wlr_output, &rdata_scene_data);
         glDisable(GL_SCISSOR_TEST);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     } else {
@@ -3845,6 +3690,10 @@ static void output_frame(struct wl_listener *listener, void *data) {
             render_scene_content0(server, wlr_output, &rdata_scene_data);
         } else if (server->current_desktop == 1) {
             render_scene_content1(server, wlr_output, &rdata_scene_data);
+        } else if (server->current_desktop == 2) {
+            render_scene_content2(server, wlr_output, &rdata_scene_data);
+        } else if (server->current_desktop == 3) {
+            render_scene_content3(server, wlr_output, &rdata_scene_data);
         } else {
             render_scene_content0(server, wlr_output, &rdata_scene_data);
         }
@@ -3901,6 +3750,20 @@ static void output_frame(struct wl_listener *listener, void *data) {
                 glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[1]);
                 glUniform1i(server->fullscreen_shader_scene_tex1_loc, 1);
                 wlr_log(WLR_DEBUG, "[%s] Bound texture1 (ID %d) for desktop 1", wlr_output->name, server->intermediate_texture[1]);
+            }
+
+             if (server->fullscreen_shader_scene_tex2_loc != -1) {
+                glActiveTexture(GL_TEXTURE2);
+                glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[2]);
+                glUniform1i(server->fullscreen_shader_scene_tex2_loc, 2);
+                wlr_log(WLR_DEBUG, "[%s] Bound texture0 (ID %d) for desktop 2", wlr_output->name, server->intermediate_texture[2]);
+            }
+
+            if (server->fullscreen_shader_scene_tex3_loc != -1) {
+                glActiveTexture(GL_TEXTURE3);
+                glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[3]);
+                glUniform1i(server->fullscreen_shader_scene_tex3_loc, 3);
+                wlr_log(WLR_DEBUG, "[%s] Bound texture1 (ID %d) for desktop 3", wlr_output->name, server->intermediate_texture[3]);
             }
 
             if (server->fullscreen_shader_zoom_loc != -1) {
@@ -5982,22 +5845,22 @@ static const char *fullscreen_fragment_shader_src =
 "        // Top-left quadrant - RED TINT\n"
 "        texture_uv = vec2(transformed_uv.x * 2.0, (transformed_uv.y - 0.5) * 2.0);\n"
 "        color = texture(u_scene_texture0, texture_uv);\n"
-"        color.rgb *= vec3(1.5, 0.7, 0.7);  // Enhance red, reduce green/blue\n"
+"     //   color.rgb *= vec3(1.5, 0.7, 0.7);  // Enhance red, reduce green/blue\n"
 "    } else if (target_quad == 1) {\n"
 "        // Top-right quadrant - GREEN TINT\n"
 "        texture_uv = vec2((transformed_uv.x - 0.5) * 2.0, (transformed_uv.y - 0.5) * 2.0);\n"
 "        color = texture(u_scene_texture1, texture_uv);\n"
-"        color.rgb *= vec3(0.7, 1.5, 0.7);  // Enhance green, reduce red/blue\n"
+"     //   color.rgb *= vec3(0.7, 1.5, 0.7);  // Enhance green, reduce red/blue\n"
 "    } else if (target_quad == 2) {\n"
 "        // Bottom-left quadrant - BLUE TINT\n"
 "        texture_uv = vec2(transformed_uv.x * 2.0, transformed_uv.y * 2.0);\n"
 "        color = texture(u_scene_texture2, texture_uv);\n"
-"        color.rgb *= vec3(0.7, 0.7, 1.5);  // Enhance blue, reduce red/green\n"
+"      //  color.rgb *= vec3(0.7, 0.7, 1.5);  // Enhance blue, reduce red/green\n"
 "    } else {\n"
 "        // Bottom-right quadrant - YELLOW TINT\n"
 "        texture_uv = vec2((transformed_uv.x - 0.5) * 2.0, transformed_uv.y * 2.0);\n"
 "        color = texture(u_scene_texture3, texture_uv);\n"
-"        color.rgb *= vec3(1.3, 1.3, 0.5);  // Enhance red/green, reduce blue\n"
+"      //  color.rgb *= vec3(1.3, 1.3, 0.5);  // Enhance red/green, reduce blue\n"
 "    }\n"
 "    \n"
 "    FragColor = color;\n"
@@ -6121,12 +5984,6 @@ const char *vendor = (const char *)glGetString(GL_VENDOR);
     wlr_renderer_init_wl_display(server.renderer, server.wl_display);
 
 
-
-     if (!init_desktop_system(&server, 4)) { // We want 4 desktops
-        wlr_log(WLR_ERROR, "Failed to initialize virtual desktop system.");
-        server_destroy(&server);
-        return 1;
-    }
 
  // --- Create Flame Shader ---
     struct shader_uniform_spec flame_uniforms[] = {
@@ -6258,8 +6115,8 @@ if (!create_generic_shader_program(server.renderer, "ScaledSceneViewShader",
     // Initialize zoom effect variables
 
     server.current_desktop = 0;
-    server.desktop_count = 1;
-    server.num_desktops = 1; // Assuming 4 desktops for the example
+    server.desktop_count = 4;
+    server.num_desktops = 4; // Assuming 4 desktops for the example
    
     server.effect_zoom_factor_normal = 2.0f;
     server.effect_zoom_factor_zoomed = 1.0f;
