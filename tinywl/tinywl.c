@@ -3811,36 +3811,30 @@ static void output_frame(struct wl_listener *listener, void *data) {
     struct wlr_output_state output_state_effect;
     struct wlr_render_pass *current_screen_pass = NULL;
 
-    // Early exit checks
     if (!wlr_output || !wlr_output->enabled || !renderer || !server->allocator) {
-        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Output not ready (output_ptr=%p, enabled=%d, renderer_ptr=%p, allocator_ptr=%p).",
-            wlr_output ? wlr_output->name : "NULL_OUTPUT_NAME",
-            (void*)wlr_output,
-            wlr_output ? wlr_output->enabled : 0,
-            (void*)renderer,
-            (void*)server->allocator);
+        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Output not ready (output_ptr=%p, enabled=%d, renderer_ptr=%p, allocator=%p).",
+            wlr_output ? wlr_output->name : "none",
+            wlr_output, wlr_output ? wlr_output->enabled : 0, renderer, server->allocator);
         if (scene && wlr_output) {
-             struct wlr_scene_output *scene_output_early_exit = wlr_scene_get_scene_output(scene, wlr_output);
-             if (scene_output_early_exit) wlr_scene_output_send_frame_done(scene_output_early_exit, &now);
+            struct wlr_scene_output *output_early_exit = wlr_scene_get_scene_output(scene, wlr_output);
+            if (output_early_exit) wlr_scene_output_send_frame_done(output_early_exit, &now);
         }
         return;
     }
     
     if (!scene) {
-        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Server scene is NULL.", wlr_output->name);
+        wlr_log(WLR_ERROR, "[%s] Output_frame: no scene", wlr_output->name);
         return;
     }
     
     struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(scene, wlr_output);
     if (!scene_output) {
-        wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] No scene_output for output.", wlr_output->name);
+        wlr_log(WLR_ERROR, "[%s] Output_frame: no scene_output", wlr_output->name);
         return;
     }
 
-    // Snapshot the FBO path state for this frame
     bool current_frame_fbo_path = server->shrink_effect_active;
 
-    // Calculate the current zoom factor for animation if the FBO path is intended to be active
     if (server->shrink_effect_active) {
         if (server->effect_is_animating_zoom) {
             float now_sec = get_monotonic_time_seconds_as_float();
@@ -3852,99 +3846,97 @@ static void output_frame(struct wl_listener *listener, void *data) {
             }
 
             if (t >= 1.0f) {
-                t = 1.0f; 
+                t = 1.0f;
                 server->effect_anim_current_factor = server->effect_anim_target_factor;
-                server->effect_is_animating_zoom = false; 
-                wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Zoom animation finished. Factor: %.2f. Target state was_zoomed: %d",
+                server->effect_is_animating_zoom = false;
+                wlr_log(WLR_DEBUG, "[%s] Zoom animation completed. Factor: %.2f, Target_zoomed: %d",
                         wlr_output->name, server->effect_anim_current_factor, server->effect_is_target_zoomed);
 
                 if (!server->effect_is_target_zoomed &&
                     fabs(server->effect_anim_current_factor - server->effect_zoom_factor_normal) < 1e-4f) {
                     server->shrink_effect_active = false;
                     current_frame_fbo_path = false;
-                    wlr_log(WLR_INFO, "[OUTPUT_FRAME:%s] Fullscreen Shader Effect DISABLED (animation to normal finished).", wlr_output->name);
+                    wlr_log(WLR_INFO, "[%s] Fullscreen Shader Effect OFF.", wlr_output->name);
                     
-                    // HANDLE DEFERRED DESKTOP SWITCH HERE
                     handle_expo_end_desktop_switch(server);
                     
                     struct tinywl_output *output_iter_redraw;
                     wl_list_for_each(output_iter_redraw, &server->outputs, link) {
-                         if (output_iter_redraw->wlr_output && output_iter_redraw->wlr_output->enabled) {
-                              wlr_output_schedule_frame(output_iter_redraw->wlr_output);
-                         }
+                        if (output_iter_redraw->wlr_output && output_iter_redraw->wlr_output->enabled) {
+                            wlr_output_schedule_frame(output_iter_redraw->wlr_output);
+                        }
                     }
                 }
             } else {
                 server->effect_anim_current_factor = server->effect_anim_start_factor +
-                                           (server->effect_anim_target_factor - server->effect_anim_start_factor) * t;
+                    (server->effect_anim_target_factor - server->effect_anim_start_factor) * t;
                 wlr_output_schedule_frame(wlr_output);
             }
-        } else { 
+        } else {
             server->effect_anim_current_factor = server->effect_is_target_zoomed ?
-                                                 server->effect_zoom_factor_zoomed :
-                                                 server->effect_zoom_factor_normal;
+                server->effect_zoom_factor_zoomed : server->effect_zoom_factor_normal;
         }
-    } else { 
+    } else {
         server->effect_is_animating_zoom = false;
         server->effect_is_target_zoomed = false;
         server->effect_anim_current_factor = server->effect_zoom_factor_normal;
     }
 
-    struct render_data rdata_scene_render = {
+    struct render_data rdata_scene_data = {
         .renderer = renderer,
         .server = server,
         .output = wlr_output,
         .pass = NULL
     };
 
-    // FIRST FRAMEBUFFER SETUP AND RENDERING
     if (current_frame_fbo_path) {
         if (!setup_intermediate_framebuffer1(server, wlr_output->width, wlr_output->height)) {
-            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to setup intermediate FBO1.", wlr_output->name);
-            current_frame_fbo_path = false; 
+            wlr_log(WLR_ERROR, "[%s] Failed to setup FBO1.", wlr_output->name);
+            current_frame_fbo_path = false;
+        }
+        if (!setup_intermediate_framebuffer2(server, wlr_output->width, wlr_output->height)) {
+            wlr_log(WLR_ERROR, "[%s] Failed to setup FBO2.", wlr_output->name);
+            current_frame_fbo_path = false;
         }
     }
 
     if (current_frame_fbo_path) {
-        // When expo is active, use current framebuffer setup without allowing swaps
-        if (!setup_intermediate_framebuffer1(server, wlr_output->width, wlr_output->height)) {
-            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to setup intermediate FBO1.", wlr_output->name);
-            current_frame_fbo_path = false;
-        } else {
-            // CRITICAL: During expo, don't change framebuffers - use current setup
-            glBindFramebuffer(GL_FRAMEBUFFER, server->desktop0_fbo);
-            glViewport(0, 0, server->intermediate_width0, server->intermediate_height0);
-            glScissor(0, 0, server->intermediate_width0, server->intermediate_height0);
-            glEnable(GL_SCISSOR_TEST);
-            glEnable(GL_BLEND);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            glDisable(GL_CULL_FACE);
-            glDisable(GL_DEPTH_TEST);
-            
-            // Render current desktop content to maintain visual consistency
-            if (server->current_desktop == 0) {
-                render_scene_content0(server, wlr_output, &rdata_scene_render);
-            } else if (server->current_desktop == 1) {
-                render_scene_content1(server, wlr_output, &rdata_scene_render);
-            } else {
-                render_scene_content0(server, wlr_output, &rdata_scene_render);
-            }
-            
-            glDisable(GL_SCISSOR_TEST);
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            
-            // Use consistent texture during expo
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, server->desktop_textures[0]);
-        }
+        // Render desktop 0 to desktop0_fbo
+        glBindFramebuffer(GL_FRAMEBUFFER, server->desktop0_fbo);
+        glViewport(0, 0, server->intermediate_width0, server->intermediate_height0);
+        glScissor(0, 0, server->intermediate_width0, server->intermediate_height0);
+        glEnable(GL_SCISSOR_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_DEPTH_TEST);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        render_scene_content0(server, wlr_output, &rdata_scene_data);
+        glDisable(GL_SCISSOR_TEST);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+        // Render desktop 1 to desktop1_fbo
+        glBindFramebuffer(GL_FRAMEBUFFER, server->desktop1_fbo);
+        glViewport(0, 0, server->intermediate_width1, server->intermediate_height1);
+        glScissor(0, 0, server->intermediate_width1, server->intermediate_height1);
+        glEnable(GL_SCISSOR_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_DEPTH_TEST);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        render_scene_content1(server, wlr_output, &rdata_scene_data);
+        glDisable(GL_SCISSOR_TEST);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
     } else {
-        // Direct rendering path - normal desktop switching is allowed here
         wlr_output_state_init(&output_state_direct);
         struct wlr_scene_output_state_options opts = {0};
         bool has_damage = wlr_scene_output_build_state(scene_output, &output_state_direct, &opts);
         
         if (!has_damage && !(output_state_direct.committed & WLR_OUTPUT_STATE_BUFFER)) {
-            wlr_log(WLR_DEBUG, "[OUTPUT_FRAME:%s] Direct: No damage or buffer, skipping render.", wlr_output->name);
+            wlr_log(WLR_DEBUG, "[%s] Direct: No damage or buffer, skipping.", wlr_output->name);
             wlr_output_state_finish(&output_state_direct);
             wlr_scene_output_send_frame_done(scene_output, &now);
             return;
@@ -3957,13 +3949,13 @@ static void output_frame(struct wl_listener *listener, void *data) {
         
         current_screen_pass = wlr_output_begin_render_pass(wlr_output, &output_state_direct, NULL);
         if (!current_screen_pass) {
-            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Direct: wlr_output_begin_render_pass failed.", wlr_output->name);
+            wlr_log(WLR_ERROR, "[%s] Direct: Failed to begin render pass.", wlr_output->name);
             wlr_output_state_finish(&output_state_direct);
             wlr_scene_output_send_frame_done(scene_output, &now);
             return;
         }
         
-        rdata_scene_render.pass = current_screen_pass;
+        rdata_scene_data.pass = current_screen_pass;
         
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
@@ -3975,46 +3967,17 @@ static void output_frame(struct wl_listener *listener, void *data) {
         glDisable(GL_CULL_FACE);
         glDisable(GL_DEPTH_TEST);
         
-        // Normal desktop switching behavior when NOT in expo
         if (server->current_desktop == 0) {
-            render_scene_content0(server, wlr_output, &rdata_scene_render);
+            render_scene_content0(server, wlr_output, &rdata_scene_data);
         } else if (server->current_desktop == 1) {
-            render_scene_content1(server, wlr_output, &rdata_scene_render);
+            render_scene_content1(server, wlr_output, &rdata_scene_data);
         } else {
-            render_scene_content0(server, wlr_output, &rdata_scene_render);
+            render_scene_content0(server, wlr_output, &rdata_scene_data);
         }
         
         glDisable(GL_SCISSOR_TEST);
     }
 
-    // SECOND FRAMEBUFFER SETUP AND RENDERING
-    if (current_frame_fbo_path) {
-        if (!setup_intermediate_framebuffer2(server, wlr_output->width, wlr_output->height)) {
-            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to setup intermediate FBO2.", wlr_output->name);
-            // Don't disable FBO path completely, just skip second framebuffer
-        } else {
-            // STAGE 1B: Render scene content to second intermediate framebuffer
-            glBindFramebuffer(GL_FRAMEBUFFER, server->desktop1_fbo);
-            glViewport(0, 0, server->intermediate_width1, server->intermediate_height1);
-            glScissor(0, 0, server->intermediate_width1, server->intermediate_height1);
-            glEnable(GL_SCISSOR_TEST);
-            glEnable(GL_BLEND);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            glDisable(GL_CULL_FACE);
-            glDisable(GL_DEPTH_TEST);
-
-            // Clear the second framebuffer
-            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-            glClear(GL_COLOR_BUFFER_BIT);
-
-            render_scene_content1(server, wlr_output, &rdata_scene_render);
-
-            glDisable(GL_SCISSOR_TEST);
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        }
-    }
-
-    // STAGE 2: Composite FBO to screen
     if (current_frame_fbo_path) {
         wlr_output_state_init(&output_state_effect);
         pixman_region32_t full_damage_effect;
@@ -4024,15 +3987,15 @@ static void output_frame(struct wl_listener *listener, void *data) {
 
         current_screen_pass = wlr_output_begin_render_pass(wlr_output, &output_state_effect, NULL);
         if (!current_screen_pass) {
-            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] FBO Path: Failed to begin final effect pass.", wlr_output->name);
+            wlr_log(WLR_ERROR, "[%s] FBO Path: Failed to begin effect pass.", wlr_output->name);
             wlr_output_state_finish(&output_state_effect);
-            goto cleanup_frame_and_send_done; 
+            goto cleanup_frame;
         }
 
         glViewport(0, 0, wlr_output->width, wlr_output->height);
         glScissor(0, 0, wlr_output->width, wlr_output->height);
         glEnable(GL_SCISSOR_TEST);
-        glClearColor(0.1f, 0.0f, 0.1f, 1.0f); 
+        glClearColor(0.1f, 0.0f, 0.1f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -4043,7 +4006,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
             glBindVertexArray(server->quad_vao);
             glUseProgram(server->fullscreen_shader_program);
 
-            float effect_mvp[9]; 
+            float effect_mvp[9];
             wlr_matrix_identity(effect_mvp);
             effect_mvp[0] = 2.0f; effect_mvp[4] = 2.0f;
             effect_mvp[6] = -1.0f; effect_mvp[7] = -1.0f;
@@ -4054,22 +4017,16 @@ static void output_frame(struct wl_listener *listener, void *data) {
 
             if (server->fullscreen_shader_scene_tex0_loc != -1) {
                 glActiveTexture(GL_TEXTURE0);
-                if (server->current_desktop == 0) {
-                    glBindTexture(GL_TEXTURE_2D, server->intermediate_texture0);
-                } else {
-                    glBindTexture(GL_TEXTURE_2D, server->intermediate_texture1);
-                }
+                glBindTexture(GL_TEXTURE_2D, server->intermediate_texture0);
                 glUniform1i(server->fullscreen_shader_scene_tex0_loc, 0);
+                wlr_log(WLR_DEBUG, "[%s] Bound texture0 (ID %d) for desktop 0", wlr_output->name, server->intermediate_texture0);
             }
 
             if (server->fullscreen_shader_scene_tex1_loc != -1) {
                 glActiveTexture(GL_TEXTURE1);
-                if (server->current_desktop == 0) {
-                    glBindTexture(GL_TEXTURE_2D, server->intermediate_texture1);
-                } else {
-                    glBindTexture(GL_TEXTURE_2D, server->intermediate_texture0);
-                }
+                glBindTexture(GL_TEXTURE_2D, server->intermediate_texture1);
                 glUniform1i(server->fullscreen_shader_scene_tex1_loc, 1);
+                wlr_log(WLR_DEBUG, "[%s] Bound texture1 (ID %d) for desktop 1", wlr_output->name, server->intermediate_texture1);
             }
 
             if (server->fullscreen_shader_zoom_loc != -1) {
@@ -4080,10 +4037,12 @@ static void output_frame(struct wl_listener *listener, void *data) {
                 glUniform2fv(server->fullscreen_shader_zoom_center_loc, 1, center_for_shader);
             }
 
-             int target_quadrant = server->shrink_effect_active && server->pending_desktop_switch != -1 ?
+            int target_quadrant = server->shrink_effect_active && server->pending_desktop_switch != -1 ?
                                   server->pending_desktop_switch : server->current_desktop;
             if (server->fullscreen_shader_quadrant_loc != -1) {
                 glUniform1i(server->fullscreen_shader_quadrant_loc, target_quadrant);
+                wlr_log(WLR_DEBUG, "[%s] Set quadrant to %d (pending_switch=%d, current_desktop=%d)",
+                        wlr_output->name, target_quadrant, server->pending_desktop_switch, server->current_desktop);
             }
 
             glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
@@ -4100,7 +4059,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
 
     if (current_screen_pass) {
         if (!wlr_render_pass_submit(current_screen_pass)) {
-            wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to submit render pass.", wlr_output->name);
+            wlr_log(WLR_ERROR, "[%s] Failed to submit render pass.", wlr_output->name);
         }
         
         struct wlr_buffer *buffer_to_transmit = NULL;
@@ -4113,11 +4072,11 @@ static void output_frame(struct wl_listener *listener, void *data) {
         if (buffer_to_transmit && buffer_to_transmit->width > 0 && buffer_to_transmit->height > 0) {
             pthread_mutex_lock(&rdp_transmit_mutex);
             struct wlr_buffer *locked_buffer = wlr_buffer_lock(buffer_to_transmit);
-            if (locked_buffer) { 
-                rdp_transmit_surface(locked_buffer); 
-                wlr_buffer_unlock(locked_buffer); 
+            if (locked_buffer) {
+                rdp_transmit_surface(locked_buffer);
+                wlr_buffer_unlock(locked_buffer);
             } else {
-                wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Failed to lock buffer for RDP transmit.", wlr_output->name);
+                wlr_log(WLR_ERROR, "[%s] Failed to lock buffer for RDP transmit.", wlr_output->name);
             }
             pthread_mutex_unlock(&rdp_transmit_mutex);
         }
@@ -4129,11 +4088,13 @@ static void output_frame(struct wl_listener *listener, void *data) {
         wlr_output_state_finish(&output_state_direct);
     }
 
-cleanup_frame_and_send_done:
-    glDisable(GL_SCISSOR_TEST); 
+cleanup_frame:
+    glDisable(GL_SCISSOR_TEST);
     glDisable(GL_BLEND);
     wlr_scene_output_send_frame_done(scene_output, &now);
 }
+
+
 
 
 
