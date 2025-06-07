@@ -511,6 +511,7 @@ static float animation_start_time = 0.0f;
 static float animation_duration = 0.5f; // 500ms animation
 static int last_quadrant = -1; // Initialize to -1 to guarantee first animation
 static bool animating = false;
+static float last_rendered_rotation = 0.0f;
 
 /* Updated tinywl_output struct to store timer */
 struct tinywl_output {
@@ -807,6 +808,33 @@ static bool create_generic_shader_program(
 
     return true;
 }
+/*
+// Function to start rotation animation
+void start_quadrant_animation(int new_quadrant, float current_time) {
+    if (new_quadrant != last_quadrant) {
+        // Calculate target rotation (-90 degrees per quadrant)
+        float new_target = (float)new_quadrant * -M_PI / 2.0f;
+        
+        // --- THE FIX ---
+        // Capture the current visual rotation (including any wobble)
+        // as the true starting point for our new animation.
+        current_rotation = last_rendered_rotation;
+        
+        // Handle wrap-around for shortest path (this logic now uses the captured angle)
+        float diff = new_target - current_rotation;
+        if (diff > M_PI) {
+            current_rotation += 2.0f * M_PI;
+        } else if (diff < -M_PI) {
+            current_rotation -= 2.0f * M_PI;
+        }
+        
+        target_rotation = new_target;
+        animation_start_time = current_time;
+        last_quadrant = new_quadrant;
+        animating = true;
+        wlr_log(WLR_INFO, "Starting anim to quad %d. From %.2frad to %.2frad", new_quadrant, current_rotation, target_rotation);
+    }
+}*/
 
 // Function to start rotation animation
 void start_quadrant_animation(int new_quadrant, float current_time) {
@@ -814,8 +842,12 @@ void start_quadrant_animation(int new_quadrant, float current_time) {
         // Calculate target rotation (-90 degrees per quadrant)
         float new_target = (float)new_quadrant * -M_PI / 2.0f;
         
-        // Handle wrap-around for shortest path
-        // If current is 270 (-pi*1.5) and target is 0, rotate +90, not -270
+        // --- THE FIX ---
+        // Capture the current visual rotation (including any wobble)
+        // as the true starting point for our new animation.
+        current_rotation = last_rendered_rotation;
+        
+        // Handle wrap-around for shortest path (this logic now uses the captured angle)
         float diff = new_target - current_rotation;
         if (diff > M_PI) {
             current_rotation += 2.0f * M_PI;
@@ -830,7 +862,7 @@ void start_quadrant_animation(int new_quadrant, float current_time) {
         wlr_log(WLR_INFO, "Starting anim to quad %d. From %.2frad to %.2frad", new_quadrant, current_rotation, target_rotation);
     }
 }
-
+/*
 // Function to update rotation animation
 float update_rotation_animation(float current_time) {
     if (animating) {
@@ -853,8 +885,63 @@ float update_rotation_animation(float current_time) {
     }
     
     return current_rotation;
-}
+}*/
 
+#include <math.h> // Make sure you have this include for powf
+
+// ... (keep the rest of your code the same) ...
+// In update_rotation_animation:
+
+float update_rotation_animation(struct tinywl_server *server, float current_time) {
+    float base_rotation_this_frame;
+
+    // --- Part 1: Determine the Base Rotation ---
+    // This is either the result of the main animation or the stable target angle.
+    if (animating) {
+        float elapsed = current_time - animation_start_time;
+        float progress = elapsed / animation_duration;
+
+        if (progress >= 1.0f) {
+            // The main animation has just finished.
+            animating = false;
+            current_rotation = target_rotation; // Lock in the new base angle for the *next* animation.
+            base_rotation_this_frame = target_rotation;
+        } else {
+            // The animation is in progress. Calculate the eased angle.
+            const float c1 = 1.70158f;
+            const float c3 = c1 + 1.0f;
+            float eased_progress = 1.0f + c3 * powf(progress - 1.0f, 3.0f) + c1 * powf(progress - 1.0f, 2.0f);
+            base_rotation_this_frame = current_rotation + (target_rotation - current_rotation) * eased_progress;
+        }
+    } else {
+        // Not animating, so the base rotation is the stable target angle.
+        base_rotation_this_frame = target_rotation;
+    }
+
+    // --- Part 2: Calculate the Additive Wobble Offset ---
+    // This is calculated regardless of the animation state but is only non-zero if zoomed.
+    float wobble_offset = 0.0f;
+    float zoom_diff = fabs(server->cube_anim_current_factor - server->cube_zoom_factor_normal);
+
+    if (zoom_diff > 0.1f) {
+        float wobble_speed = 4.0f;
+        float wobble_amplitude = 0.5f; // A subtle amplitude is usually best
+        float fade_factor = fminf(1.0f, zoom_diff / 1.0f);
+        fade_factor = fade_factor * fade_factor * (3.0f - 2.0f * fade_factor); // Smoothstep
+        
+        // The wobble is just a small, sinusoidal offset from the base.
+        wobble_offset = sin(current_time * wobble_speed) * wobble_amplitude * fade_factor;
+    }
+
+    // --- Part 3: Combine and Return the Final Angle ---
+    // The final visual angle is the base rotation plus the wobble offset.
+    float final_rotation = base_rotation_this_frame + wobble_offset;
+
+    // Always update the last_rendered_rotation for seamless animation starts.
+    last_rendered_rotation = final_rotation;
+    
+    return final_rotation;
+}
 
 
 /* Function implementations */
@@ -3636,7 +3723,8 @@ static void output_frame(struct wl_listener *listener, void *data) {
             start_quadrant_animation(server->current_desktop, now_float_sec);
 
             // 2. Get the current interpolated angle for this frame
-            float animated_rotation = update_rotation_animation(now_float_sec);
+//            float animated_rotation = update_rotation_animation(now_float_sec);
+            float animated_rotation = update_rotation_animation(server, now_float_sec);
 
 
     glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
@@ -3659,7 +3747,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
     
    // --- CORRECT UNIFORM SETTING ---
                 // 1. Pass time to the shader for rotation
-               
+               last_rendered_rotation = animated_rotation;
             // Pass the calculated rotation angle to the shader
             glUniform1f(server->cube_shader_time_loc, animated_rotation); // time_loc holds u_rotation_y location
             
@@ -3737,12 +3825,14 @@ cleanup_frame:
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_BLEND);
     wlr_scene_output_send_frame_done(scene_output, &now);
-    
+    /*
      // Schedule continuous frames if ANY effect is animating
-    if (server->effect_is_animating_zoom || server->cube_is_animating_zoom ||
-        (server->expo_effect_active && server->pending_desktop_switch != -1)) {
+     if (server->effect_is_animating_zoom || server->cube_is_animating_zoom ||
+        (server->expo_effect_active && server->pending_desktop_switch != -1) ||
+        server->cube_effect_active) { // <-- THIS IS THE CRITICAL ADDITION
+        
         wlr_output_schedule_frame(wlr_output);
-    }
+    }*/
 }
 
 
@@ -5816,6 +5906,7 @@ static const char *cube_vertex_shader_src =
        "\n"
        "uniform float u_zoom;           // Zoom factor (higher is further away)\n"
        "uniform float u_rotation_y;     // The final Y rotation angle from C code\n"
+       "uniform float u_time;           // Time uniform for animation (add this to your C code)\n"
        "\n"
        "out vec2 v_texcoord_to_fs;\n"
        "out float v_face_id;\n"
