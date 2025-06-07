@@ -105,6 +105,21 @@
 #include <wlr/types/wlr_matrix.h> 
 #include <wlr/types/wlr_matrix.h>
 
+#include <wlr/types/wlr_compositor.h>
+#include <wlr/types/wlr_output.h>
+#include <wlr/types/wlr_xdg_shell.h> // THIS IS KEY for wlr_xdg_surface_get_geometry
+// Add other wlr/types/ as needed: scene, output_layout, cursor, seat, etc.
+#include <wlr/types/wlr_scene.h>
+
+
+#include <wlr/backend.h>
+#include <wlr/render/wlr_renderer.h> // THIS IS KEY for struct wlr_render_texture_options
+#include <wlr/render/allocator.h>
+#include <wlr/render/egl.h>
+#include <wlr/render/gles2.h>
+
+#include <drm_fourcc.h>
+
 #define PROTOCOL_DECORATION_MODE_NONE 0
 #define PROTOCOL_DECORATION_MODE_SERVER_SIDE 1
 #define PROTOCOL_DECORATION_MODE_CLIENT_SIDE 2
@@ -241,20 +256,8 @@ struct wlr_rdp_backend {
     /* Other fields may exist, but we only need these */
 };
 
-#include <wlr/types/wlr_compositor.h>
-#include <wlr/types/wlr_output.h>
-#include <wlr/types/wlr_xdg_shell.h> // THIS IS KEY for wlr_xdg_surface_get_geometry
-// Add other wlr/types/ as needed: scene, output_layout, cursor, seat, etc.
-#include <wlr/types/wlr_scene.h>
 
 
-#include <wlr/backend.h>
-#include <wlr/render/wlr_renderer.h> // THIS IS KEY for struct wlr_render_texture_options
-#include <wlr/render/allocator.h>
-#include <wlr/render/egl.h>
-#include <wlr/render/gles2.h>
-
-#include <drm_fourcc.h>
 
 /* Structures */
 enum tinywl_cursor_mode {
@@ -423,7 +426,7 @@ struct wl_listener pointer_motion;
  GLint cube_shader_resolution_loc;
 
 
-   // GLint cube_shader_current_quad_loc;   
+    GLint cube_shader_current_quad_loc;   
 
 
 // Add these new zoom uniform locations:
@@ -501,6 +504,13 @@ GLuint intermediate_rbo[4];
    // New cube geometry (add these)
     GLuint cube_vao, cube_vbo, cube_ibo;
 };
+
+static float current_rotation = 0.0f;
+static float target_rotation = 0.0f;
+static float animation_start_time = 0.0f;
+static float animation_duration = 0.5f; // 500ms animation
+static int last_quadrant = -1; // Initialize to -1 to guarantee first animation
+static bool animating = false;
 
 /* Updated tinywl_output struct to store timer */
 struct tinywl_output {
@@ -796,6 +806,53 @@ static bool create_generic_shader_program(
     }
 
     return true;
+}
+
+// Function to start rotation animation
+void start_quadrant_animation(int new_quadrant, float current_time) {
+    if (new_quadrant != last_quadrant) {
+        // Calculate target rotation (-90 degrees per quadrant)
+        float new_target = (float)new_quadrant * -M_PI / 2.0f;
+        
+        // Handle wrap-around for shortest path
+        // If current is 270 (-pi*1.5) and target is 0, rotate +90, not -270
+        float diff = new_target - current_rotation;
+        if (diff > M_PI) {
+            current_rotation += 2.0f * M_PI;
+        } else if (diff < -M_PI) {
+            current_rotation -= 2.0f * M_PI;
+        }
+        
+        target_rotation = new_target;
+        animation_start_time = current_time;
+        last_quadrant = new_quadrant;
+        animating = true;
+        wlr_log(WLR_INFO, "Starting anim to quad %d. From %.2frad to %.2frad", new_quadrant, current_rotation, target_rotation);
+    }
+}
+
+// Function to update rotation animation
+float update_rotation_animation(float current_time) {
+    if (animating) {
+        float elapsed = current_time - animation_start_time;
+        float progress = elapsed / animation_duration;
+        
+        if (progress >= 1.0f) {
+            animating = false;
+            current_rotation = target_rotation;
+            return target_rotation;
+        }
+        
+        // Smooth easing function (ease-in-out)
+        float eased_progress = progress < 0.5f 
+                             ? 4.0f * progress * progress * progress
+                             : 1.0f - pow(-2.0f * progress + 2.0f, 3.0f) / 2.0f;
+        
+        // Interpolate from the rotation at the start of the animation
+        return current_rotation + (target_rotation - current_rotation) * eased_progress;
+    }
+    
+    return current_rotation;
 }
 
 
@@ -3552,6 +3609,15 @@ static void output_frame(struct wl_listener *listener, void *data) {
     wlr_log(WLR_INFO, "CUBE DEBUG: Rendering cube with zoom=%.2f, quadrant=%d, time=%.2f", 
            server->cube_anim_current_factor, server->current_desktop, get_monotonic_time_seconds_as_float());
     
+ float now_float_sec = get_monotonic_time_seconds_as_float();
+
+            // 1. Check if we need to start a new animation
+            start_quadrant_animation(server->current_desktop, now_float_sec);
+
+            // 2. Get the current interpolated angle for this frame
+            float animated_rotation = update_rotation_animation(now_float_sec);
+
+
     glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LESS);
@@ -3570,13 +3636,17 @@ static void output_frame(struct wl_listener *listener, void *data) {
     wlr_log(WLR_INFO, "CUBE DEBUG: time_loc=%d, zoom_loc=%d, quadrant_loc=%d", 
            server->cube_shader_time_loc, server->cube_shader_zoom_loc, server->cube_shader_quadrant_loc);
     
-    GLint time_loc = server->cube_shader_time_loc;
-    if (time_loc != -1) {
-        glUniform1f(time_loc, get_monotonic_time_seconds_as_float());
-    }
+   // --- CORRECT UNIFORM SETTING ---
+                // 1. Pass time to the shader for rotation
+               
+            // Pass the calculated rotation angle to the shader
+            glUniform1f(server->cube_shader_time_loc, animated_rotation); // time_loc holds u_rotation_y location
+            
+            // Pass zoom and quadrant uniforms
+            glUniform1f(server->cube_shader_zoom_loc, server->cube_anim_current_factor);
+            glUniform1i(server->cube_shader_quadrant_loc, server->current_desktop);
+    
 
-    glUniform1f(server->cube_shader_zoom_loc, server->cube_anim_current_factor);
-    glUniform1i(server->cube_shader_quadrant_loc, server->current_desktop);
     
     for(int i = 0; i < 4; ++i) {
         glActiveTexture(GL_TEXTURE0 + i);
@@ -4671,6 +4741,8 @@ static void handle_xdg_decoration_new(struct wl_listener *listener, void *data) 
         WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
 }
 
+
+
 /* Updated main function */
 int main(int argc, char *argv[]) {
     
@@ -5714,7 +5786,6 @@ static const char *fullscreen_fragment_shader_src =
 "    FragColor = color;\n"
 "}\n";
 
-
 // Vertex Shader
 static const char *cube_vertex_shader_src =
        "#version 300 es\n"
@@ -5723,67 +5794,44 @@ static const char *cube_vertex_shader_src =
        "layout(location = 1) in vec2 a_texcoord;\n"
        "layout(location = 2) in float a_face_id;    // Face ID (0-5)\n"
        "\n"
-       "uniform float u_zoom;       // 1.0 to 2.0 (now used for zoom out)\n"
-       "uniform highp int u_quadrant;    // Which quadrant to expand (0-3)\n"
-       "uniform float u_time;       // Time for rotation\n"
+       "uniform float u_zoom;           // Zoom factor (higher is further away)\n"
+       "uniform float u_rotation_y;     // The final Y rotation angle from C code\n"
        "\n"
        "out vec2 v_texcoord_to_fs;\n"
        "out float v_face_id;\n"
        "\n"
        "mat4 rotationX(float angle) {\n"
-       "    float c = cos(angle);\n"
-       "    float s = sin(angle);\n"
-       "    return mat4(\n"
-       "        1.0, 0.0, 0.0, 0.0,\n"
-       "        0.0, c, -s, 0.0,\n"
-       "        0.0, s, c, 0.0,\n"
-       "        0.0, 0.0, 0.0, 1.0\n"
-       "    );\n"
+       "    float c = cos(angle); float s = sin(angle);\n"
+       "    return mat4(1.0, 0.0, 0.0, 0.0, 0.0, c, -s, 0.0, 0.0, s, c, 0.0, 0.0, 0.0, 0.0, 1.0);\n"
        "}\n"
        "\n"
        "mat4 rotationY(float angle) {\n"
-       "    float c = cos(angle);\n"
-       "    float s = sin(angle);\n"
-       "    return mat4(\n"
-       "        c, 0.0, s, 0.0,\n"
-       "        0.0, 1.0, 0.0, 0.0,\n"
-       "        -s, 0.0, c, 0.0,\n"
-       "        0.0, 0.0, 0.0, 1.0\n"
-       "    );\n"
+       "    float c = cos(angle); float s = sin(angle);\n"
+       "    return mat4(c, 0.0, s, 0.0, 0.0, 1.0, 0.0, 0.0, -s, 0.0, c, 0.0, 0.0, 0.0, 0.0, 1.0);\n"
        "}\n"
        "\n"
        "mat4 perspective(float fov, float aspect, float near, float far) {\n"
        "    float f = 1.0 / tan(fov * 0.5);\n"
-       "    return mat4(\n"
-       "        f / aspect, 0.0, 0.0, 0.0,\n"
-       "        0.0, f, 0.0, 0.0,\n"
-       "        0.0, 0.0, (far + near) / (near - far), -1.0,\n"
-       "        0.0, 0.0, (2.0 * far * near) / (near - far), 0.0\n"
-       "    );\n"
+       "    return mat4(f/aspect, 0.0, 0.0, 0.0, 0.0, f, 0.0, 0.0, 0.0, 0.0, (far+near)/(near-far), -1.0, 0.0, 0.0, (2.0*far*near)/(near-far), 0.0);\n"
        "}\n"
        "\n"
        "void main() {\n"
-       "    // Use u_zoom for zoom out effect (higher zoom = further away)\n"
-       "    float zoom_distance = 2.0 + (u_zoom - 1.0) * 3.0;  // 2.0 to 5.0\n"
-       "    \n"
-       "    // Rotation based on time and quadrant selection\n"
-       "    float rot_speed = 1.0 + float(u_quadrant) * 0.3;\n"
-       "    mat4 rotX = rotationX(u_time * rot_speed * 0.7);\n"
-       "    mat4 rotY = rotationY(u_time * rot_speed);\n"
-       "    \n"
-       "    // Transform vertex\n"
+       "    float zoom_distance = 2.0 + (u_zoom - 1.0) * 3.0;\n"
+       "    float slight_x_rotation = 0.2; // ~11 degrees for a better view\n"
+       "\n"
+       "    mat4 rotX = rotationX(slight_x_rotation);\n"
+       "    mat4 rotY = rotationY(u_rotation_y); // Use the angle passed directly from C\n"
+       "\n"
        "    vec4 pos = vec4(a_position, 1.0);\n"
        "    pos = rotY * rotX * pos;\n"
-       "    pos.z -= zoom_distance;  // Move away from camera\n"
-       "    \n"
-       "    // Perspective projection\n"
+       "    pos.z -= zoom_distance;\n"
+       "\n"
        "    mat4 proj = perspective(45.0 * 3.14159 / 180.0, 1.0, 0.1, 10.0);\n"
        "    gl_Position = proj * pos;\n"
-       "    \n"
+       "\n"
        "    v_texcoord_to_fs = a_texcoord;\n"
        "    v_face_id = a_face_id;\n"
        "}\n";
-
 // Fragment Shader
 static const char *cube_fragment_shader_src =
 "#version 300 es\n"
@@ -5795,6 +5843,7 @@ static const char *cube_fragment_shader_src =
 "uniform sampler2D u_scene_texture2;\n"
 "uniform sampler2D u_scene_texture3;\n"
 "uniform float u_zoom;               // For brightness/intensity\n"
+"uniform highp int u_quadrant;       // Which quadrant to expand (0-3)\n"
 "\n"
 "in vec2 v_texcoord_to_fs;\n"
 "in float v_face_id; // The ID of the cube face being rendered (0-5)\n"
@@ -5806,6 +5855,15 @@ static const char *cube_fragment_shader_src =
 "    \n"
 "    // Convert the incoming float face ID to an integer.\n"
 "    int face = int(round(v_face_id)); // Use round() for safety\n"
+"    int desktop_id = face % 4; // Which desktop this face represents (0-3)\n"
+"    \n"
+"    // Apply zoom effect when this face matches the selected quadrant\n"
+"    vec2 sampling_uv = uv;\n"
+"    if (desktop_id == u_quadrant) {\n"
+"        // Show full texture but scaled up - no cropping\n"
+"        // This makes the texture appear larger on the face\n"
+"        sampling_uv = uv; // Use original UV coordinates to show full texture\n"
+"    }\n"
 "    \n"
 "    vec4 color;\n"
 "    \n"
@@ -5815,16 +5873,16 @@ static const char *cube_fragment_shader_src =
 "    // across the 6 faces of the cube.\n"
 "    if (face % 4 == 0) {\n"
 "        // Faces 0 and 4 will get Desktop 0\n"
-"        color = texture(u_scene_texture0, uv);\n"
+"        color = texture(u_scene_texture0, sampling_uv);\n"
 "    } else if (face % 4 == 1) {\n"
 "        // Faces 1 and 5 will get Desktop 1\n"
-"        color = texture(u_scene_texture1, uv);\n"
+"        color = texture(u_scene_texture2, sampling_uv);\n"
 "    } else if (face % 4 == 2) {\n"
 "        // Face 2 will get Desktop 2\n"
-"        color = texture(u_scene_texture2, uv);\n"
+"        color = texture(u_scene_texture1, sampling_uv);\n"
 "    } else { // face % 4 == 3\n"
 "        // Face 3 will get Desktop 3\n"
-"        color = texture(u_scene_texture3, uv);\n"
+"        color = texture(u_scene_texture3, sampling_uv);\n"
 "    }\n"
 "    \n"
 "    // Intensity based on zoom (closer zoom = brighter)\n"
@@ -5833,8 +5891,6 @@ static const char *cube_fragment_shader_src =
 "    \n"
 "    FragColor = color;\n"
 "}\n";
-// Place these near your other `const char *` shader definitions in main()
-
 // Shader for Desktop 1 (Starfield)
 static const char *desktop_1_fs_src =
     "#version 300 es\n"
@@ -6223,17 +6279,17 @@ if (!create_generic_shader_program(server.renderer, "ScaledSceneViewShader",
 
 
     struct shader_uniform_spec cube_scene_uniforms[] = {
-    {"mvp", &server.cube_shader_mvp_loc},
-    {"u_scene_texture0", &server.cube_shader_scene_tex0_loc},
-    {"u_scene_texture1", &server.cube_shader_scene_tex1_loc},
-    {"u_scene_texture2", &server.cube_shader_scene_tex2_loc},
-    {"u_scene_texture3", &server.cube_shader_scene_tex3_loc},
-    {"u_zoom", &server.cube_shader_zoom_loc},
-    {"u_zoom_center", &server.cube_shader_zoom_center_loc},
-    {"u_quadrant", &server.cube_shader_quadrant_loc},
-    {"u_time",&server.cube_shader_time_loc}  // Add this if using the uniform version
-// {"u_current_quad", &server.cube_shader_current_quad_loc} 
-};
+        {"mvp", &server.cube_shader_mvp_loc},
+        {"u_scene_texture0", &server.cube_shader_scene_tex0_loc},
+        {"u_scene_texture1", &server.cube_shader_scene_tex1_loc},
+        {"u_scene_texture2", &server.cube_shader_scene_tex2_loc},
+        {"u_scene_texture3", &server.cube_shader_scene_tex3_loc},
+        {"u_zoom", &server.cube_shader_zoom_loc},
+        {"u_zoom_center", &server.cube_shader_zoom_center_loc},
+         {"u_zoom", &server.cube_shader_zoom_loc},
+        {"u_rotation_y", &server.cube_shader_time_loc}, // RENAMED in shader, but C variable is the same
+        {"u_quadrant", &server.cube_shader_quadrant_loc},
+    };
 
 if (!create_generic_shader_program(server.renderer, "CubeShader",
                                  cube_vertex_shader_src,
