@@ -6217,7 +6217,8 @@ if (!create_generic_shader_program(server.renderer, "ScaledSceneViewShader",
     {"u_scene_texture3", &server.cube_shader_scene_tex3_loc},
     {"u_zoom", &server.cube_shader_zoom_loc},
     {"u_zoom_center", &server.cube_shader_zoom_center_loc},
-    {"u_quadrant", &server.cube_shader_quadrant_loc}  // Add this if using the uniform version
+    {"u_quadrant", &server.cube_shader_quadrant_loc},
+    {"u_time",&server.cube_shader_time_loc}  // Add this if using the uniform version
 // {"u_current_quad", &server.cube_shader_current_quad_loc} 
 };
 
