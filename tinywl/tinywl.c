@@ -3396,6 +3396,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
     bool current_frame_fbo_path = server->expo_effect_active || server->cube_effect_active;
 
 
+
    
 
     struct render_data rdata_scene_data = {
@@ -3404,6 +3405,26 @@ static void output_frame(struct wl_listener *listener, void *data) {
         .output = wlr_output,
         .pass = NULL
     };
+
+    if (current_frame_fbo_path) {
+        // --- START OF THE FIX ---
+        // When the cube or expo effect is active, we need ALL toplevels to be visible
+        // in the scene so they can be rendered into their respective desktop FBOs.
+        // The standard visibility logic would hide windows on non-active desktops.
+        // This loop temporarily makes everything visible for the offscreen render.
+        struct tinywl_toplevel *toplevel;
+        wl_list_for_each(toplevel, &server->toplevels, link) {
+            if (toplevel->scene_tree) {
+                // Also check if the toplevel is not minimized (scale > 0)
+                if (toplevel->scale > 0.01) {
+                    wlr_scene_node_set_enabled(&toplevel->scene_tree->node, true);
+                } else {
+                    wlr_scene_node_set_enabled(&toplevel->scene_tree->node, false);
+                }
+            }
+        }
+        
+    }
 
     if (current_frame_fbo_path) {
         if (!setup_intermediate_framebuffer(server, wlr_output->width, wlr_output->height,0))
@@ -5900,7 +5921,7 @@ static const char *cube_fragment_shader_src =
 "    }\n"
 "    \n"
 "    // Intensity based on zoom (closer zoom = brighter)\n"
-"    float intensity = 0.7 + (2.0 - u_zoom) * 0.3;\n"
+"    float intensity = 1.0; //0.7 + (2.0 - u_zoom) * 0.3;\n"
 "    color.rgb *= intensity;\n"
 "    \n"
 "    FragColor = color;\n"
