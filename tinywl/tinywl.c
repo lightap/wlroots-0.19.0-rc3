@@ -3548,37 +3548,56 @@ static void output_frame(struct wl_listener *listener, void *data) {
                         glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[i]);
                         glUniform1i(server->fullscreen_shader_scene_tex0_loc + i, i);
                     }
-                 } else if (server->cube_effect_active) {
-                // --- CUBE 3D RENDERING ---
-                glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
-                
-                // FIX: Enable depth testing and clear the depth buffer
-                glEnable(GL_DEPTH_TEST);
-                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-                glEnable(GL_BLEND);
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                } else if (server->cube_effect_active) {
+    wlr_log(WLR_INFO, "CUBE DEBUG: Rendering cube with zoom=%.2f, quadrant=%d, time=%.2f", 
+           server->cube_anim_current_factor, server->current_desktop, get_monotonic_time_seconds_as_float());
+    
+    glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    
+    // Try WITHOUT face culling first to see all faces
+    glEnable(GL_CULL_FACE);  // Temporarily disable to see if geometry is correct
+    glFrontFace(GL_CCW); 
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-                glBindVertexArray(server->cube_vao); // Use the 3D cube
-                glUseProgram(server->cube_shader_program);
-                
-                // FIX: Set the u_time uniform
-                GLint time_loc = server->cube_shader_time_loc; // Use the stored location
-                if (time_loc != -1) {
-                    glUniform1f(time_loc, get_monotonic_time_seconds_as_float());
-                }
+    glBindVertexArray(server->cube_vao);
+    glUseProgram(server->cube_shader_program);
+    
+    // Debug uniform locations
+    wlr_log(WLR_INFO, "CUBE DEBUG: time_loc=%d, zoom_loc=%d, quadrant_loc=%d", 
+           server->cube_shader_time_loc, server->cube_shader_zoom_loc, server->cube_shader_quadrant_loc);
+    
+    GLint time_loc = server->cube_shader_time_loc;
+    if (time_loc != -1) {
+        glUniform1f(time_loc, get_monotonic_time_seconds_as_float());
+    }
 
-                // Set other cube uniforms
-                glUniform1f(server->cube_shader_zoom_loc, server->cube_anim_current_factor);
-                glUniform1i(server->cube_shader_quadrant_loc, server->current_desktop); // Cube doesn't have pending switch logic
-                    for(int i = 0; i < 4; ++i) {
-                        glActiveTexture(GL_TEXTURE0 + i);
-                        glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[i]);
-                        // Use the CUBE's uniform locations
-                        glUniform1i(server->cube_shader_scene_tex0_loc + i, i);
-                    }
-                }
-
+    glUniform1f(server->cube_shader_zoom_loc, server->cube_anim_current_factor);
+    glUniform1i(server->cube_shader_quadrant_loc, server->current_desktop);
+    
+    for(int i = 0; i < 4; ++i) {
+        glActiveTexture(GL_TEXTURE0 + i);
+        glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[i]);
+        glUniform1i(server->cube_shader_scene_tex0_loc + i, i);
+    }
+    
+    // Check for OpenGL errors
+    GLenum error = glGetError();
+    if (error != GL_NO_ERROR) {
+        wlr_log(WLR_ERROR, "CUBE DEBUG: OpenGL error before draw: %d", error);
+    }
+}
+             if (server->expo_effect_active) {    
                 glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+             }
+
+             if (server->cube_effect_active) {    
+                glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_INT, 0);
+             }
+
 
                 // Cleanup
                 glUseProgram(0);
@@ -5769,57 +5788,51 @@ static const char *cube_vertex_shader_src =
 static const char *cube_fragment_shader_src =
 "#version 300 es\n"
 "precision mediump float;\n"
-"precision mediump int;\n"
+"precision highp int;\n" // Use highp for the int uniform
 "\n"
-"uniform sampler2D u_scene_texture0;  // Texture for top-left quadrant\n"
-"uniform sampler2D u_scene_texture1;  // Texture for top-right quadrant\n"
-"uniform sampler2D u_scene_texture2;  // Texture for bottom-left quadrant\n"
-"uniform sampler2D u_scene_texture3;  // Texture for bottom-right quadrant\n"
-"uniform float u_zoom;               // 1.0 to 2.0\n"
-"uniform highp int u_quadrant;       // Which quadrant to expand (0-3)\n"
+"uniform sampler2D u_scene_texture0;\n"
+"uniform sampler2D u_scene_texture1;\n"
+"uniform sampler2D u_scene_texture2;\n"
+"uniform sampler2D u_scene_texture3;\n"
+"uniform float u_zoom;               // For brightness/intensity\n"
 "\n"
 "in vec2 v_texcoord_to_fs;\n"
-"in float v_face_id;\n"
+"in float v_face_id; // The ID of the cube face being rendered (0-5)\n"
 "out vec4 FragColor;\n"
 "\n"
 "void main() {\n"
+"    // The texture coordinates for this fragment on the current face (always 0.0-1.0).\n"
 "    vec2 uv = v_texcoord_to_fs;\n"
-"    int face = int(v_face_id);\n"
 "    \n"
-"    // Map each face to a quadrant based on face ID and selected quadrant\n"
-"    int texture_quad = (face + u_quadrant) % 4;\n"
-"    \n"
-"    // Intensity based on zoom (closer zoom = brighter)\n"
-"    float intensity = 0.7 + (2.0 - u_zoom) * 0.3;\n"
+"    // Convert the incoming float face ID to an integer.\n"
+"    int face = int(round(v_face_id)); // Use round() for safety\n"
 "    \n"
 "    vec4 color;\n"
 "    \n"
-"    if (texture_quad == 0) {\n"
-"        // Use texture0 - RED TINT\n"
+"    // *** THE CORRECT LOGIC ***\n"
+"    // Use the face ID to select which single texture to sample from.\n"
+"    // We use the modulo operator (%) so that the 4 textures repeat\n"
+"    // across the 6 faces of the cube.\n"
+"    if (face % 4 == 0) {\n"
+"        // Faces 0 and 4 will get Desktop 0\n"
 "        color = texture(u_scene_texture0, uv);\n"
-"        color.rgb *= vec3(1.2, 0.8, 0.8) * intensity;  // Red tint\n"
-"    } else if (texture_quad == 1) {\n"
-"        // Use texture1 - GREEN TINT\n"
+"    } else if (face % 4 == 1) {\n"
+"        // Faces 1 and 5 will get Desktop 1\n"
 "        color = texture(u_scene_texture1, uv);\n"
-"        color.rgb *= vec3(0.8, 1.2, 0.8) * intensity;  // Green tint\n"
-"    } else if (texture_quad == 2) {\n"
-"        // Use texture2 - BLUE TINT\n"
+"    } else if (face % 4 == 2) {\n"
+"        // Face 2 will get Desktop 2\n"
 "        color = texture(u_scene_texture2, uv);\n"
-"        color.rgb *= vec3(0.8, 0.8, 1.2) * intensity;  // Blue tint\n"
-"    } else {\n"
-"        // Use texture3 - YELLOW TINT\n"
+"    } else { // face % 4 == 3\n"
+"        // Face 3 will get Desktop 3\n"
 "        color = texture(u_scene_texture3, uv);\n"
-"        color.rgb *= vec3(1.1, 1.1, 0.7) * intensity;  // Yellow tint\n"
 "    }\n"
 "    \n"
-"    // Add subtle edge highlighting based on quadrant selection\n"
-"    if (texture_quad == u_quadrant) {\n"
-"        color.rgb += vec3(0.1);  // Slight brightness boost for selected quadrant\n"
-"    }\n"
+"    // Intensity based on zoom (closer zoom = brighter)\n"
+"    float intensity = 0.7 + (2.0 - u_zoom) * 0.3;\n"
+"    color.rgb *= intensity;\n"
 "    \n"
 "    FragColor = color;\n"
 "}\n";
-
 // Place these near your other `const char *` shader definitions in main()
 
 // Shader for Desktop 1 (Starfield)
@@ -6351,54 +6364,58 @@ if (wlr_egl_make_current(egl_main, NULL)) {
     const GLuint indices[] = {0, 1, 2, 1, 3, 2}; 
 
     // NEW CUBE DATA (for the rotating cube effect)
-    const GLfloat cube_verts[] = {
-        // Position (x,y,z)    TexCoord (u,v)    Face ID
-        // Front face (z = 0.5)
-        -0.5f, -0.5f,  0.5f,   0.0f, 0.0f,   0.0f,  // Bottom-left
-         0.5f, -0.5f,  0.5f,   1.0f, 0.0f,   0.0f,  // Bottom-right
-         0.5f,  0.5f,  0.5f,   1.0f, 1.0f,   0.0f,  // Top-right
-        -0.5f,  0.5f,  0.5f,   0.0f, 1.0f,   0.0f,  // Top-left
-        
-        // Back face (z = -0.5)
-        -0.5f, -0.5f, -0.5f,   1.0f, 0.0f,   1.0f,  // Bottom-left
-         0.5f, -0.5f, -0.5f,   0.0f, 0.0f,   1.0f,  // Bottom-right
-         0.5f,  0.5f, -0.5f,   0.0f, 1.0f,   1.0f,  // Top-right
-        -0.5f,  0.5f, -0.5f,   1.0f, 1.0f,   1.0f,  // Top-left
-        
-        // Left face (x = -0.5)
-        -0.5f, -0.5f, -0.5f,   0.0f, 0.0f,   2.0f,  // Bottom-left
-        -0.5f, -0.5f,  0.5f,   1.0f, 0.0f,   2.0f,  // Bottom-right
-        -0.5f,  0.5f,  0.5f,   1.0f, 1.0f,   2.0f,  // Top-right
-        -0.5f,  0.5f, -0.5f,   0.0f, 1.0f,   2.0f,  // Top-left
-        
-        // Right face (x = 0.5)
-         0.5f, -0.5f, -0.5f,   1.0f, 0.0f,   3.0f,  // Bottom-left
-         0.5f, -0.5f,  0.5f,   0.0f, 0.0f,   3.0f,  // Bottom-right
-         0.5f,  0.5f,  0.5f,   0.0f, 1.0f,   3.0f,  // Top-right
-         0.5f,  0.5f, -0.5f,   1.0f, 1.0f,   3.0f,  // Top-left
-        
-        // Bottom face (y = -0.5)
-        -0.5f, -0.5f, -0.5f,   0.0f, 1.0f,   4.0f,  // Bottom-left
-         0.5f, -0.5f, -0.5f,   1.0f, 1.0f,   4.0f,  // Bottom-right
-         0.5f, -0.5f,  0.5f,   1.0f, 0.0f,   4.0f,  // Top-right
-        -0.5f, -0.5f,  0.5f,   0.0f, 0.0f,   4.0f,  // Top-left
-        
-        // Top face (y = 0.5)
-        -0.5f,  0.5f, -0.5f,   0.0f, 0.0f,   5.0f,  // Bottom-left
-         0.5f,  0.5f, -0.5f,   1.0f, 0.0f,   5.0f,  // Bottom-right
-         0.5f,  0.5f,  0.5f,   1.0f, 1.0f,   5.0f,  // Top-right
-        -0.5f,  0.5f,  0.5f,   0.0f, 1.0f,   5.0f   // Top-left
-    };
+ const GLfloat cube_verts[] = {
+    // Front face (z = 0.5) - Counter-clockwise from outside
+    -0.5f, -0.5f,  0.5f,   0.0f, 0.0f,   0.0f,  // 0: Bottom-left
+     0.5f, -0.5f,  0.5f,   1.0f, 0.0f,   0.0f,  // 1: Bottom-right
+     0.5f,  0.5f,  0.5f,   1.0f, 1.0f,   0.0f,  // 2: Top-right
+    -0.5f,  0.5f,  0.5f,   0.0f, 1.0f,   0.0f,  // 3: Top-left
+    
+    // Back face (z = -0.5) - Counter-clockwise from outside  
+    -0.5f, -0.5f, -0.5f,   1.0f, 0.0f,   1.0f,  // 4: Bottom-left
+    -0.5f,  0.5f, -0.5f,   1.0f, 1.0f,   1.0f,  // 5: Top-left
+     0.5f,  0.5f, -0.5f,   0.0f, 1.0f,   1.0f,  // 6: Top-right
+     0.5f, -0.5f, -0.5f,   0.0f, 0.0f,   1.0f,  // 7: Bottom-right
+    
+    // Left face (x = -0.5)
+    -0.5f, -0.5f, -0.5f,   0.0f, 0.0f,   2.0f,  // 8: Bottom-back
+    -0.5f, -0.5f,  0.5f,   1.0f, 0.0f,   2.0f,  // 9: Bottom-front
+    -0.5f,  0.5f,  0.5f,   1.0f, 1.0f,   2.0f,  // 10: Top-front
+    -0.5f,  0.5f, -0.5f,   0.0f, 1.0f,   2.0f,  // 11: Top-back
+    
+    // Right face (x = 0.5)
+     0.5f, -0.5f,  0.5f,   0.0f, 0.0f,   3.0f,  // 12: Bottom-front
+     0.5f, -0.5f, -0.5f,   1.0f, 0.0f,   3.0f,  // 13: Bottom-back
+     0.5f,  0.5f, -0.5f,   1.0f, 1.0f,   3.0f,  // 14: Top-back
+     0.5f,  0.5f,  0.5f,   0.0f, 1.0f,   3.0f,  // 15: Top-front
+    
+    // Bottom face (y = -0.5)
+    -0.5f, -0.5f, -0.5f,   0.0f, 1.0f,   4.0f,  // 16
+     0.5f, -0.5f, -0.5f,   1.0f, 1.0f,   4.0f,  // 17
+     0.5f, -0.5f,  0.5f,   1.0f, 0.0f,   4.0f,  // 18
+    -0.5f, -0.5f,  0.5f,   0.0f, 0.0f,   4.0f,  // 19
+    
+    // Top face (y = 0.5)
+    -0.5f,  0.5f,  0.5f,   0.0f, 0.0f,   5.0f,  // 20
+     0.5f,  0.5f,  0.5f,   1.0f, 0.0f,   5.0f,  // 21
+     0.5f,  0.5f, -0.5f,   1.0f, 1.0f,   5.0f,  // 22
+    -0.5f,  0.5f, -0.5f,   0.0f, 1.0f,   5.0f   // 23
+};
 
-    const GLuint cube_indices[] = {
-        0,  1,  2,   2,  3,  0,   // Front
-        4,  5,  6,   6,  7,  4,   // Back
-        8,  9, 10,  10, 11,  8,   // Left
-       12, 13, 14,  14, 15, 12,   // Right
-       16, 17, 18,  18, 19, 16,   // Bottom
-       20, 21, 22,  22, 23, 20    // Top
-    };
-
+const GLuint cube_indices[] = {
+    // Front face
+    0, 1, 2,   0, 2, 3,
+    // Back face  
+    4, 5, 6,   4, 6, 7,
+    // Left face
+    8, 9, 10,  8, 10, 11,
+    // Right face
+    12, 13, 14, 12, 14, 15,
+    // Bottom face
+    16, 17, 18, 16, 18, 19,
+    // Top face
+    20, 21, 22, 20, 22, 23
+};
     // ===========================================
     // SETUP EXISTING 2D QUAD (for other effects)
     // ===========================================
