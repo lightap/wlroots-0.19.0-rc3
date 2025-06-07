@@ -361,6 +361,7 @@ struct wl_listener pointer_motion;
     GLint panel_shader_is_preview_active_loc;
     GLint panel_shader_preview_rect_loc;
     GLint panel_shader_preview_tex_transform_loc;
+    GLint panel_shader_rect_pixel_dimensions_loc;
 
 
 // NEW: Shader for SSDs
@@ -2877,6 +2878,12 @@ static void render_panel_node(struct wlr_scene_node *node, void *user_data) {
         return;
     }
 
+    if (server->panel_shader_rect_pixel_dimensions_loc != -1) {
+        // Get the dimensions directly from the wlr_scene_rect struct.
+        float panel_dims[2] = { (float)panel_srect->width, (float)panel_srect->height };
+        glUniform2fv(server->panel_shader_rect_pixel_dimensions_loc, 1, panel_dims);
+    }
+
     // --- Standard Panel Uniforms (MVP, time, iResolution for panel's own shader effects) ---
     float mvp_for_panel_geometry[9];
     int sx = node->x;
@@ -5130,7 +5137,7 @@ static const char *panel_vertex_shader_src =
     "    v_texcoord = texcoord;\n"
     "}\n";
 
-
+/*
 static const char *panel_fragment_shader_src =
     "#version 300 es\n"
     "precision mediump float;\n"
@@ -5251,9 +5258,132 @@ static const char *panel_fragment_shader_src =
     "    }\n"
     "\n"
     "    frag_color = final_pixel_color.bgra;\n"
+    "}";*/
+static const char *panel_fragment_shader_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "\n"
+    "in vec2 v_texcoord; // Normalized UV for the panel quad itself (0,0 to 1,1)\n"
+    "out vec4 frag_color;\n"
+    "\n"
+    "// Time and resolution uniforms for the background animation\n"
+    "uniform float time;\n"
+    "uniform vec2 iResolution; // Resolution of the viewport/target this shader draws to\n"
+    "uniform vec2 panelDimensions; // Actual panel dimensions in pixels\n"
+    "\n"
+    "// Uniforms for the preview functionality\n"
+    "uniform sampler2D u_previewTexture;     // The window texture for the preview\n"
+    "uniform bool u_isPreviewActive;         // Flag: is there a preview to draw?\n"
+    "uniform vec4 u_previewRect;           // Preview position and size on panel: x, y, w, h (normalized 0-1 relative to panel's own UVs)\n"
+    "uniform mat3 u_previewTexTransform;   // Transform for sampling the preview texture\n"
+    "\n"
+    "// Function to calculate rounded top corner mask using pixel-based dimensions\n"
+    "float roundedTopCornerMask(vec2 uv, float radiusPixels) {\n"
+    "    // Convert UV coordinates to pixel coordinates\n"
+    "    vec2 pixelCoord = uv * panelDimensions;\n"
+    "    \n"
+    "    // --- THE FIX IS HERE --- \n"
+    "    // Check the TOP of the panel (where pixelCoord.y is SMALLER than radiusPixels)\n"
+    "    if (pixelCoord.y > radiusPixels) {\n"
+    "        return 1.0; // The non-rounded part is fully opaque\n"
+    "    }\n"
+    "    \n"
+    "    // We are now in the top-most part of the panel. Check if we're in a corner.\n"
+    "    vec2 corner_dist;\n"
+    "    \n"
+    "    // Top-left corner (pixelCoord.x is small)\n"
+    "    if (pixelCoord.x < radiusPixels) {\n"
+    "        corner_dist = vec2(radiusPixels - pixelCoord.x, radiusPixels - pixelCoord.y);\n"
+    "        float dist_to_center = length(corner_dist);\n"
+    "        return smoothstep(radiusPixels + 1.0, radiusPixels - 1.0, dist_to_center);\n"
+    "    }\n"
+    "    \n"
+    "    // Top-right corner (pixelCoord.x is large)\n"
+    "    if (pixelCoord.x > (panelDimensions.x - radiusPixels)) {\n"
+    "        corner_dist = vec2(pixelCoord.x - (panelDimensions.x - radiusPixels), radiusPixels - pixelCoord.y);\n"
+    "        float dist_to_center = length(corner_dist);\n"
+    "        return smoothstep(radiusPixels + 1.0, radiusPixels - 1.0, dist_to_center);\n"
+    "    }\n"
+    "    \n"
+    "    // The area between the corners at the top is fully opaque\n"
+    "    return 1.0;\n"
+    "}\n"
+    "\n"
+    "// ... (The rest of your shader code remains exactly the same) ...\n"
+    "\n"
+    "mat2 rotate2D(float angle) {\n"
+    "    float s = sin(angle);\n"
+    "    float c = cos(angle);\n"
+    "    return mat2(c, -s, s, c);\n"
+    "}\n"
+    "\n"
+    "float hash(vec2 p) {\n"
+    "    return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);\n"
+    "}\n"
+    "\n"
+    "vec4 getElectricGridColor() {\n"
+    "    vec2 uv = (gl_FragCoord.xy - 0.5 * iResolution.xy) / min(iResolution.x, iResolution.y);\n"
+    "    float iTime = time * 0.35;\n"
+    "    vec3 col = vec3(0.01, 0.02, 0.05);\n"
+    "    uv *= rotate2D(iTime * 0.05);\n"
+    "    uv *= (1.0 + 0.05 * sin(iTime * 0.2));\n"
+    "    float grid_scale = 8.0;\n"
+    "    vec2 grid_uv = uv * grid_scale;\n"
+    "    grid_uv.x += iTime * 0.3;\n"
+    "    grid_uv.y -= iTime * 0.2;\n"
+    "    vec2 grid_id = floor(grid_uv);\n"
+    "    vec2 grid_fract = fract(grid_uv);\n"
+    "    float line_width = 0.03;\n"
+    "    float line_intensity_x = smoothstep(line_width, 0.0, min(grid_fract.x, 1.0 - grid_fract.x));\n"
+    "    float line_intensity_y = smoothstep(line_width, 0.0, min(grid_fract.y, 1.0 - grid_fract.y));\n"
+    "    float grid_lines = max(line_intensity_x, line_intensity_y);\n"
+    "    float pulse_wave = 0.6 + 0.4 * sin(grid_id.x * 0.7 - iTime * 2.5 + grid_id.y * 0.5);\n"
+    "    grid_lines *= pulse_wave;\n"
+    "    vec3 grid_color = vec3(0.1, 0.6, 1.0);\n"
+    "    col = mix(col, grid_color, grid_lines * 0.7);\n"
+    "    float dot_radius = 0.08;\n"
+    "    float dist_to_center = length(grid_fract - 0.5);\n"
+    "    float dots = smoothstep(dot_radius, dot_radius - 0.02, dist_to_center);\n"
+    "    float dot_pulse = 0.5 + 0.5 * sin(hash(grid_id) * 6.283 + iTime * 4.0);\n"
+    "    dots *= dot_pulse;\n"
+    "    vec3 dot_color = vec3(0.8, 1.0, 1.0);\n"
+    "    col = mix(col, dot_color, dots * 0.4);\n"
+    "    vec2 fine_grid_uv = uv * grid_scale * 2.5;\n"
+    "    fine_grid_uv.x -= iTime * 0.7;\n"
+    "    fine_grid_uv.y += iTime * 0.5;\n"
+    "    vec2 fine_grid_fract = fract(fine_grid_uv);\n"
+    "    float fine_line_width = 0.01;\n"
+    "    float fine_intensity_x = smoothstep(fine_line_width, 0.0, min(fine_grid_fract.x, 1.0 - fine_grid_fract.x));\n"
+    "    float fine_intensity_y = smoothstep(fine_line_width, 0.0, min(fine_grid_fract.y, 1.0 - fine_grid_fract.y));\n"
+    "    float fine_grid_lines = max(fine_intensity_x, fine_intensity_y);\n"
+    "    col = mix(col, grid_color * 0.5, fine_grid_lines * 0.2);\n"
+    "    return vec4(clamp(col, 0.0, 1.0), 0.8);\n"
+    "}\n"
+    "\n"
+    "void main() {\n"
+    "    float corner_radius_pixels = 40.0;\n"
+    "    float corner_mask = roundedTopCornerMask(v_texcoord, corner_radius_pixels);\n"
+    "    vec4 background_color = getElectricGridColor();\n"
+    "    background_color.a *= corner_mask;\n"
+    "    vec4 final_pixel_color = background_color;\n"
+    "\n"
+    "    if (u_isPreviewActive) {\n"
+    "        bool is_inside_preview_x = (v_texcoord.x >= u_previewRect.x && v_texcoord.x < (u_previewRect.x + u_previewRect.z));\n"
+    "        bool is_inside_preview_y = (v_texcoord.y >= u_previewRect.y && v_texcoord.y < (u_previewRect.y + u_previewRect.w));\n"
+    "        \n"
+    "        if (is_inside_preview_x && is_inside_preview_y) {\n"
+    "            vec3 transformed_uv_homogeneous = u_previewTexTransform * vec3(v_texcoord, 1.0);\n"
+    "            vec2 final_sample_uv = transformed_uv_homogeneous.xy;\n"
+    "            vec4 preview_sample = texture(u_previewTexture, final_sample_uv);\n"
+    "            \n"
+    "            if (preview_sample.a > 0.05) {\n"
+    "                final_pixel_color = mix(background_color, preview_sample, preview_sample.a);\n"
+    "            }\n"
+    "        }\n"
+    "    }\n"
+    "\n"
+    "    frag_color = final_pixel_color.bgra;\n"
     "}";
-
-
 
 const char *back_vertex_shader_src =
         "#version 300 es\n"
@@ -6614,6 +6744,7 @@ const char *vendor = (const char *)glGetString(GL_VENDOR);
         {"mvp", &server.panel_shader_mvp_loc},                       // For mat3
         {"time", &server.panel_shader_time_loc},                     // For float
         {"iResolution", &server.panel_shader_resolution_loc},        // For vec2
+         {"panelDimensions", &server.panel_shader_rect_pixel_dimensions_loc},
         {"u_previewTexture", &server.panel_shader_preview_tex_loc},  // For sampler2D (int)
         {"u_isPreviewActive", &server.panel_shader_is_preview_active_loc}, // For bool (int)
         {"u_previewRect", &server.panel_shader_preview_rect_loc},          // For vec4
