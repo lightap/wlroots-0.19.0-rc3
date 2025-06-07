@@ -5786,7 +5786,6 @@ static const char *fullscreen_fragment_shader_src =
 "    FragColor = color;\n"
 "}\n";
 
-// Vertex Shader
 static const char *cube_vertex_shader_src =
        "#version 300 es\n"
        "precision mediump float;\n"
@@ -5816,13 +5815,27 @@ static const char *cube_vertex_shader_src =
        "}\n"
        "\n"
        "void main() {\n"
-       "    float zoom_distance = 2.0 + (u_zoom - 1.0) * 3.0;\n"
-       "    float slight_x_rotation = 0.2; // ~11 degrees for a better view\n"
+       "    float zoom_distance = 1.8 - (u_zoom - 1.85) * 1.0;\n"
+       "    float slight_x_rotation = 0.0; // ~11 degrees for a better view\n"
        "\n"
        "    mat4 rotX = rotationX(slight_x_rotation);\n"
        "    mat4 rotY = rotationY(u_rotation_y); // Use the angle passed directly from C\n"
        "\n"
        "    vec4 pos = vec4(a_position, 1.0);\n"
+       "    \n"
+       "    // Scale the geometry to make side faces rectangular while keeping top/bottom square\n"
+       "    // Assuming your textures have a 16:9 or similar aspect ratio\n"
+       "    float aspect_ratio = 1.0; // Adjust this to match your actual texture aspect ratio\n"
+       "    \n"
+       "    // Only scale the Y dimension for side faces (faces 0-3)\n"
+       "    // Top and bottom faces (4-5) remain square but will be distorted\n"
+       "    int face = int(round(a_face_id));\n"
+       "    if (face >= 0 && face <= 3) {\n"
+       "        // Side faces: scale Y to match texture aspect ratio\n"
+       "        pos.y *= aspect_ratio;\n"
+       "    }\n"
+       "    // Top and bottom faces (4-5) keep original scaling\n"
+       "    \n"
        "    pos = rotY * rotX * pos;\n"
        "    pos.z -= zoom_distance;\n"
        "\n"
@@ -5832,7 +5845,8 @@ static const char *cube_vertex_shader_src =
        "    v_texcoord_to_fs = a_texcoord;\n"
        "    v_face_id = a_face_id;\n"
        "}\n";
-// Fragment Shader
+
+// Fragment Shader - Keep unchanged
 static const char *cube_fragment_shader_src =
 "#version 300 es\n"
 "precision mediump float;\n"
