@@ -411,6 +411,25 @@ struct wl_listener pointer_motion;
     GLint fullscreen_shader_quadrant_loc;
 
 
+    // cube shader effect (as before)
+    GLuint cube_shader_program;
+    GLint cube_shader_mvp_loc;
+     GLint cube_shader_time_loc; // Keep if shader uses it for non-rotation anim
+    GLint cube_shader_scene_tex0_loc;
+   GLint cube_shader_scene_tex1_loc;
+    GLint cube_shader_scene_tex2_loc;
+    GLint cube_shader_scene_tex3_loc;
+    GLint cube_shader_tex_matrix_loc;   // Location for texture matrix uniform
+ GLint cube_shader_resolution_loc;
+
+
+   // GLint cube_shader_current_quad_loc;   
+
+
+// Add these new zoom uniform locations:
+    GLint cube_shader_zoom_loc;
+    GLint cube_shader_zoom_center_loc;
+    GLint cube_shader_quadrant_loc;
 
 
 
@@ -420,11 +439,11 @@ struct wl_listener pointer_motion;
      struct wlr_buffer *scene_capture_buffer;    // Buffer to capture the scene (NEW/REPURPOSED)
     struct wlr_texture *scene_texture;          // Texture from the captured scene buffer (REPURPOSED)
     // GLuint scene_fbo; // REMOVE THIS
- bool shrink_effect_active;
+
 
  // Variables to control the zoom effect at runtime
    // --- Animation variables for the fullscreen effect's geometric zoom ---
-
+ bool expo_effect_active;
     float effect_zoom_factor_normal;
     float effect_zoom_factor_zoomed;
     
@@ -439,7 +458,20 @@ struct wl_listener pointer_motion;
     float effect_zoom_center_x;
     float effect_zoom_center_y;
 
-
+ bool cube_effect_active;
+    float cube_zoom_factor_normal;
+    float cube_zoom_factor_zoomed;
+    
+    bool  cube_is_target_zoomed;      // True if the *target* state is zoomed
+    bool  cube_is_animating_zoom;
+    float cube_anim_current_factor;   // Calculated in output_frame
+    float cube_anim_start_factor;
+    float cube_anim_target_factor;
+    float cube_anim_start_time_sec;
+    float cube_anim_duration_sec;
+    
+    float cube_zoom_center_x;
+    float cube_zoom_center_y;
 
 
     struct wlr_xdg_decoration_manager_v1 *xdg_decoration_manager;
@@ -466,7 +498,8 @@ GLuint intermediate_rbo[4];
     GLint desktop_bg_shader_res_loc[4];
     GLint desktop_bg_shader_color_loc[4]; // In case your shaders use a base color
 
-   
+   // New cube geometry (add these)
+    GLuint cube_vao, cube_vbo, cube_ibo;
 };
 
 /* Updated tinywl_output struct to store timer */
@@ -863,7 +896,7 @@ static void server_destroy(struct tinywl_server *server) {
         if (server->ssd_shader_program) glDeleteProgram(server->ssd_shader_program);
         if (server->back_shader_program) glDeleteProgram(server->back_shader_program);
         if (server->fullscreen_shader_program) glDeleteProgram(server->fullscreen_shader_program); // NEW
-
+    if (server->cube_shader_program) glDeleteProgram(server->cube_shader_program); 
         if (server->quad_vao) glDeleteVertexArrays(1, &server->quad_vao);
         if (server->quad_vbo) glDeleteBuffers(1, &server->quad_vbo);
         if (server->quad_ibo) glDeleteBuffers(1, &server->quad_ibo);
@@ -875,6 +908,7 @@ static void server_destroy(struct tinywl_server *server) {
         server->back_shader_program = 0;
  
         server->fullscreen_shader_program = 0; // NEW
+        server->cube_shader_program = 0; // NEW
         server->quad_vao = 0;
         server->quad_vbo = 0;
         server->quad_ibo = 0;
@@ -883,6 +917,7 @@ static void server_destroy(struct tinywl_server *server) {
     } else if (server->shader_program || server->rect_shader_program || server->panel_shader_program ||
                server->ssd_shader_program || server->back_shader_program ||
                server->fullscreen_shader_program || // NEW
+                server->cube_shader_program || // NEW
                server->quad_vao || server->quad_vbo || server->quad_ibo) {
         wlr_log(WLR_ERROR, "Could not make EGL context current to delete GL resources in server_destroy");
     }
@@ -1099,14 +1134,14 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
     }
 
 
-    if (!handled_by_compositor && event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-        // --- BINDING: Toggle Expo View ('P' key) ---
+   if (!handled_by_compositor && event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
         if (!(modifiers & (WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT | WLR_MODIFIER_SHIFT | WLR_MODIFIER_LOGO))) {
             for (int i = 0; i < nsyms; i++) {
+                // --- BINDING: Toggle Expo View ('P' key) ---
                 if (syms[i] == XKB_KEY_p || syms[i] == XKB_KEY_P) {
-                     if (!server->shrink_effect_active) {
-                        server->shrink_effect_active = true;
-                        wlr_log(WLR_INFO, "Fullscreen Shader Effect ENABLED via 'P'.");
+                     if (!server->expo_effect_active) {
+                        server->expo_effect_active = true;
+                        wlr_log(WLR_INFO, "Expo Fullscreen Shader Effect ENABLED via 'P'.");
                         server->effect_is_target_zoomed = true;
                         server->effect_anim_start_factor = server->effect_zoom_factor_normal;
                         server->effect_anim_target_factor = server->effect_zoom_factor_zoomed;
@@ -1124,19 +1159,48 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
                             server->effect_is_animating_zoom = true;
                         }
                     }
-                    update_toplevel_visibility(server); // Show/hide windows based on new state
+                    update_toplevel_visibility(server);
+                    handled_by_compositor = true;
+                    break;
+                }
+
+                // --- BINDING: Toggle Cube View ('L' key) ---
+                if (syms[i] == XKB_KEY_l || syms[i] == XKB_KEY_L) {
+                     if (!server->cube_effect_active) {
+                        server->cube_effect_active = true;
+                        wlr_log(WLR_INFO, "Cube Fullscreen Shader Effect ENABLED via 'L'.");
+                        // FIX: Ensure we start by animating towards the zoomed-in state
+                        server->cube_is_target_zoomed = true; 
+                        server->cube_anim_start_factor = server->cube_zoom_factor_normal;
+                        server->cube_anim_target_factor = server->cube_zoom_factor_zoomed;
+                        if (fabs(server->cube_anim_start_factor - server->cube_anim_target_factor) > 1e-4f) {
+                            server->cube_anim_start_time_sec = get_monotonic_time_seconds_as_float();
+                            server->cube_is_animating_zoom = true;
+                        }
+                    } else {
+                        server->cube_is_target_zoomed = !server->cube_is_target_zoomed;
+                        server->cube_anim_start_factor = server->cube_anim_current_factor;
+                        server->cube_anim_target_factor = server->cube_is_target_zoomed ?
+                            server->cube_zoom_factor_zoomed : server->cube_zoom_factor_normal;
+                        if (fabs(server->cube_anim_start_factor - server->cube_anim_target_factor) > 1e-4f) {
+                            server->cube_anim_start_time_sec = get_monotonic_time_seconds_as_float();
+                            server->cube_is_animating_zoom = true;
+                        }
+                    }
+                    update_toplevel_visibility(server);
                     handled_by_compositor = true;
                     break;
                 }
             }
         }
+    
 
         // --- BINDING: Switch Desktop ('O' key) ---
         if (!handled_by_compositor && !(modifiers & (WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT | WLR_MODIFIER_SHIFT | WLR_MODIFIER_LOGO))) {
             for (int i = 0; i < nsyms; i++) {
                 if (syms[i] == XKB_KEY_o) {
                     int target_desktop = (server->current_desktop + 1) % server->num_desktops;
-                    if (server->shrink_effect_active) {
+                    if (server->expo_effect_active) {
                         server->pending_desktop_switch = target_desktop;
                         wlr_log(WLR_INFO, "Desktop switch to %d deferred.", target_desktop);
                     } else {
@@ -3164,9 +3228,6 @@ error_cleanup:
 
 
 
-
-
-
 // Get a specific desktop's framebuffer
 GLuint get_desktop_fbo(struct tinywl_server *server, int desktop_idx) {
     if (desktop_idx < 0 || desktop_idx >= server->num_desktops) {
@@ -3174,8 +3235,6 @@ GLuint get_desktop_fbo(struct tinywl_server *server, int desktop_idx) {
     }
     return server->desktops[desktop_idx].fbo;
 }
-
-
 
 // New function to handle deferred desktop switch
 void handle_expo_end_desktop_switch(struct tinywl_server *server) {
@@ -3194,6 +3253,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
     struct wlr_renderer *renderer = server->renderer;
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
+
 
     struct wlr_output_state output_state_direct;
     struct wlr_output_state output_state_effect;
@@ -3221,54 +3281,65 @@ static void output_frame(struct wl_listener *listener, void *data) {
         return;
     }
 
-    bool current_frame_fbo_path = server->shrink_effect_active;
+  
 
-    if (server->shrink_effect_active) {
+    // --- Expo Effect Animation State Calculation ---
+
+    // --- Expo Effect Animation State Calculation ---
+    if (server->expo_effect_active) {
         if (server->effect_is_animating_zoom) {
             float now_sec = get_monotonic_time_seconds_as_float();
             float elapsed_sec = now_sec - server->effect_anim_start_time_sec;
-            
-            float t = 1.0f; 
-            if (server->effect_anim_duration_sec > 1e-5f) {
-                t = elapsed_sec / server->effect_anim_duration_sec;
-            }
+            float t = (server->effect_anim_duration_sec > 1e-5f) ? (elapsed_sec / server->effect_anim_duration_sec) : 1.0f;
 
             if (t >= 1.0f) {
-                t = 1.0f;
                 server->effect_anim_current_factor = server->effect_anim_target_factor;
                 server->effect_is_animating_zoom = false;
-                wlr_log(WLR_DEBUG, "[%s] Zoom animation completed. Factor: %.2f, Target_zoomed: %d",
-                        wlr_output->name, server->effect_anim_current_factor, server->effect_is_target_zoomed);
-
-                if (!server->effect_is_target_zoomed &&
-                    fabs(server->effect_anim_current_factor - server->effect_zoom_factor_normal) < 1e-4f) {
-                    server->shrink_effect_active = false;
-                    current_frame_fbo_path = false;
-                    wlr_log(WLR_INFO, "[%s] Fullscreen Shader Effect OFF.", wlr_output->name);
-                    
+                if (!server->effect_is_target_zoomed) {
+                    server->expo_effect_active = false;
+                    wlr_log(WLR_INFO, "[%s] Expo Effect OFF.", wlr_output->name);
                     handle_expo_end_desktop_switch(server);
-                    
-                    struct tinywl_output *output_iter_redraw;
-                    wl_list_for_each(output_iter_redraw, &server->outputs, link) {
-                        if (output_iter_redraw->wlr_output && output_iter_redraw->wlr_output->enabled) {
-                            wlr_output_schedule_frame(output_iter_redraw->wlr_output);
-                        }
-                    }
                 }
             } else {
-                server->effect_anim_current_factor = server->effect_anim_start_factor +
-                    (server->effect_anim_target_factor - server->effect_anim_start_factor) * t;
-                wlr_output_schedule_frame(wlr_output);
+                server->effect_anim_current_factor = server->effect_anim_start_factor + (server->effect_anim_target_factor - server->effect_anim_start_factor) * t;
             }
         } else {
-            server->effect_anim_current_factor = server->effect_is_target_zoomed ?
-                server->effect_zoom_factor_zoomed : server->effect_zoom_factor_normal;
+            server->effect_anim_current_factor = server->effect_is_target_zoomed ? server->effect_zoom_factor_zoomed : server->effect_zoom_factor_normal;
         }
     } else {
         server->effect_is_animating_zoom = false;
-        server->effect_is_target_zoomed = false;
         server->effect_anim_current_factor = server->effect_zoom_factor_normal;
     }
+
+    // --- Cube Effect Animation State Calculation (Completely Separate) ---
+    if (server->cube_effect_active) {
+        if (server->cube_is_animating_zoom) {
+            float now_sec = get_monotonic_time_seconds_as_float();
+            float elapsed_sec = now_sec - server->cube_anim_start_time_sec;
+            float t = (server->cube_anim_duration_sec > 1e-5f) ? (elapsed_sec / server->cube_anim_duration_sec) : 1.0f;
+
+            if (t >= 1.0f) {
+                server->cube_anim_current_factor = server->cube_anim_target_factor;
+                server->cube_is_animating_zoom = false;
+                if (!server->cube_is_target_zoomed) {
+                    server->cube_effect_active = false;
+                    wlr_log(WLR_INFO, "[%s] Cube Effect OFF.", wlr_output->name);
+                }
+            } else {
+                server->cube_anim_current_factor = server->cube_anim_start_factor + (server->cube_anim_target_factor - server->cube_anim_start_factor) * t;
+            }
+        } else {
+            server->cube_anim_current_factor = server->cube_is_target_zoomed ? server->cube_zoom_factor_zoomed : server->cube_zoom_factor_normal;
+        }
+    } else {
+        server->cube_is_animating_zoom = false;
+        server->cube_anim_current_factor = server->cube_zoom_factor_normal;
+    }
+    // --- Determine Render Path ---
+    bool current_frame_fbo_path = server->expo_effect_active || server->cube_effect_active;
+
+
+   
 
     struct render_data rdata_scene_data = {
         .renderer = renderer,
@@ -3343,7 +3414,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glDisable(GL_CULL_FACE);
         glDisable(GL_DEPTH_TEST);
-        glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
        // render_scene_content2(server, wlr_output, &rdata_scene_data);
        rdata_scene_data.desktop_index = 2; // <<< SET CONTEXT
@@ -3360,7 +3431,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glDisable(GL_CULL_FACE);
         glDisable(GL_DEPTH_TEST);
-        glClearColor(0.0f, 1.0f, 0.0f, 1.0f);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
        // render_scene_content3(server, wlr_output, &rdata_scene_data);
       rdata_scene_data.desktop_index = 3; // <<< SET CONTEXT
@@ -3446,80 +3517,74 @@ static void output_frame(struct wl_listener *listener, void *data) {
         glViewport(0, 0, wlr_output->width, wlr_output->height);
         glScissor(0, 0, wlr_output->width, wlr_output->height);
         glEnable(GL_SCISSOR_TEST);
-        glClearColor(0.1f, 0.0f, 0.1f, 1.0f);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glDisable(GL_CULL_FACE);
         glDisable(GL_DEPTH_TEST);
 
-        if (server->quad_vao != 0 && server->fullscreen_shader_program != 0) {
+         if (server->quad_vao != 0) {
             glBindVertexArray(server->quad_vao);
-            glUseProgram(server->fullscreen_shader_program);
+          
+            // *** FIX: Select the correct shader program and uniforms based on which effect is active ***
+            GLuint program_to_use = 0;
+            GLint zoom_loc = -1;
+            GLint quadrant_loc = -1;
+            GLint tex0_loc = -1;
+            float zoom_to_use = 1.0f;
+            int target_quadrant = server->current_desktop;
 
-            float effect_mvp[9];
-            wlr_matrix_identity(effect_mvp);
-            effect_mvp[0] = 2.0f; effect_mvp[4] = 2.0f;
-            effect_mvp[6] = -1.0f; effect_mvp[7] = -1.0f;
+             if (server->quad_vao != 0) {
+                glBindVertexArray(server->quad_vao);
 
-            if (server->fullscreen_shader_mvp_loc != -1) {
-                glUniformMatrix3fv(server->fullscreen_shader_mvp_loc, 1, GL_FALSE, effect_mvp);
+                if (server->expo_effect_active) {
+                    glUseProgram(server->fullscreen_shader_program);
+                    glUniform1f(server->fullscreen_shader_zoom_loc, server->effect_anim_current_factor);
+                    int target_quadrant = server->pending_desktop_switch != -1 ? server->pending_desktop_switch : server->current_desktop;
+                    glUniform1i(server->fullscreen_shader_quadrant_loc, target_quadrant);
+                    for(int i = 0; i < 4; ++i) {
+                        glActiveTexture(GL_TEXTURE0 + i);
+                        glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[i]);
+                        glUniform1i(server->fullscreen_shader_scene_tex0_loc + i, i);
+                    }
+                 } else if (server->cube_effect_active) {
+                // --- CUBE 3D RENDERING ---
+                glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+                
+                // FIX: Enable depth testing and clear the depth buffer
+                glEnable(GL_DEPTH_TEST);
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+                glBindVertexArray(server->cube_vao); // Use the 3D cube
+                glUseProgram(server->cube_shader_program);
+                
+                // FIX: Set the u_time uniform
+                GLint time_loc = server->cube_shader_time_loc; // Use the stored location
+                if (time_loc != -1) {
+                    glUniform1f(time_loc, get_monotonic_time_seconds_as_float());
+                }
+
+                // Set other cube uniforms
+                glUniform1f(server->cube_shader_zoom_loc, server->cube_anim_current_factor);
+                glUniform1i(server->cube_shader_quadrant_loc, server->current_desktop); // Cube doesn't have pending switch logic
+                    for(int i = 0; i < 4; ++i) {
+                        glActiveTexture(GL_TEXTURE0 + i);
+                        glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[i]);
+                        // Use the CUBE's uniform locations
+                        glUniform1i(server->cube_shader_scene_tex0_loc + i, i);
+                    }
+                }
+
+                glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+
+                // Cleanup
+                glUseProgram(0);
+                glBindVertexArray(0);
             }
-
-            if (server->fullscreen_shader_scene_tex0_loc != -1) {
-                glActiveTexture(GL_TEXTURE0);
-                glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[0]);
-                glUniform1i(server->fullscreen_shader_scene_tex0_loc, 0);
-                wlr_log(WLR_DEBUG, "[%s] Bound texture0 (ID %d) for desktop 0", wlr_output->name, server->intermediate_texture[0]);
-            }
-
-            if (server->fullscreen_shader_scene_tex1_loc != -1) {
-                glActiveTexture(GL_TEXTURE1);
-                glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[1]);
-                glUniform1i(server->fullscreen_shader_scene_tex1_loc, 1);
-                wlr_log(WLR_DEBUG, "[%s] Bound texture1 (ID %d) for desktop 1", wlr_output->name, server->intermediate_texture[1]);
-            }
-
-             if (server->fullscreen_shader_scene_tex2_loc != -1) {
-                glActiveTexture(GL_TEXTURE2);
-                glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[2]);
-                glUniform1i(server->fullscreen_shader_scene_tex2_loc, 2);
-                wlr_log(WLR_DEBUG, "[%s] Bound texture0 (ID %d) for desktop 2", wlr_output->name, server->intermediate_texture[2]);
-            }
-
-            if (server->fullscreen_shader_scene_tex3_loc != -1) {
-                glActiveTexture(GL_TEXTURE3);
-                glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[3]);
-                glUniform1i(server->fullscreen_shader_scene_tex3_loc, 3);
-                wlr_log(WLR_DEBUG, "[%s] Bound texture1 (ID %d) for desktop 3", wlr_output->name, server->intermediate_texture[3]);
-            }
-
-            if (server->fullscreen_shader_zoom_loc != -1) {
-                glUniform1f(server->fullscreen_shader_zoom_loc, server->effect_anim_current_factor);
-            }
-            if (server->fullscreen_shader_zoom_center_loc != -1) {
-                float center_for_shader[2] = {server->effect_zoom_center_x, server->effect_zoom_center_y};
-                glUniform2fv(server->fullscreen_shader_zoom_center_loc, 1, center_for_shader);
-            }
-
-            int target_quadrant = server->shrink_effect_active && server->pending_desktop_switch != -1 ?
-                                  server->pending_desktop_switch : server->current_desktop;
-            if (server->fullscreen_shader_quadrant_loc != -1) {
-                glUniform1i(server->fullscreen_shader_quadrant_loc, target_quadrant);
-                wlr_log(WLR_DEBUG, "[%s] Set quadrant to %d (pending_switch=%d, current_desktop=%d)",
-                        wlr_output->name, target_quadrant, server->pending_desktop_switch, server->current_desktop);
-            }
-
-            glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
-
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, 0);
-            glActiveTexture(GL_TEXTURE1);
-            glBindTexture(GL_TEXTURE_2D, 0);
-            glBindVertexArray(0);
-            glUseProgram(0);
         }
-        glDisable(GL_SCISSOR_TEST);
     }
 
     if (current_screen_pass) {
@@ -3553,12 +3618,22 @@ static void output_frame(struct wl_listener *listener, void *data) {
         wlr_output_state_finish(&output_state_direct);
     }
 
+       // // TEMPORARY: Force continuous frame scheduling
+     //     wlr_output_schedule_frame(wlr_output);
+     
+
 cleanup_frame:
+    glDisable(GL_DEPTH_TEST);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_BLEND);
     wlr_scene_output_send_frame_done(scene_output, &now);
+    
+     // Schedule continuous frames if ANY effect is animating
+    if (server->effect_is_animating_zoom || server->cube_is_animating_zoom ||
+        (server->expo_effect_active && server->pending_desktop_switch != -1)) {
+        wlr_output_schedule_frame(wlr_output);
+    }
 }
-
 
 
 
@@ -4274,13 +4349,13 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
 
 void update_toplevel_visibility(struct tinywl_server *server) {
     wlr_log(WLR_DEBUG, "Updating toplevel visibility. Current desktop: %d, Expo active: %d",
-            server->current_desktop, server->shrink_effect_active);
+            server->current_desktop, server->expo_effect_active);
 
     struct tinywl_toplevel *toplevel;
     wl_list_for_each(toplevel, &server->toplevels, link) {
         if (toplevel->scene_tree) {
             // A toplevel is visible if expo is on, OR if its desktop matches the current one.
-            bool visible = server->shrink_effect_active || (toplevel->desktop == server->current_desktop);
+            bool visible = server->expo_effect_active || (toplevel->desktop == server->current_desktop);
             wlr_scene_node_set_enabled(&toplevel->scene_tree->node, visible);
             wlr_log(WLR_DEBUG, "  Toplevel on desktop %d is now %s.",
                     toplevel->desktop, visible ? "ENABLED" : "DISABLED");
@@ -5620,6 +5695,131 @@ static const char *fullscreen_fragment_shader_src =
 "    FragColor = color;\n"
 "}\n";
 
+
+// Vertex Shader
+static const char *cube_vertex_shader_src =
+       "#version 300 es\n"
+       "precision mediump float;\n"
+       "layout(location = 0) in vec3 a_position;    // 3D cube vertices\n"
+       "layout(location = 1) in vec2 a_texcoord;\n"
+       "layout(location = 2) in float a_face_id;    // Face ID (0-5)\n"
+       "\n"
+       "uniform float u_zoom;       // 1.0 to 2.0 (now used for zoom out)\n"
+       "uniform highp int u_quadrant;    // Which quadrant to expand (0-3)\n"
+       "uniform float u_time;       // Time for rotation\n"
+       "\n"
+       "out vec2 v_texcoord_to_fs;\n"
+       "out float v_face_id;\n"
+       "\n"
+       "mat4 rotationX(float angle) {\n"
+       "    float c = cos(angle);\n"
+       "    float s = sin(angle);\n"
+       "    return mat4(\n"
+       "        1.0, 0.0, 0.0, 0.0,\n"
+       "        0.0, c, -s, 0.0,\n"
+       "        0.0, s, c, 0.0,\n"
+       "        0.0, 0.0, 0.0, 1.0\n"
+       "    );\n"
+       "}\n"
+       "\n"
+       "mat4 rotationY(float angle) {\n"
+       "    float c = cos(angle);\n"
+       "    float s = sin(angle);\n"
+       "    return mat4(\n"
+       "        c, 0.0, s, 0.0,\n"
+       "        0.0, 1.0, 0.0, 0.0,\n"
+       "        -s, 0.0, c, 0.0,\n"
+       "        0.0, 0.0, 0.0, 1.0\n"
+       "    );\n"
+       "}\n"
+       "\n"
+       "mat4 perspective(float fov, float aspect, float near, float far) {\n"
+       "    float f = 1.0 / tan(fov * 0.5);\n"
+       "    return mat4(\n"
+       "        f / aspect, 0.0, 0.0, 0.0,\n"
+       "        0.0, f, 0.0, 0.0,\n"
+       "        0.0, 0.0, (far + near) / (near - far), -1.0,\n"
+       "        0.0, 0.0, (2.0 * far * near) / (near - far), 0.0\n"
+       "    );\n"
+       "}\n"
+       "\n"
+       "void main() {\n"
+       "    // Use u_zoom for zoom out effect (higher zoom = further away)\n"
+       "    float zoom_distance = 2.0 + (u_zoom - 1.0) * 3.0;  // 2.0 to 5.0\n"
+       "    \n"
+       "    // Rotation based on time and quadrant selection\n"
+       "    float rot_speed = 1.0 + float(u_quadrant) * 0.3;\n"
+       "    mat4 rotX = rotationX(u_time * rot_speed * 0.7);\n"
+       "    mat4 rotY = rotationY(u_time * rot_speed);\n"
+       "    \n"
+       "    // Transform vertex\n"
+       "    vec4 pos = vec4(a_position, 1.0);\n"
+       "    pos = rotY * rotX * pos;\n"
+       "    pos.z -= zoom_distance;  // Move away from camera\n"
+       "    \n"
+       "    // Perspective projection\n"
+       "    mat4 proj = perspective(45.0 * 3.14159 / 180.0, 1.0, 0.1, 10.0);\n"
+       "    gl_Position = proj * pos;\n"
+       "    \n"
+       "    v_texcoord_to_fs = a_texcoord;\n"
+       "    v_face_id = a_face_id;\n"
+       "}\n";
+
+// Fragment Shader
+static const char *cube_fragment_shader_src =
+"#version 300 es\n"
+"precision mediump float;\n"
+"precision mediump int;\n"
+"\n"
+"uniform sampler2D u_scene_texture0;  // Texture for top-left quadrant\n"
+"uniform sampler2D u_scene_texture1;  // Texture for top-right quadrant\n"
+"uniform sampler2D u_scene_texture2;  // Texture for bottom-left quadrant\n"
+"uniform sampler2D u_scene_texture3;  // Texture for bottom-right quadrant\n"
+"uniform float u_zoom;               // 1.0 to 2.0\n"
+"uniform highp int u_quadrant;       // Which quadrant to expand (0-3)\n"
+"\n"
+"in vec2 v_texcoord_to_fs;\n"
+"in float v_face_id;\n"
+"out vec4 FragColor;\n"
+"\n"
+"void main() {\n"
+"    vec2 uv = v_texcoord_to_fs;\n"
+"    int face = int(v_face_id);\n"
+"    \n"
+"    // Map each face to a quadrant based on face ID and selected quadrant\n"
+"    int texture_quad = (face + u_quadrant) % 4;\n"
+"    \n"
+"    // Intensity based on zoom (closer zoom = brighter)\n"
+"    float intensity = 0.7 + (2.0 - u_zoom) * 0.3;\n"
+"    \n"
+"    vec4 color;\n"
+"    \n"
+"    if (texture_quad == 0) {\n"
+"        // Use texture0 - RED TINT\n"
+"        color = texture(u_scene_texture0, uv);\n"
+"        color.rgb *= vec3(1.2, 0.8, 0.8) * intensity;  // Red tint\n"
+"    } else if (texture_quad == 1) {\n"
+"        // Use texture1 - GREEN TINT\n"
+"        color = texture(u_scene_texture1, uv);\n"
+"        color.rgb *= vec3(0.8, 1.2, 0.8) * intensity;  // Green tint\n"
+"    } else if (texture_quad == 2) {\n"
+"        // Use texture2 - BLUE TINT\n"
+"        color = texture(u_scene_texture2, uv);\n"
+"        color.rgb *= vec3(0.8, 0.8, 1.2) * intensity;  // Blue tint\n"
+"    } else {\n"
+"        // Use texture3 - YELLOW TINT\n"
+"        color = texture(u_scene_texture3, uv);\n"
+"        color.rgb *= vec3(1.1, 1.1, 0.7) * intensity;  // Yellow tint\n"
+"    }\n"
+"    \n"
+"    // Add subtle edge highlighting based on quadrant selection\n"
+"    if (texture_quad == u_quadrant) {\n"
+"        color.rgb += vec3(0.1);  // Slight brightness boost for selected quadrant\n"
+"    }\n"
+"    \n"
+"    FragColor = color;\n"
+"}\n";
+
 // Place these near your other `const char *` shader definitions in main()
 
 // Shader for Desktop 1 (Starfield)
@@ -5799,7 +5999,7 @@ static const char *desktop_3_fs_src =
     }
 
     struct tinywl_server server = {0};
-    server.shrink_effect_active = false;
+    server.expo_effect_active = false;
 
 // Initialize all lists
     wl_list_init(&server.toplevels);
@@ -6008,6 +6208,30 @@ if (!create_generic_shader_program(server.renderer, "ScaledSceneViewShader",
     return 1;
 }
 
+
+    struct shader_uniform_spec cube_scene_uniforms[] = {
+    {"mvp", &server.cube_shader_mvp_loc},
+    {"u_scene_texture0", &server.cube_shader_scene_tex0_loc},
+    {"u_scene_texture1", &server.cube_shader_scene_tex1_loc},
+    {"u_scene_texture2", &server.cube_shader_scene_tex2_loc},
+    {"u_scene_texture3", &server.cube_shader_scene_tex3_loc},
+    {"u_zoom", &server.cube_shader_zoom_loc},
+    {"u_zoom_center", &server.cube_shader_zoom_center_loc},
+    {"u_quadrant", &server.cube_shader_quadrant_loc}  // Add this if using the uniform version
+// {"u_current_quad", &server.cube_shader_current_quad_loc} 
+};
+
+if (!create_generic_shader_program(server.renderer, "CubeShader",
+                                 cube_vertex_shader_src,
+                                 cube_fragment_shader_src,
+                                 &server.cube_shader_program,
+                                 cube_scene_uniforms, // <-- USE THE CORRECT STRUCT HERE
+                                 sizeof(cube_scene_uniforms) / sizeof(cube_scene_uniforms[0]))) {
+    wlr_log(WLR_ERROR, "Failed to create cube effect shader program.");
+    server_destroy(&server); 
+    return 1;
+}
+
 const char *desktop_fs_sources[] = {
     rect_fragment_shader_src, // Desktop 0 uses the "Melt" shader
     desktop_1_fs_src,         // Desktop 1 uses "Starfield"
@@ -6057,6 +6281,22 @@ for (int i = 0; i < 4; ++i) {
     // For the current shader, u_zoom_center should be (0,0) to scale around the quadrant's local center
     server.effect_zoom_center_x = 0.0f;
     server.effect_zoom_center_y = 1.0f;
+
+    // --- Initialize Cube effect variables ---
+    server.cube_effect_active = false;
+    server.cube_zoom_factor_normal = 2.0f; // Start zoomed out
+    server.cube_zoom_factor_zoomed = 1.0f; // Zoomed in
+    
+    server.cube_is_target_zoomed = true; // The desired state is not zoomed
+    server.cube_is_animating_zoom = false;
+    server.cube_anim_current_factor = server.cube_zoom_factor_normal;
+    server.cube_anim_start_factor = server.cube_zoom_factor_normal;
+    server.cube_anim_target_factor = server.cube_zoom_factor_normal;
+    server.cube_anim_duration_sec = 0.3f; // A slightly different duration
+    
+    // These centers likely won't be used if your shader doesn't have a u_zoom_center, but good to init
+    server.cube_zoom_center_x = 0.0f; 
+    server.cube_zoom_center_y = 1.0f;
  /* wlr_log(WLR_INFO, "Fullscreen Shader Locations: mvp=%d, scene_tex=%d, zoom=%d, zoom_center=%d, quadrant=%d",
             server.fullscreen_shader_mvp_loc,
             server.fullscreen_shader_scene_tex0_loc,
@@ -6095,88 +6335,98 @@ wlr_log(WLR_INFO, "SSDColorShader created (ID: %u). MVP@%d, Color@%d",
     // Ensure EGL context is current for VAO operations.
     // create_generic_shader_program restores the context, so make it current again.
     struct wlr_egl *egl_main = wlr_gles2_renderer_get_egl(server.renderer);
-    if (wlr_egl_make_current(egl_main, NULL)) {
-        // Your existing VAO setup code...
-        // When setting attribute pointers, you need a program active that uses those attributes
-        // OR use layout(location=N) in GLSL and fixed locations in glVertexAttribPointer.
-        // Since you get locations by name, make one program active:
-        glUseProgram(server.shader_program); // or rect_shader_program, or panel_shader_program
-                                           // assuming "position" and "texcoord" are common attribute names.
+if (wlr_egl_make_current(egl_main, NULL)) {
+    GLenum gl_error;
+    while ((gl_error = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error main A (after make_current): 0x%x", gl_error); }
 
-        GLint pos_loc = glGetAttribLocation(server.shader_program, "position");
-        if (pos_loc != -1) {
-            glBindBuffer(GL_ARRAY_BUFFER, server.quad_vbo);
-            glEnableVertexAttribArray(pos_loc);
-            glVertexAttribPointer(pos_loc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)0);
-        }
-        GLint tex_loc = glGetAttribLocation(server.shader_program, "texcoord");
-        if (tex_loc != -1) {
-            glBindBuffer(GL_ARRAY_BUFFER, server.quad_vbo);
-            glEnableVertexAttribArray(tex_loc);
-            glVertexAttribPointer(tex_loc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)(2 * sizeof(GLfloat)));
-        }
-        glUseProgram(0);
-        glBindVertexArray(0);
-        wlr_egl_unset_current(egl_main);
-    } else {
-         wlr_log(WLR_ERROR, "Failed to make EGL context current for VAO setup.");
-         server_destroy(&server); return 1;
-    }
-    GLenum err_main;
-    if (wlr_egl_make_current(egl_main, NULL)) {
-        while ((err_main = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error main A (after make_current): 0x%x", err_main); }
+    // EXISTING 2D QUAD DATA (keep this for your other effects)
+    const GLfloat verts[] = {
+        // positions // texcoords (Y flipped from your original)
+        0.0f, 0.0f,  0.0f, 0.0f, // Top-left quad -> Tex (0,0)
+        1.0f, 0.0f,  1.0f, 0.0f, // Top-right quad -> Tex (1,0)
+        0.0f, 1.0f,  0.0f, 1.0f, // Bottom-left quad -> Tex (0,1)
+        1.0f, 1.0f,  1.0f, 1.0f, // Bottom-right quad -> Tex (1,1)
+    };
+    const GLuint indices[] = {0, 1, 2, 1, 3, 2}; 
 
-       const GLfloat verts[] = {
-            // positions // texcoords (Y flipped from your original)
-            0.0f, 0.0f,  0.0f, 0.0f, // Top-left quad -> Tex (0,0)
-            1.0f, 0.0f,  1.0f, 0.0f, // Top-right quad -> Tex (1,0)
-            0.0f, 1.0f,  0.0f, 1.0f, // Bottom-left quad -> Tex (0,1)
-            1.0f, 1.0f,  1.0f, 1.0f, // Bottom-right quad -> Tex (1,1)
-        };
-        const GLuint indices[] = {0, 1, 2, 1, 3, 2}; 
-
-        glGenVertexArrays(1, &server.quad_vao);
-        while ((err_main = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error main B (after GenVertexArrays): 0x%x", err_main); }
-        glBindVertexArray(server.quad_vao);
-        wlr_log(WLR_DEBUG, "MAIN_VAO_SETUP: VAO ID: %d bound", server.quad_vao);
-        while ((err_main = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error main C (after BindVertexArray): 0x%x", err_main); }
-
-        glGenBuffers(1, &server.quad_vbo);
-        while ((err_main = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error main D (after GenBuffers VBO): 0x%x", err_main); }
-        glBindBuffer(GL_ARRAY_BUFFER, server.quad_vbo); 
-        wlr_log(WLR_DEBUG, "MAIN_VAO_SETUP: VBO ID: %d bound to GL_ARRAY_BUFFER", server.quad_vbo);
-        while ((err_main = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error main E (after BindBuffer VBO): 0x%x", err_main); }
-        glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
-        while ((err_main = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error main F (after BufferData VBO): 0x%x", err_main); }
-
-        glGenBuffers(1, &server.quad_ibo);
-        while ((err_main = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error main G (after GenBuffers IBO): 0x%x", err_main); }
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, server.quad_ibo); 
-        wlr_log(WLR_DEBUG, "MAIN_VAO_SETUP: IBO ID: %d bound to GL_ELEMENT_ARRAY_BUFFER (associated with VAO %d)", server.quad_ibo, server.quad_vao);
-        while ((err_main = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error main H (after BindBuffer IBO): 0x%x", err_main); }
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
-        while ((err_main = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error main I (after BufferData IBO): 0x%x", err_main); }
-
-        GLint pos_attrib = glGetAttribLocation(server.shader_program, "position");
-        wlr_log(WLR_DEBUG, "MAIN_VAO_SETUP: 'position' attrib location: %d", pos_attrib);
-        if (pos_attrib != -1) {
-            glEnableVertexAttribArray(pos_attrib);
-            glVertexAttribPointer(pos_attrib, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)0);
-        } else { wlr_log(WLR_ERROR, "Position attribute NOT FOUND"); }
-        while ((err_main = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error main J (after position attrib setup): 0x%x", err_main); }
-
-        GLint texcoord_attrib = glGetAttribLocation(server.shader_program, "texcoord");
-        wlr_log(WLR_DEBUG, "MAIN_VAO_SETUP: 'texcoord' attrib location: %d", texcoord_attrib);
-        if (texcoord_attrib != -1) { 
-            glEnableVertexAttribArray(texcoord_attrib);
-            glVertexAttribPointer(texcoord_attrib, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)(2 * sizeof(GLfloat)));
-        } else { wlr_log(WLR_INFO, "Texcoord attribute NOT FOUND (OK for solid color shader but VS still declares it)."); }
-        while ((err_main = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error main K (after texcoord attrib setup): 0x%x", err_main); }
-
+    // NEW CUBE DATA (for the rotating cube effect)
+    const GLfloat cube_verts[] = {
+        // Position (x,y,z)    TexCoord (u,v)    Face ID
+        // Front face (z = 0.5)
+        -0.5f, -0.5f,  0.5f,   0.0f, 0.0f,   0.0f,  // Bottom-left
+         0.5f, -0.5f,  0.5f,   1.0f, 0.0f,   0.0f,  // Bottom-right
+         0.5f,  0.5f,  0.5f,   1.0f, 1.0f,   0.0f,  // Top-right
+        -0.5f,  0.5f,  0.5f,   0.0f, 1.0f,   0.0f,  // Top-left
         
-    glBindVertexArray(server.quad_vao); // Bind the VAO you want to configure
+        // Back face (z = -0.5)
+        -0.5f, -0.5f, -0.5f,   1.0f, 0.0f,   1.0f,  // Bottom-left
+         0.5f, -0.5f, -0.5f,   0.0f, 0.0f,   1.0f,  // Bottom-right
+         0.5f,  0.5f, -0.5f,   0.0f, 1.0f,   1.0f,  // Top-right
+        -0.5f,  0.5f, -0.5f,   1.0f, 1.0f,   1.0f,  // Top-left
+        
+        // Left face (x = -0.5)
+        -0.5f, -0.5f, -0.5f,   0.0f, 0.0f,   2.0f,  // Bottom-left
+        -0.5f, -0.5f,  0.5f,   1.0f, 0.0f,   2.0f,  // Bottom-right
+        -0.5f,  0.5f,  0.5f,   1.0f, 1.0f,   2.0f,  // Top-right
+        -0.5f,  0.5f, -0.5f,   0.0f, 1.0f,   2.0f,  // Top-left
+        
+        // Right face (x = 0.5)
+         0.5f, -0.5f, -0.5f,   1.0f, 0.0f,   3.0f,  // Bottom-left
+         0.5f, -0.5f,  0.5f,   0.0f, 0.0f,   3.0f,  // Bottom-right
+         0.5f,  0.5f,  0.5f,   0.0f, 1.0f,   3.0f,  // Top-right
+         0.5f,  0.5f, -0.5f,   1.0f, 1.0f,   3.0f,  // Top-left
+        
+        // Bottom face (y = -0.5)
+        -0.5f, -0.5f, -0.5f,   0.0f, 1.0f,   4.0f,  // Bottom-left
+         0.5f, -0.5f, -0.5f,   1.0f, 1.0f,   4.0f,  // Bottom-right
+         0.5f, -0.5f,  0.5f,   1.0f, 0.0f,   4.0f,  // Top-right
+        -0.5f, -0.5f,  0.5f,   0.0f, 0.0f,   4.0f,  // Top-left
+        
+        // Top face (y = 0.5)
+        -0.5f,  0.5f, -0.5f,   0.0f, 0.0f,   5.0f,  // Bottom-left
+         0.5f,  0.5f, -0.5f,   1.0f, 0.0f,   5.0f,  // Bottom-right
+         0.5f,  0.5f,  0.5f,   1.0f, 1.0f,   5.0f,  // Top-right
+        -0.5f,  0.5f,  0.5f,   0.0f, 1.0f,   5.0f   // Top-left
+    };
 
+    const GLuint cube_indices[] = {
+        0,  1,  2,   2,  3,  0,   // Front
+        4,  5,  6,   6,  7,  4,   // Back
+        8,  9, 10,  10, 11,  8,   // Left
+       12, 13, 14,  14, 15, 12,   // Right
+       16, 17, 18,  18, 19, 16,   // Bottom
+       20, 21, 22,  22, 23, 20    // Top
+    };
+
+    // ===========================================
+    // SETUP EXISTING 2D QUAD (for other effects)
+    // ===========================================
+    glGenVertexArrays(1, &server.quad_vao);
+    while ((gl_error = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error main B (after GenVertexArrays): 0x%x", gl_error); }
+    glBindVertexArray(server.quad_vao);
+    wlr_log(WLR_DEBUG, "MAIN_VAO_SETUP: VAO ID: %d bound", server.quad_vao);
+    while ((gl_error = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error main C (after BindVertexArray): 0x%x", gl_error); }
+
+    glGenBuffers(1, &server.quad_vbo);
+    while ((gl_error = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error main D (after GenBuffers VBO): 0x%x", gl_error); }
+    glBindBuffer(GL_ARRAY_BUFFER, server.quad_vbo); 
+    wlr_log(WLR_DEBUG, "MAIN_VAO_SETUP: VBO ID: %d bound to GL_ARRAY_BUFFER", server.quad_vbo);
+    while ((gl_error = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error main E (after BindBuffer VBO): 0x%x", gl_error); }
+    glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
+    while ((gl_error = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error main F (after BufferData VBO): 0x%x", gl_error); }
+
+    glGenBuffers(1, &server.quad_ibo);
+    while ((gl_error = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error main G (after GenBuffers IBO): 0x%x", gl_error); }
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, server.quad_ibo); 
+    wlr_log(WLR_DEBUG, "MAIN_VAO_SETUP: IBO ID: %d bound to GL_ELEMENT_ARRAY_BUFFER (associated with VAO %d)", server.quad_ibo, server.quad_vao);
+    while ((gl_error = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error main H (after BindBuffer IBO): 0x%x", gl_error); }
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
+    while ((gl_error = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error main I (after BufferData IBO): 0x%x", gl_error); }
+
+    // Set up 2D quad vertex attributes (existing code)
+    glBindVertexArray(server.quad_vao);
     glBindBuffer(GL_ARRAY_BUFFER, server.quad_vbo);
+    
     // Position attribute at fixed location 0
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)0);
@@ -6187,13 +6437,53 @@ wlr_log(WLR_INFO, "SSDColorShader created (ID: %u). MVP@%d, Color@%d",
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)(2 * sizeof(GLfloat)));
     wlr_log(WLR_DEBUG, "VAO Setup: Enabled attrib 1 for texcoord");
 
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, server.quad_ibo); // Bind IBO to VAO
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, server.quad_ibo);
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-    glBindVertexArray(0); // Unbind VAO
-    glBindBuffer(GL_ARRAY_BUFFER, 0); // Unbind VBO
-    // glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0); // Don't unbind IBO while VAO is bound usually, but okay after VAO is unbound.
+    // ===========================================
+    // SETUP NEW CUBE GEOMETRY
+    // ===========================================
+    glGenVertexArrays(1, &server.cube_vao);
+    while ((gl_error = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error cube A (after GenVertexArrays): 0x%x", gl_error); }
+    glBindVertexArray(server.cube_vao);
+    wlr_log(WLR_DEBUG, "CUBE_VAO_SETUP: VAO ID: %d bound", server.cube_vao);
+
+    glGenBuffers(1, &server.cube_vbo);
+    while ((gl_error = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error cube B (after GenBuffers VBO): 0x%x", gl_error); }
+    glBindBuffer(GL_ARRAY_BUFFER, server.cube_vbo); 
+    wlr_log(WLR_DEBUG, "CUBE_VAO_SETUP: VBO ID: %d bound", server.cube_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(cube_verts), cube_verts, GL_STATIC_DRAW);
+    while ((gl_error = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error cube C (after BufferData VBO): 0x%x", gl_error); }
+
+    glGenBuffers(1, &server.cube_ibo);
+    while ((gl_error = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error cube D (after GenBuffers IBO): 0x%x", gl_error); }
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, server.cube_ibo); 
+    wlr_log(WLR_DEBUG, "CUBE_VAO_SETUP: IBO ID: %d bound", server.cube_ibo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(cube_indices), cube_indices, GL_STATIC_DRAW);
+    while ((gl_error = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error cube E (after BufferData IBO): 0x%x", gl_error); }
+
+    // Set up cube vertex attributes
+    // Position attribute at location 0 (vec3)
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(GLfloat), (void*)0);
+    wlr_log(WLR_DEBUG, "CUBE Setup: Enabled attrib 0 for position (vec3)");
+
+    // Texcoord attribute at location 1
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(GLfloat), (void*)(3 * sizeof(GLfloat)));
+    wlr_log(WLR_DEBUG, "CUBE Setup: Enabled attrib 1 for texcoord");
+
+    // Face ID attribute at location 2
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 6 * sizeof(GLfloat), (void*)(5 * sizeof(GLfloat)));
+    wlr_log(WLR_DEBUG, "CUBE Setup: Enabled attrib 2 for face_id");
+
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    
     wlr_egl_unset_current(egl_main);
-} else {
+}else {
         wlr_log(WLR_ERROR, "Failed to make EGL context current for quad VBO setup in main");
         server_destroy(&server);
         // return 1; // Or handle error appropriately
