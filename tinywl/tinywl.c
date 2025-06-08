@@ -3390,14 +3390,7 @@ GLuint get_desktop_fbo(struct tinywl_server *server, int desktop_idx) {
     return server->desktops[desktop_idx].fbo;
 }
 
-// New function to handle deferred desktop switch
-void handle_expo_end_desktop_switch(struct tinywl_server *server) {
-    if (server->pending_desktop_switch != -1) {
-        server->current_desktop = server->pending_desktop_switch;
-        wlr_log(WLR_INFO, "[OUTPUT_FRAME] Applied deferred desktop switch to desktop %d", server->current_desktop);
-        server->pending_desktop_switch = -1; // Clear pending switch
-    }
-}
+
 
 static void output_frame(struct wl_listener *listener, void *data) {
     struct tinywl_output *output_wrapper = wl_container_of(listener, output_wrapper, frame);
@@ -3446,13 +3439,49 @@ static void output_frame(struct wl_listener *listener, void *data) {
             float elapsed_sec = now_sec - server->effect_anim_start_time_sec;
             float t = (server->effect_anim_duration_sec > 1e-5f) ? (elapsed_sec / server->effect_anim_duration_sec) : 1.0f;
 
-            if (t >= 1.0f) {
+              if (t >= 1.0f) {
                 server->effect_anim_current_factor = server->effect_anim_target_factor;
                 server->effect_is_animating_zoom = false;
+
+                // This code block runs ONLY when the zoom-out animation finishes.
                 if (!server->effect_is_target_zoomed) {
                     server->expo_effect_active = false;
                     wlr_log(WLR_INFO, "[%s] Expo Effect OFF.", wlr_output->name);
-                    handle_expo_end_desktop_switch(server);
+
+                    // --- THIS IS THE "REFRESH" LOGIC ---
+                    // It does exactly what a direct 'o' press would do.
+
+                    // 1. Apply the deferred desktop switch if there is one.
+                    if (server->pending_desktop_switch != -1) {
+                        server->current_desktop = server->pending_desktop_switch;
+                        server->pending_desktop_switch = -1;
+                    }
+
+                    // 2. Update visibility now that the effect is off.
+                    update_toplevel_visibility(server);
+
+                    // 3. Find the topmost window on the new desktop to make it active.
+                    //    This fixes the "many clicks" problem.
+                    struct tinywl_toplevel *toplevel_to_focus = NULL;
+                    struct tinywl_toplevel *toplevel_iter;
+                    wl_list_for_each(toplevel_iter, &server->toplevels, link) {
+                        if (toplevel_iter->desktop == server->current_desktop && toplevel_iter->mapped) {
+                            toplevel_to_focus = toplevel_iter;
+                            break;
+                        }
+                    }
+
+                    if (toplevel_to_focus) {
+                        focus_toplevel(toplevel_to_focus);
+                    } else {
+                        if (server->seat->keyboard_state.focused_surface) {
+                            wlr_seat_keyboard_clear_focus(server->seat);
+                        }
+                    }
+
+                    // 4. Update the mouse pointer's focus to restore hover effects.
+                    uint32_t time_msec = now.tv_sec * 1000 + now.tv_nsec / 1000000;
+                    process_cursor_motion(server, time_msec);
                 }
             } else {
                 server->effect_anim_current_factor = server->effect_anim_start_factor + (server->effect_anim_target_factor - server->effect_anim_start_factor) * t;
@@ -3478,6 +3507,38 @@ static void output_frame(struct wl_listener *listener, void *data) {
                 if (!server->cube_is_target_zoomed) {
                     server->cube_effect_active = false;
                     wlr_log(WLR_INFO, "[%s] Cube Effect OFF.", wlr_output->name);
+                    
+                    // 1. Apply the deferred desktop switch if there is one.
+                    if (server->pending_desktop_switch != -1) {
+                        server->current_desktop = server->pending_desktop_switch;
+                        server->pending_desktop_switch = -1;
+                    }
+
+                    // 2. Update visibility now that the effect is off.
+                    update_toplevel_visibility(server);
+
+                    // 3. Find the topmost window on the new desktop to make it active.
+                    //    This fixes the "many clicks" problem.
+                    struct tinywl_toplevel *toplevel_to_focus = NULL;
+                    struct tinywl_toplevel *toplevel_iter;
+                    wl_list_for_each(toplevel_iter, &server->toplevels, link) {
+                        if (toplevel_iter->desktop == server->current_desktop && toplevel_iter->mapped) {
+                            toplevel_to_focus = toplevel_iter;
+                            break;
+                        }
+                    }
+
+                    if (toplevel_to_focus) {
+                        focus_toplevel(toplevel_to_focus);
+                    } else {
+                        if (server->seat->keyboard_state.focused_surface) {
+                            wlr_seat_keyboard_clear_focus(server->seat);
+                        }
+                    }
+
+                    // 4. Update the mouse pointer's focus to restore hover effects.
+                    uint32_t time_msec = now.tv_sec * 1000 + now.tv_nsec / 1000000;
+                    process_cursor_motion(server, time_msec);
                 }
             } else {
                 server->cube_anim_current_factor = server->cube_anim_start_factor + (server->cube_anim_target_factor - server->cube_anim_start_factor) * t;
@@ -4565,7 +4626,7 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
     wlr_log(WLR_INFO, "Toplevel %p (title: %s) wrapper created. SSDs NOT enabled. Waiting for xdg-decoration.",
             (void*)toplevel, xdg_toplevel->title ? xdg_toplevel->title : "N/A");
 }
-
+/*
 void update_toplevel_visibility(struct tinywl_server *server) {
     wlr_log(WLR_DEBUG, "Updating toplevel visibility. Current desktop: %d, Expo active: %d",
             server->current_desktop, server->expo_effect_active);
@@ -4582,6 +4643,39 @@ void update_toplevel_visibility(struct tinywl_server *server) {
     }
 
     // Schedule a frame on all outputs to reflect the change
+    struct tinywl_output *output;
+    wl_list_for_each(output, &server->outputs, link) {
+        if (output->wlr_output && output->wlr_output->enabled) {
+            wlr_output_schedule_frame(output->wlr_output);
+        }
+    }
+}*/
+void update_toplevel_visibility(struct tinywl_server *server) {
+    wlr_log(WLR_DEBUG, "Updating toplevel visibility. Current desktop: %d, Cube: %d, Expo: %d",
+            server->current_desktop, server->cube_effect_active, server->expo_effect_active);
+
+    struct tinywl_toplevel *toplevel;
+    wl_list_for_each(toplevel, &server->toplevels, link) {
+        if (toplevel->scene_tree) {
+            bool should_be_enabled;
+
+            // --- THIS IS THE CRITICAL LOGIC ---
+            if (server->expo_effect_active || server->cube_effect_active) {
+                // If any multi-desktop effect is active, a window is visible
+                // as long as it's not minimized. Its desktop property determines
+                // *where* it's rendered, not *if* it's enabled.
+                should_be_enabled = (toplevel->scale > 0.01f);
+            } else {
+                // If no effect is active, only show windows on the current desktop.
+                should_be_enabled = (toplevel->desktop == server->current_desktop);
+            }
+
+            // Apply the calculated state.
+            wlr_scene_node_set_enabled(&toplevel->scene_tree->node, should_be_enabled);
+        }
+    }
+
+    // Schedule a frame on all outputs to reflect the change.
     struct tinywl_output *output;
     wl_list_for_each(output, &server->outputs, link) {
         if (output->wlr_output && output->wlr_output->enabled) {
