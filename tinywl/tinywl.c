@@ -507,6 +507,28 @@ GLuint intermediate_rbo[4];
 
     GLuint cube_background_shader_program;
     GLint cube_background_shader_time_loc;
+
+     // <<< ADD THESE NEW MEMBERS FOR POST-PROCESSING >>>
+    GLuint post_process_fbo;
+    GLuint post_process_texture;
+    int post_process_width;
+    int post_process_height;
+
+    GLuint post_process_rbo; 
+
+    // Shader program for the final effect
+    GLuint post_process_shader_program;
+    GLint post_process_shader_tex_loc;
+    GLint post_process_shader_time_loc; // Optional: for animated effects
+    GLint post_process_shader_resolution_loc;
+
+    // <<< ADD THESE MEMBERS >>>
+     // --- TV EFFECT MEMBERS ---
+    bool tv_effect_animating;
+    float tv_effect_start_time;
+    float tv_effect_duration; 
+    bool tv_is_on; 
+
 };
 
 static float current_rotation = 0.0f;
@@ -550,8 +572,8 @@ struct tinywl_decoration { // Your struct for SSD scene rects
 
 };
 
-#define TITLE_BAR_HEIGHT 30
-#define BORDER_WIDTH 4
+#define TITLE_BAR_HEIGHT 50
+#define BORDER_WIDTH 10
 
 struct tinywl_toplevel {
     struct wl_list link;
@@ -599,6 +621,7 @@ struct wlr_xdg_toplevel_decoration_v1 *decoration;
 
      struct wl_listener decoration_destroy_listener;
      struct wl_listener decoration_request_mode_listener;
+   
 
      // Decoration fields
      bool ssd_pending_enable;
@@ -1364,6 +1387,37 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
         }
     }
 
+
+    // <<< ADD THIS NEW BINDING FOR 'K' >>>
+      if (!handled_by_compositor && !(modifiers & (WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT | WLR_MODIFIER_SHIFT | WLR_MODIFIER_LOGO))) {
+        for (int i = 0; i < nsyms; i++) {
+            if (syms[i] == XKB_KEY_k || syms[i] == XKB_KEY_K) {
+                
+                // --- THE FIX ---
+                // Only trigger if the key is PRESSED and an animation is NOT already running.
+                if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED && !server->tv_effect_animating) {
+                    wlr_log(WLR_INFO, "TV Animation Triggered by K press.");
+                    
+                    // Start the animation
+                    server->tv_effect_animating = true;
+                    server->tv_effect_start_time = get_monotonic_time_seconds_as_float();
+                    
+                    // Schedule a frame on all outputs to make the animation start
+                    struct tinywl_output *output;
+                    wl_list_for_each(output, &server->outputs, link) {
+                        if (output->wlr_output && output->wlr_output->enabled) {
+                            wlr_output_schedule_frame(output->wlr_output);
+                        }
+                    }
+                }
+                // --- END OF FIX ---
+                
+                // We handle the key regardless of state to prevent it from going to a client.
+                handled_by_compositor = true;
+                break;
+            }
+        }
+    }
     // --- BINDING: Compositor shortcuts (Alt + [Key]) ---
     // Make sure Shift isn't pressed to avoid conflict with "move window" binding
     if (!handled_by_compositor && (modifiers & WLR_MODIFIER_ALT) && !(modifiers & WLR_MODIFIER_SHIFT)) {
@@ -2167,209 +2221,7 @@ void debug_scene_tree(struct wlr_scene *scene, struct wlr_output *output) {
     
     wlr_log(WLR_INFO, "[DEBUG] Total nodes: %d", node_count);
 }
-// scene_buffer_iterator for MAIN WINDOWS ONLY (using windowback Shader)
-static void scene_buffer_iterator_main_window_only(
-        struct wlr_scene_buffer *scene_buffer,
-        int sx, int sy,
-        void *user_data) {
 
-    struct render_data *rdata = user_data;
-    struct wlr_renderer *renderer = rdata->renderer;
-    struct wlr_output *output = rdata->output;
-    struct tinywl_server *server = rdata->server;
-    struct wlr_gles2_texture_attribs tex_attribs;
-    const char *output_name_log = output ? output->name : "UNKNOWN_OUTPUT_MAIN_ITER";
-
-    // --- Basic Validation ---
-    if (!rdata || !server || !renderer || !output) {
-        wlr_log(WLR_ERROR, "[SITER_MAIN_ONLY:%s] Invalid render_data, server, renderer, or output.", output_name_log);
-        return;
-    }
-    if (!scene_buffer) {
-        wlr_log(WLR_ERROR, "[SITER_MAIN_ONLY:%s] scene_buffer is NULL.", output_name_log);
-        return;
-    }
-    if (!scene_buffer->node.enabled) {
-        // This buffer node is part of the scene but currently disabled, skip rendering.
-        // This is normal, e.g., for an unmapped window.
-        return;
-    }
-    if (output->width == 0 || output->height == 0) {
-        wlr_log(WLR_ERROR, "[SITER_MAIN_ONLY:%s] Output has zero width/height.", output_name_log);
-        return;
-    }
-    if (!scene_buffer->buffer) {
-        wlr_log(WLR_DEBUG, "[SITER_MAIN_ONLY:%s] scene_buffer %p has NULL wlr_buffer, skipping.", output_name_log, (void*)scene_buffer);
-        return;
-    }
-
-    // --- Find Associated Toplevel for Animation ---
-    struct tinywl_toplevel *toplevel_for_anim = NULL;
-    struct wlr_scene_node *current_node_for_owner_search = &scene_buffer->node;
-    int depth = 0;
-    while(current_node_for_owner_search && depth < 10) { // Depth limit for safety
-        if (current_node_for_owner_search->data != NULL) {
-            struct tinywl_toplevel *potential_tl = current_node_for_owner_search->data;
-            struct tinywl_toplevel *check_tl_in_list;
-            bool is_known_and_correct_toplevel = false;
-            wl_list_for_each(check_tl_in_list, &server->toplevels, link) {
-                if (check_tl_in_list == potential_tl) {
-                    // Check if this is the toplevel's main scene tree node
-                    if (potential_tl->scene_tree == (struct wlr_scene_tree*)current_node_for_owner_search) {
-                        is_known_and_correct_toplevel = true;
-                        break;
-                    }
-                }
-            }
-            if (is_known_and_correct_toplevel) {
-                toplevel_for_anim = potential_tl;
-                break;
-            }
-        }
-        if (!current_node_for_owner_search->parent) break;
-        current_node_for_owner_search = &current_node_for_owner_search->parent->node;
-        depth++;
-    }
-
-    const char* tl_title_for_log = "UNKNOWN/NON-TOPLEVEL";
-    if (toplevel_for_anim && toplevel_for_anim->xdg_toplevel && toplevel_for_anim->xdg_toplevel->title) {
-        tl_title_for_log = toplevel_for_anim->xdg_toplevel->title;
-    } else if (toplevel_for_anim) {
-        tl_title_for_log = "TOPLEVEL_NO_TITLE";
-    }
-    wlr_log(WLR_DEBUG, "[SITER_MAIN_ONLY:%s] Processing buffer for '%s' (toplevel_for_anim: %p)",
-            output_name_log, tl_title_for_log, (void*)toplevel_for_anim);
-
-
-    // --- Animation Scaling ---
-    float anim_scale_factor = 1.0f;
-    if (toplevel_for_anim) {
-        if (toplevel_for_anim->is_animating) {
-            struct timespec now_anim;
-            clock_gettime(CLOCK_MONOTONIC, &now_anim);
-            float current_time_anim = now_anim.tv_sec + now_anim.tv_nsec / 1e9f;
-            float elapsed = current_time_anim - toplevel_for_anim->animation_start;
-            if (elapsed < 0.0f) elapsed = 0.0f;
-            float t = 0.0f;
-            if (toplevel_for_anim->animation_duration > 1e-5f) {
-                t = elapsed / toplevel_for_anim->animation_duration;
-            } else if (elapsed > 0) { t = 1.0f; }
-
-            if (t >= 1.0f) {
-                t = 1.0f;
-                anim_scale_factor = toplevel_for_anim->target_scale;
-                if (toplevel_for_anim->target_scale == 0.0f && !toplevel_for_anim->pending_destroy) {
-                    toplevel_for_anim->scale = 0.0f;
-                    wlr_output_schedule_frame(output);
-                } else {
-                    toplevel_for_anim->is_animating = false;
-                    toplevel_for_anim->scale = toplevel_for_anim->target_scale;
-                }
-            } else {
-                anim_scale_factor = toplevel_for_anim->scale + (toplevel_for_anim->target_scale - toplevel_for_anim->scale) * t;
-            }
-            if (toplevel_for_anim->is_animating) {
-                wlr_output_schedule_frame(output);
-            }
-        } else {
-            anim_scale_factor = toplevel_for_anim->scale;
-            if (toplevel_for_anim->target_scale == 0.0f && toplevel_for_anim->scale <= 0.001f && !toplevel_for_anim->pending_destroy) {
-                wlr_output_schedule_frame(output);
-            }
-        }
-        // wlr_log(WLR_DEBUG, "[SITER_MAIN_ONLY:%s] TL '%s' anim_scale_factor: %.3f", output_name_log, tl_title_for_log, anim_scale_factor);
-    }
-    if (anim_scale_factor < 0.001f && !(toplevel_for_anim && toplevel_for_anim->target_scale == 0.0f && !toplevel_for_anim->pending_destroy)) {
-        anim_scale_factor = 0.001f; // Prevent fully zero scale unless intended for minimize
-    }
-
-
-    // --- Main Window Rendering ---
-    struct wlr_texture *texture = wlr_texture_from_buffer(renderer, scene_buffer->buffer);
-    if (!texture) {
-        wlr_log(WLR_ERROR, "[SITER_MAIN_ONLY:%s] Failed to create wlr_texture from buffer %p for '%s'.",
-                output_name_log, (void*)scene_buffer->buffer, tl_title_for_log);
-        return;
-    }
-    wlr_gles2_texture_get_attribs(texture, &tex_attribs);
-
-    struct wlr_box main_render_box = {
-        .x = (int)round((double)sx + (double)texture->width * (1.0 - (double)anim_scale_factor) / 2.0),
-        .y = (int)round((double)sy + (double)texture->height * (1.0 - (double)anim_scale_factor) / 2.0),
-        .width = (int)round((double)texture->width * (double)anim_scale_factor),
-        .height = (int)round((double)texture->height * (double)anim_scale_factor),
-    };
-
-    if (main_render_box.width <= 0 || main_render_box.height <= 0) {
-        if (toplevel_for_anim && !toplevel_for_anim->pending_destroy && toplevel_for_anim->target_scale == 0.0f) {
-            // This is fine for a minimized window.
-        } else {
-            wlr_log(WLR_DEBUG, "[SITER_MAIN_ONLY:%s] Scaled dimensions for '%s' are zero/negative (%dx%d) with scale %.2f. Skipping draw.",
-                   output_name_log, tl_title_for_log, main_render_box.width, main_render_box.height, anim_scale_factor);
-        }
-        wlr_texture_destroy(texture);
-        return;
-    }
-
-    // Calculate MVP matrix exactly like first version
-    float main_mvp[9];
-    wlr_matrix_identity(main_mvp);
-    float box_scale_x = (float)main_render_box.width * (2.0f / output->width);
-    float box_scale_y = (float)main_render_box.height * (-2.0f / output->height);
-    float box_translate_x = ((float)main_render_box.x / output->width) * 2.0f - 1.0f;
-    float box_translate_y = ((float)main_render_box.y / output->height) * -2.0f + 1.0f;
-
-    // Handle output transforms like first version
-    if (output->transform == WL_OUTPUT_TRANSFORM_FLIPPED_180) {
-        main_mvp[0] = -box_scale_x; main_mvp[4] = -box_scale_y; main_mvp[6] = -box_translate_x; main_mvp[7] = -box_translate_y;
-        main_mvp[1] = main_mvp[2] = main_mvp[3] = main_mvp[5] = 0.0f; main_mvp[8] = 1.0f;
-    } else if (output->transform == WL_OUTPUT_TRANSFORM_NORMAL) {
-        main_mvp[0] = box_scale_x; main_mvp[4] = box_scale_y; main_mvp[6] = box_translate_x; main_mvp[7] = box_translate_y;
-        main_mvp[1] = main_mvp[2] = main_mvp[3] = main_mvp[5] = 0.0f; main_mvp[8] = 1.0f;
-    } else {
-        float temp_mvp[9] = {box_scale_x, 0.0f, 0.0f, 0.0f, box_scale_y, 0.0f, box_translate_x, box_translate_y, 1.0f};
-        float transform_matrix[9];
-        wlr_matrix_transform(transform_matrix, output->transform);
-        wlr_matrix_multiply(main_mvp, transform_matrix, temp_mvp);
-    }
-
-    // Handle buffer transforms like first version
-    if (scene_buffer->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
-        float temp_mvp_buffer[9];
-        memcpy(temp_mvp_buffer, main_mvp, sizeof(main_mvp));
-        float buffer_matrix[9];
-        wlr_matrix_transform(buffer_matrix, scene_buffer->transform);
-        wlr_matrix_multiply(main_mvp, temp_mvp_buffer, buffer_matrix);
-    }
-
-   if (server->back_shader_mvp_loc != -1) { // Use windowback's MVP location
-        glUniformMatrix3fv(server->back_shader_mvp_loc, 1, GL_FALSE, main_mvp);
-    }
-    if (server->back_shader_tex_loc != -1) { // Use windowback's texture sampler location
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(tex_attribs.target, tex_attribs.tex);
-        glTexParameteri(tex_attribs.target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(tex_attribs.target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(tex_attribs.target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(tex_attribs.target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glUniform1i(server->back_shader_tex_loc, 0);
-    }
-    if (server->back_shader_time_loc != -1) { // Use windowback's time location
-        glUniform1f(server->back_shader_time_loc, get_monotonic_time_seconds_as_float());
-    }
-    if (server->back_shader_res_loc != -1) { // Use windowback's iResolution location
-        float res_array[2] = {(float)main_render_box.width, (float)main_render_box.height};
-        glUniform2fv(server->back_shader_res_loc, 1, res_array);
-    }
-    // Draw the main window content
-    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
-    wlr_log(WLR_DEBUG, "[SITER_MAIN_ONLY:%s] Drew main window for '%s'", output_name_log, tl_title_for_log);
-
-    // Cleanup for this iteration
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(tex_attribs.target, 0);
-    wlr_texture_destroy(texture);
-}
 // scene_buffer_iterator with preview rendering logic and detailed logging
 static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
                                  int sx, int sy,
@@ -3088,9 +2940,7 @@ static void render_desktop_content(struct tinywl_server *server,
                                    struct wlr_output *wlr_output,
                                    struct render_data *current_rdata,
                                    int desktop_to_render) {
-    // Clear the target (FBO or screen)
-    glClearColor(0.0f, 0.0f, 0.0, 0.0f); // Clear with transparent black for FBOs
-    glClear(GL_COLOR_BUFFER_BIT);
+  
 
     if (server->quad_vao == 0) return;
     glBindVertexArray(server->quad_vao);
@@ -3390,7 +3240,92 @@ GLuint get_desktop_fbo(struct tinywl_server *server, int desktop_idx) {
     return server->desktops[desktop_idx].fbo;
 }
 
+// =============================================================================
+// <<< ADD THIS ENTIRE FUNCTION TO YOUR .c FILE >>>
+// =============================================================================
+static bool setup_post_process_framebuffer(struct tinywl_server *server, int width, int height) {
+    // This function is almost identical to setup_intermediate_framebuffer, but for the
+    // single final FBO used for post-processing.
+    GLenum err;
 
+    struct wlr_egl *egl = wlr_gles2_renderer_get_egl(server->renderer);
+    if (!egl) {
+        wlr_log(WLR_ERROR, "setup_post_process_framebuffer: Failed to get EGL from renderer.");
+        return false;
+    }
+    struct wlr_egl_context saved_ctx;
+    if (!wlr_egl_make_current(egl, &saved_ctx)) {
+        wlr_log(WLR_ERROR, "setup_post_process_framebuffer: Failed to make EGL context current.");
+        return false;
+    }
+
+    // Check if the FBO already exists and if its size has changed.
+    if (server->post_process_fbo != 0) {
+        if (server->post_process_width != width || server->post_process_height != height) {
+            wlr_log(WLR_INFO, "Post-process FBO: Resizing from %dx%d to %dx%d",
+                    server->post_process_width, server->post_process_height, width, height);
+            // Delete old resources if size is different
+            glDeleteFramebuffers(1, &server->post_process_fbo);
+            glDeleteTextures(1, &server->post_process_texture);
+            glDeleteRenderbuffers(1, &server->post_process_rbo); // Use post_process_rbo
+            server->post_process_fbo = 0;
+            server->post_process_texture = 0;
+            server->post_process_rbo = 0;
+        } else {
+            // FBO exists and is the correct size, no need to re-create.
+            wlr_egl_restore_context(&saved_ctx);
+            return true;
+        }
+    }
+
+    // --- Create Texture for Color Attachment ---
+    glGenTextures(1, &server->post_process_texture);
+    glBindTexture(GL_TEXTURE_2D, server->post_process_texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    // --- Create Renderbuffer for Depth Attachment ---
+    glGenRenderbuffers(1, &server->post_process_rbo);
+    glBindRenderbuffer(GL_RENDERBUFFER, server->post_process_rbo);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, width, height);
+    glBindRenderbuffer(GL_RENDERBUFFER, 0);
+
+    // --- Create and Configure Framebuffer ---
+    glGenFramebuffers(1, &server->post_process_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, server->post_process_fbo);
+
+    // Attach the texture and renderbuffer
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, server->post_process_texture, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, server->post_process_rbo);
+
+    // --- CRITICAL: Check if the framebuffer is complete ---
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        wlr_log(WLR_ERROR, "Post-process framebuffer is not complete! Status: 0x%x", status);
+        // Clean up partially created resources
+        glDeleteFramebuffers(1, &server->post_process_fbo); server->post_process_fbo = 0;
+        glDeleteTextures(1, &server->post_process_texture); server->post_process_texture = 0;
+        glDeleteRenderbuffers(1, &server->post_process_rbo); server->post_process_rbo = 0;
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        wlr_egl_restore_context(&saved_ctx);
+        return false;
+    }
+
+    wlr_log(WLR_INFO, "Post-process framebuffer created/verified: %dx%d, FBO ID: %u",
+            width, height, server->post_process_fbo);
+            
+    // Unbind the FBO
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    // Store dimensions for next frame check
+    server->post_process_width = width;
+    server->post_process_height = height;
+
+    wlr_egl_restore_context(&saved_ctx);
+    return true;
+}
 
 static void output_frame(struct wl_listener *listener, void *data) {
     struct tinywl_output *output_wrapper = wl_container_of(listener, output_wrapper, frame);
@@ -3401,10 +3336,11 @@ static void output_frame(struct wl_listener *listener, void *data) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
 
-
     struct wlr_output_state output_state_direct;
     struct wlr_output_state output_state_effect;
     struct wlr_render_pass *current_screen_pass = NULL;
+
+     float time_for_shader;
 
     if (!wlr_output || !wlr_output->enabled || !renderer || !server->allocator) {
         wlr_log(WLR_ERROR, "[OUTPUT_FRAME:%s] Output not ready (output_ptr=%p, enabled=%d, renderer_ptr=%p, allocator=%p).",
@@ -3428,10 +3364,99 @@ static void output_frame(struct wl_listener *listener, void *data) {
         return;
     }
 
-  
+    // --- Damage Detection and Early Exit (only for non-effect path) ---
+    wlr_output_state_init(&output_state_direct);
+    struct wlr_scene_output_state_options opts = {0};
+    bool has_damage = wlr_scene_output_build_state(scene_output, &output_state_direct, &opts);
+    
+    // Check if we need effects or if we can use direct path
+    bool current_frame_fbo_path = server->expo_effect_active || server->cube_effect_active;
+    
+    // Only do early exit if no effects are active
+    if (!current_frame_fbo_path && !has_damage && !(output_state_direct.committed & WLR_OUTPUT_STATE_BUFFER)) {
+        wlr_log(WLR_DEBUG, "[%s] Direct: No damage or buffer, skipping.", wlr_output->name);
+        wlr_output_state_finish(&output_state_direct);
+        wlr_scene_output_send_frame_done(scene_output, &now);
+        return;
+    }
 
-    // --- Expo Effect Animation State Calculation ---
+if (!server->cube_effect_active) {
+  if (last_quadrant != server->current_desktop) {
+        // This is the first frame the cube is active after a potential desktop change.
+        // Force the animation system to accept the new reality.
+        wlr_log(WLR_INFO, "CUBE SYNC: Current desktop is %d, but last cube quadrant was %d. Synchronizing.",
+                server->current_desktop, last_quadrant);
+        last_quadrant = server->current_desktop;
+        
+        // Set the cube's rotation directly to the correct angle without animation.
+        // This prevents the jarring rotation from the old desktop to the new one.
+        target_rotation = (float)server->current_desktop * -M_PI / 2.0f;
+        current_rotation = target_rotation;
+        last_rendered_rotation = target_rotation;
+        animating = false; // Ensure no old rotation animation is running.
+    }}
 
+
+      // --- Cube Effect Animation State Calculation (Completely Separate) ---
+    if (server->cube_effect_active) {
+
+       
+        if (server->cube_is_animating_zoom) {
+            float now_sec = get_monotonic_time_seconds_as_float();
+            float elapsed_sec = now_sec - server->cube_anim_start_time_sec;
+            float t = (server->cube_anim_duration_sec > 1e-5f) ? (elapsed_sec / server->cube_anim_duration_sec) : 1.0f;
+server->effect_is_animating_zoom = false;
+server->expo_effect_active = false;
+server->effect_is_target_zoomed=false;
+            if (t >= 1.0f) {
+                server->cube_anim_current_factor = server->cube_anim_target_factor;
+                server->cube_is_animating_zoom = false;
+                if (!server->cube_is_target_zoomed) {
+                    server->cube_effect_active = false;
+                    wlr_log(WLR_INFO, "[%s] Cube Effect OFF.", wlr_output->name);
+                    
+                    // 1. Apply the deferred desktop switch if there is one.
+                    if (server->pending_desktop_switch != -1) {
+                        server->current_desktop = server->pending_desktop_switch;
+                        server->pending_desktop_switch = -1;
+                    }
+
+                    // 2. Update visibility now that the effect is off.
+                    update_toplevel_visibility(server);
+
+                    // 3. Find the topmost window on the new desktop to make it active.
+                    //    This fixes the "many clicks" problem.
+                    struct tinywl_toplevel *toplevel_to_focus = NULL;
+                    struct tinywl_toplevel *toplevel_iter;
+                    wl_list_for_each(toplevel_iter, &server->toplevels, link) {
+                        if (toplevel_iter->desktop == server->current_desktop && toplevel_iter->mapped) {
+                            toplevel_to_focus = toplevel_iter;
+                            break;
+                        }
+                    }
+
+                    if (toplevel_to_focus) {
+                        focus_toplevel(toplevel_to_focus);
+                    } else {
+                        if (server->seat->keyboard_state.focused_surface) {
+                            wlr_seat_keyboard_clear_focus(server->seat);
+                        }
+                    }
+
+                    // 4. Update the mouse pointer's focus to restore hover effects.
+                    uint32_t time_msec = now.tv_sec * 1000 + now.tv_nsec / 1000000;
+                    process_cursor_motion(server, time_msec);
+                }
+            } else {
+                server->cube_anim_current_factor = server->cube_anim_start_factor + (server->cube_anim_target_factor - server->cube_anim_start_factor) * t;
+            }
+        } else {
+            server->cube_anim_current_factor = server->cube_is_target_zoomed ? server->cube_zoom_factor_zoomed : server->cube_zoom_factor_normal;
+        }
+    } else {
+        server->cube_is_animating_zoom = false;
+        server->cube_anim_current_factor = server->cube_zoom_factor_normal;
+    }
     // --- Expo Effect Animation State Calculation ---
     if (server->expo_effect_active) {
         if (server->effect_is_animating_zoom) {
@@ -3482,6 +3507,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
                     // 4. Update the mouse pointer's focus to restore hover effects.
                     uint32_t time_msec = now.tv_sec * 1000 + now.tv_nsec / 1000000;
                     process_cursor_motion(server, time_msec);
+                    
                 }
             } else {
                 server->effect_anim_current_factor = server->effect_anim_start_factor + (server->effect_anim_target_factor - server->effect_anim_start_factor) * t;
@@ -3494,25 +3520,62 @@ static void output_frame(struct wl_listener *listener, void *data) {
         server->effect_anim_current_factor = server->effect_zoom_factor_normal;
     }
 
-    // --- Cube Effect Animation State Calculation (Completely Separate) ---
-    if (server->cube_effect_active) {
-        if (server->cube_is_animating_zoom) {
-            float now_sec = get_monotonic_time_seconds_as_float();
-            float elapsed_sec = now_sec - server->cube_anim_start_time_sec;
-            float t = (server->cube_anim_duration_sec > 1e-5f) ? (elapsed_sec / server->cube_anim_duration_sec) : 1.0f;
+  
+if (server->tv_effect_animating) {
+    float elapsed = get_monotonic_time_seconds_as_float() - server->tv_effect_start_time;
+    float animation_duration = server->tv_effect_duration / 2.0f;
+    
+    if (elapsed >= animation_duration) {
+        // Animation is over, stop animating and toggle state
+        server->tv_effect_animating = false;
+        
+        if (server->tv_effect_duration / 2.0f == 2.5f) {
+            // Was at 2.5, now store 5.0
+            server->tv_effect_duration = 10.0f; // So duration/2 = 5.0
+            time_for_shader = 5.0f;
+        } else {
+            // Was at 5.0, now store 2.5
+            server->tv_effect_duration = 5.0f; // So duration/2 = 2.5
+            time_for_shader = 2.5f;
+        }
+    } else {
+        // Animation is in progress - determine start and end values
+        float start_value = server->tv_effect_duration / 2.0f;
+        float end_value = (start_value == 2.5f) ? 5.0f : 2.5f;
+        
+        // Interpolate between start and end
+        float progress = elapsed / animation_duration;
+        time_for_shader = start_value + (end_value - start_value) * progress;
+    }
+} else {
+    // Not animating, so send the stored stable state
+    time_for_shader = server->tv_effect_duration / 2.0f;
+}
 
-            if (t >= 1.0f) {
-                server->cube_anim_current_factor = server->cube_anim_target_factor;
-                server->cube_is_animating_zoom = false;
-                if (!server->cube_is_target_zoomed) {
-                    server->cube_effect_active = false;
-                    wlr_log(WLR_INFO, "[%s] Cube Effect OFF.", wlr_output->name);
+     if (!server->expo_effect_active & !server->cube_effect_active) {
+   
+            float now_sec = get_monotonic_time_seconds_as_float();
+            float elapsed_sec = now_sec - server->effect_anim_start_time_sec;
+            float t = (server->effect_anim_duration_sec > 1e-5f) ? (elapsed_sec / server->effect_anim_duration_sec) : 1.0f;
+
+          //    if (t >= 1.0f) {
+              //  server->effect_anim_current_factor = server->effect_anim_target_factor;
+            //    server->effect_is_animating_zoom = false;
+
+                // This code block runs ONLY when the zoom-out animation finishes.
+              //  if (server->effect_is_target_zoomed) {
+                   if (!server->cube_effect_active)
+                   {
+                   server->expo_effect_active = true;
+                   }else {
+                   server->expo_effect_active = false;
+                   }
+                   wlr_log(WLR_INFO, "[%s] Expo Effect OFF.", wlr_output->name);
+
+                    // --- THIS IS THE "REFRESH" LOGIC ---
+                    // It does exactly what a direct 'o' press would do.
+
                     
-                    // 1. Apply the deferred desktop switch if there is one.
-                    if (server->pending_desktop_switch != -1) {
-                        server->current_desktop = server->pending_desktop_switch;
-                        server->pending_desktop_switch = -1;
-                    }
 
                     // 2. Update visibility now that the effect is off.
                     update_toplevel_visibility(server);
@@ -3539,382 +3602,294 @@ static void output_frame(struct wl_listener *listener, void *data) {
                     // 4. Update the mouse pointer's focus to restore hover effects.
                     uint32_t time_msec = now.tv_sec * 1000 + now.tv_nsec / 1000000;
                     process_cursor_motion(server, time_msec);
-                }
-            } else {
-                server->cube_anim_current_factor = server->cube_anim_start_factor + (server->cube_anim_target_factor - server->cube_anim_start_factor) * t;
-            }
-        } else {
-            server->cube_anim_current_factor = server->cube_is_target_zoomed ? server->cube_zoom_factor_zoomed : server->cube_zoom_factor_normal;
-        }
-    } else {
-        server->cube_is_animating_zoom = false;
-        server->cube_anim_current_factor = server->cube_zoom_factor_normal;
-    }
-    // --- Determine Render Path ---
-    bool current_frame_fbo_path = server->expo_effect_active || server->cube_effect_active;
+                    
+             //   }
+            } 
 
 
 
-   
-
-    struct render_data rdata_scene_data = {
-        .renderer = renderer,
-        .server = server,
-        .output = wlr_output,
-        .pass = NULL
-    };
-
+    // =========================================================================================
+    // --- STAGE 1 (Conditional): Prepare Textures for Multi-Desktop Effects ---
+    // =========================================================================================
     if (current_frame_fbo_path) {
-        // --- START OF THE FIX ---
-        // When the cube or expo effect is active, we need ALL toplevels to be visible
-        // in the scene so they can be rendered into their respective desktop FBOs.
-        // The standard visibility logic would hide windows on non-active desktops.
-        // This loop temporarily makes everything visible for the offscreen render.
+        // When an effect is active, enable all toplevels in the scene so they can be
+        // rendered into their respective desktop FBOs.
         struct tinywl_toplevel *toplevel;
         wl_list_for_each(toplevel, &server->toplevels, link) {
             if (toplevel->scene_tree) {
-                // Also check if the toplevel is not minimized (scale > 0)
-                if (toplevel->scale > 0.01) {
-                    wlr_scene_node_set_enabled(&toplevel->scene_tree->node, true);
-                } else {
-                    wlr_scene_node_set_enabled(&toplevel->scene_tree->node, false);
-                }
+                wlr_scene_node_set_enabled(&toplevel->scene_tree->node, toplevel->scale > 0.01);
             }
         }
-        
+      if (server->effect_anim_current_factor<2.0){
+        // Setup and render each desktop into its own intermediate FBO.
+        for (int i = 0; i < 4; ++i) {
+    if (!setup_intermediate_framebuffer(server, wlr_output->width, wlr_output->height, i)) {
+         wlr_log(WLR_ERROR, "Failed to setup desktop FBO %d. Aborting frame.", i);
+         goto cleanup_frame;
     }
-
-    if (current_frame_fbo_path) {
-        if (!setup_intermediate_framebuffer(server, wlr_output->width, wlr_output->height,0))
-         {
-            wlr_log(WLR_ERROR, "[%s] Failed to setup FBO1.", wlr_output->name);
-            current_frame_fbo_path = false;
-        }
-        if (!setup_intermediate_framebuffer(server, wlr_output->width, wlr_output->height,1)) 
-        {
-            wlr_log(WLR_ERROR, "[%s] Failed to setup FBO2.", wlr_output->name);
-            current_frame_fbo_path = false;
-        }
-        if (!setup_intermediate_framebuffer(server, wlr_output->width, wlr_output->height,2))
-         {
-            wlr_log(WLR_ERROR, "[%s] Failed to setup FBO3.", wlr_output->name);
-            current_frame_fbo_path = false;
-        }
-        if (!setup_intermediate_framebuffer(server, wlr_output->width, wlr_output->height,3)) {
-            wlr_log(WLR_ERROR, "[%s] Failed to setup FBO4.", wlr_output->name);
-            current_frame_fbo_path = false;
-        }
-    }
-
-    if (current_frame_fbo_path) {
-        // Render desktop 0 to desktop_fbos[0]
-        glBindFramebuffer(GL_FRAMEBUFFER, server->desktop_fbos[0]);
-        glViewport(0, 0, server->intermediate_width[0], server->intermediate_height[0]);
-        glScissor(0, 0, server->intermediate_width[0], server->intermediate_height[0]);
-        glEnable(GL_SCISSOR_TEST);
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glDisable(GL_CULL_FACE);
-        glDisable(GL_DEPTH_TEST);
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-      //  render_scene_content0(server, wlr_output, &rdata_scene_data);
-      rdata_scene_data.desktop_index = 0; // <<< SET CONTEXT
-            render_desktop_content(server, wlr_output, &rdata_scene_data, 0);
-      glDisable(GL_SCISSOR_TEST);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-        // Render desktop 1 to desktop_fbos[1]
-        glBindFramebuffer(GL_FRAMEBUFFER, server->desktop_fbos[1]);
-        glViewport(0, 0, server->intermediate_width[1], server->intermediate_height[1]);
-        glScissor(0, 0, server->intermediate_width[1], server->intermediate_height[1]);
-        glEnable(GL_SCISSOR_TEST);
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glDisable(GL_CULL_FACE);
-        glDisable(GL_DEPTH_TEST);
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-       // render_scene_content1(server, wlr_output, &rdata_scene_data);
-       rdata_scene_data.desktop_index = 1; // <<< SET CONTEXT
-            render_desktop_content(server, wlr_output, &rdata_scene_data, 1);
-       glDisable(GL_SCISSOR_TEST);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-        // Render desktop 2 to desktop_fbos[1]
-        glBindFramebuffer(GL_FRAMEBUFFER, server->desktop_fbos[2]);
-        glViewport(0, 0, server->intermediate_width[2], server->intermediate_height[2]);
-        glScissor(0, 0, server->intermediate_width[2], server->intermediate_height[2]);
-        glEnable(GL_SCISSOR_TEST);
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glDisable(GL_CULL_FACE);
-        glDisable(GL_DEPTH_TEST);
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-       // render_scene_content2(server, wlr_output, &rdata_scene_data);
-       rdata_scene_data.desktop_index = 2; // <<< SET CONTEXT
-            render_desktop_content(server, wlr_output, &rdata_scene_data, 2);
-       glDisable(GL_SCISSOR_TEST);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-        // Render desktop 3 to desktop_fbos[1]
-        glBindFramebuffer(GL_FRAMEBUFFER, server->desktop_fbos[3]);
-        glViewport(0, 0, server->intermediate_width[3], server->intermediate_height[3]);
-        glScissor(0, 0, server->intermediate_width[3], server->intermediate_height[3]);
-        glEnable(GL_SCISSOR_TEST);
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glDisable(GL_CULL_FACE);
-        glDisable(GL_DEPTH_TEST);
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-       // render_scene_content3(server, wlr_output, &rdata_scene_data);
-      rdata_scene_data.desktop_index = 3; // <<< SET CONTEXT
-            render_desktop_content(server, wlr_output, &rdata_scene_data, 3);
-       glDisable(GL_SCISSOR_TEST);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    } else {
-        wlr_output_state_init(&output_state_direct);
-        struct wlr_scene_output_state_options opts = {0};
-        bool has_damage = wlr_scene_output_build_state(scene_output, &output_state_direct, &opts);
-        
-        if (!has_damage && !(output_state_direct.committed & WLR_OUTPUT_STATE_BUFFER)) {
-            wlr_log(WLR_DEBUG, "[%s] Direct: No damage or buffer, skipping.", wlr_output->name);
-            wlr_output_state_finish(&output_state_direct);
-            wlr_scene_output_send_frame_done(scene_output, &now);
-            return;
-        }
-        
-        pixman_region32_t full_damage_for_direct_pass;
-        pixman_region32_init_rect(&full_damage_for_direct_pass, 0, 0, wlr_output->width, wlr_output->height);
-        wlr_output_state_set_damage(&output_state_direct, &full_damage_for_direct_pass);
-        pixman_region32_fini(&full_damage_for_direct_pass);
-        
-        current_screen_pass = wlr_output_begin_render_pass(wlr_output, &output_state_direct, NULL);
-        if (!current_screen_pass) {
-            wlr_log(WLR_ERROR, "[%s] Direct: Failed to begin render pass.", wlr_output->name);
-            wlr_output_state_finish(&output_state_direct);
-            wlr_scene_output_send_frame_done(scene_output, &now);
-            return;
-        }
-        
-        rdata_scene_data.pass = current_screen_pass;
-        
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-        glViewport(0, 0, wlr_output->width, wlr_output->height);
-        glScissor(0, 0, wlr_output->width, wlr_output->height);
-        glEnable(GL_SCISSOR_TEST);
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glDisable(GL_CULL_FACE);
-        glDisable(GL_DEPTH_TEST);
-        
-        if (server->current_desktop == 0) {
-   //         render_scene_content0(server, wlr_output, &rdata_scene_data);
-    rdata_scene_data.desktop_index = 0;
-            render_desktop_content(server, wlr_output, &rdata_scene_data, 0);
-        } else if (server->current_desktop == 1) {
-    //        render_scene_content1(server, wlr_output, &rdata_scene_data);
-     rdata_scene_data.desktop_index = 1;
-            render_desktop_content(server, wlr_output, &rdata_scene_data, 1);
-        } else if (server->current_desktop == 2) {
-    //        render_scene_content2(server, wlr_output, &rdata_scene_data);
-     rdata_scene_data.desktop_index = 2;
-            render_desktop_content(server, wlr_output, &rdata_scene_data, 2);
-        } else if (server->current_desktop == 3) {
-    //        render_scene_content3(server, wlr_output, &rdata_scene_data);
-     rdata_scene_data.desktop_index = 3;
-            render_desktop_content(server, wlr_output, &rdata_scene_data, 3);
-        } else {
-    //        render_scene_content0(server, wlr_output, &rdata_scene_data);
-     rdata_scene_data.desktop_index = 1;
-            render_desktop_content(server, wlr_output, &rdata_scene_data, 0);
-        }
-        
-        glDisable(GL_SCISSOR_TEST);
-    }
-
-    if (current_frame_fbo_path) {
-        wlr_output_state_init(&output_state_effect);
-        pixman_region32_t full_damage_effect;
-        pixman_region32_init_rect(&full_damage_effect, 0, 0, wlr_output->width, wlr_output->height);
-        wlr_output_state_set_damage(&output_state_effect, &full_damage_effect);
-        pixman_region32_fini(&full_damage_effect);
-
-        current_screen_pass = wlr_output_begin_render_pass(wlr_output, &output_state_effect, NULL);
-        if (!current_screen_pass) {
-            wlr_log(WLR_ERROR, "[%s] FBO Path: Failed to begin effect pass.", wlr_output->name);
-            wlr_output_state_finish(&output_state_effect);
-            goto cleanup_frame;
-        }
-
-        glViewport(0, 0, wlr_output->width, wlr_output->height);
-        glScissor(0, 0, wlr_output->width, wlr_output->height);
-        glEnable(GL_SCISSOR_TEST);
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glDisable(GL_CULL_FACE);
-        glDisable(GL_DEPTH_TEST);
-
-         if (server->quad_vao != 0) {
-            glBindVertexArray(server->quad_vao);
-          
-            // *** FIX: Select the correct shader program and uniforms based on which effect is active ***
-            GLuint program_to_use = 0;
-            GLint zoom_loc = -1;
-            GLint quadrant_loc = -1;
-            GLint tex0_loc = -1;
-            float zoom_to_use = 1.0f;
-            int target_quadrant = server->current_desktop;
-
-             if (server->quad_vao != 0) {
-                glBindVertexArray(server->quad_vao);
-
-                if (server->expo_effect_active) {
-                    glUseProgram(server->fullscreen_shader_program);
-                    glUniform1f(server->fullscreen_shader_zoom_loc, server->effect_anim_current_factor);
-                    int target_quadrant = server->pending_desktop_switch != -1 ? server->pending_desktop_switch : server->current_desktop;
-                    glUniform1i(server->fullscreen_shader_quadrant_loc, target_quadrant);
-                    for(int i = 0; i < 4; ++i) {
-                        glActiveTexture(GL_TEXTURE0 + i);
-                        glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[i]);
-                        glUniform1i(server->fullscreen_shader_scene_tex0_loc + i, i);
-                    }
-                } else if (server->cube_effect_active) {
-    wlr_log(WLR_INFO, "CUBE DEBUG: Rendering cube with zoom=%.2f, quadrant=%d, time=%.2f", 
-           server->cube_anim_current_factor, server->current_desktop, get_monotonic_time_seconds_as_float());
+    glBindFramebuffer(GL_FRAMEBUFFER, server->desktop_fbos[i]);
+    glViewport(0, 0, server->intermediate_width[i], server->intermediate_height[i]);
     
- float now_float_sec = get_monotonic_time_seconds_as_float();
-
-            // 1. Check if we need to start a new animation
-            start_quadrant_animation(server->current_desktop, now_float_sec);
-
-            // 2. Get the current interpolated angle for this frame
-//            float animated_rotation = update_rotation_animation(now_float_sec);
-            float animated_rotation = update_rotation_animation(server, now_float_sec);
-
-// --- RENDER THE BACKGROUND FIRST ---
-    // Disable depth testing so the background is always drawn behind everything.
-    glDisable(GL_DEPTH_TEST);
-    glUseProgram(server->cube_background_shader_program);
-    glUniform1f(server->cube_background_shader_time_loc, now_float_sec);
-    // This draw call uses the simple vertex shader that generates a fullscreen quad
-    // so we don't need a VAO. We draw 4 vertices to make the quad.
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4); 
-
-
-   // glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
-    glEnable(GL_DEPTH_TEST);
-    glDepthFunc(GL_LESS);
-   // glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    // FIX 8: Clear with transparent black for individual desktop FBOs
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);  // Transparent, not opaque
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     
-    // Try WITHOUT face culling first to see all faces
-    glEnable(GL_CULL_FACE);  // Temporarily disable to see if geometry is correct
-    glFrontFace(GL_CCW); 
+    // FIX 9: Ensure blending is enabled for desktop content rendering
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    
+    struct render_data rdata = { 
+        .renderer = renderer, 
+        .server = server, 
+        .output = wlr_output, 
+        .pass = NULL, 
+        .desktop_index = i 
+    };
+    render_desktop_content(server, wlr_output, &rdata, i);
 
-    glBindVertexArray(server->cube_vao);
-    glUseProgram(server->cube_shader_program);
-    
-    // Debug uniform locations
-    wlr_log(WLR_INFO, "CUBE DEBUG: time_loc=%d, zoom_loc=%d, quadrant_loc=%d", 
-           server->cube_shader_time_loc, server->cube_shader_zoom_loc, server->cube_shader_quadrant_loc);
-    
-   // --- CORRECT UNIFORM SETTING ---
-                // 1. Pass time to the shader for rotation
-               last_rendered_rotation = animated_rotation;
-            // Pass the calculated rotation angle to the shader
-            glUniform1f(server->cube_shader_time_loc, animated_rotation); // time_loc holds u_rotation_y location
-            
-            // Pass zoom and quadrant uniforms
-            glUniform1f(server->cube_shader_zoom_loc, server->cube_anim_current_factor);
-            glUniform1i(server->cube_shader_quadrant_loc, server->current_desktop);
-    
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-    
-    for(int i = 0; i < 4; ++i) {
-        glActiveTexture(GL_TEXTURE0 + i);
-        glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[i]);
-        glUniform1i(server->cube_shader_scene_tex0_loc + i, i);
+}}else if (server->effect_anim_current_factor==2.0){
+        // Setup and render each desktop into its own intermediate FBO.
+     int target_quadrant = server->pending_desktop_switch != -1 ? server->pending_desktop_switch : server->current_desktop;
+         
+    if (!setup_intermediate_framebuffer(server, wlr_output->width, wlr_output->height, target_quadrant)) {
+         wlr_log(WLR_ERROR, "Failed to setup desktop FBO %d. Aborting frame.", target_quadrant);
+         goto cleanup_frame;
     }
+    glBindFramebuffer(GL_FRAMEBUFFER, server->desktop_fbos[target_quadrant]);
+    glViewport(0, 0, server->intermediate_width[target_quadrant], server->intermediate_height[target_quadrant]);
     
-    // Check for OpenGL errors
-    GLenum error = glGetError();
-    if (error != GL_NO_ERROR) {
-        wlr_log(WLR_ERROR, "CUBE DEBUG: OpenGL error before draw: %d", error);
-    }
+    // FIX 8: Clear with transparent black for individual desktop FBOs
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);  // Transparent, not opaque
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    
+    // FIX 9: Ensure blending is enabled for desktop content rendering
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    
+    struct render_data rdata = { 
+        .renderer = renderer, 
+        .server = server, 
+        .output = wlr_output, 
+        .pass = NULL, 
+        .desktop_index = target_quadrant
+    };
+    render_desktop_content(server, wlr_output, &rdata, target_quadrant);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
-             if (server->expo_effect_active) {    
-                glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
-             }
-
-             if (server->cube_effect_active) {    
-                glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_INT, 0);
-             }
 
 
-                // Cleanup
-                glUseProgram(0);
-                glBindVertexArray(0);
-            }
-        }
+}else {
+        // If no effects are active, ensure standard visibility rules are applied.
+        update_toplevel_visibility(server);
     }
 
-    if (current_screen_pass) {
-        if (!wlr_render_pass_submit(current_screen_pass)) {
-            wlr_log(WLR_ERROR, "[%s] Failed to submit render pass.", wlr_output->name);
-        }
-        
-        struct wlr_buffer *buffer_to_transmit = NULL;
-        if (current_frame_fbo_path && (output_state_effect.committed & WLR_OUTPUT_STATE_BUFFER)) {
-            buffer_to_transmit = output_state_effect.buffer;
-        } else if (!current_frame_fbo_path && (output_state_direct.committed & WLR_OUTPUT_STATE_BUFFER)) {
-            buffer_to_transmit = output_state_direct.buffer;
-        }
+  
 
-        if (buffer_to_transmit && buffer_to_transmit->width > 0 && buffer_to_transmit->height > 0) {
+
+// Key fixes for alpha issues in expo and cube effects:
+
+// =========================================================================================
+// --- STAGE 2: Render The Composite Scene Into The Single Post-Processing FBO ---
+// =========================================================================================
+
+if (!setup_post_process_framebuffer(server, wlr_output->width, wlr_output->height)) {
+    wlr_log(WLR_ERROR, "Failed to setup post-processing FBO. Aborting frame.");
+    goto cleanup_frame;
+}
+
+// Bind our new single FBO as the render target for the entire scene.
+glBindFramebuffer(GL_FRAMEBUFFER, server->post_process_fbo);
+glViewport(0, 0, wlr_output->width, wlr_output->height);
+
+// FIX 1: Ensure proper alpha blending setup
+glEnable(GL_BLEND);
+glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+glBlendEquation(GL_FUNC_ADD);  // Add this line
+
+// FIX 2: Clear with transparent black instead of opaque black
+glClearColor(0.0f, 0.0f, 0.0f, 0.0f);  // Changed alpha from 1.0f to 0.0f
+glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+// Now, draw either the effect view or the normal desktop view INTO this FBO.
+if (current_frame_fbo_path) {
+    // --- Effect Path: Render Expo or Cube effect using textures from Stage 1 ---
+    if (server->expo_effect_active) {
+        if (server->effect_anim_current_factor<2.0)
+        {
+        // FIX 3: Ensure consistent GL state for expo
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glEnable(GL_BLEND);  // Ensure blending is enabled
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        
+        glBindVertexArray(server->quad_vao);
+        glUseProgram(server->fullscreen_shader_program);
+        
+        glUniform1f(server->fullscreen_shader_zoom_loc, server->effect_anim_current_factor);
+        int target_quadrant = server->pending_desktop_switch != -1 ? server->pending_desktop_switch : server->current_desktop;
+        glUniform1i(server->fullscreen_shader_quadrant_loc, target_quadrant);
+        
+        for(int i = 0; i < 4; ++i) {
+            glActiveTexture(GL_TEXTURE0 + i);
+            glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[i]);
+            glUniform1i(server->fullscreen_shader_scene_tex0_loc + i, i);
+        } 
+    }else if (server->effect_anim_current_factor==2.0)
+        {
+        // FIX 3: Ensure consistent GL state for expo
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glEnable(GL_BLEND);  // Ensure blending is enabled
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        
+        glBindVertexArray(server->quad_vao);
+        glUseProgram(server->fullscreen_shader_program);
+        
+        glUniform1f(server->fullscreen_shader_zoom_loc, server->effect_anim_current_factor);
+        int target_quadrant = server->pending_desktop_switch != -1 ? server->pending_desktop_switch : server->current_desktop;
+        glUniform1i(server->fullscreen_shader_quadrant_loc, target_quadrant);
+        
+       
+            glActiveTexture(GL_TEXTURE0 + target_quadrant);
+            glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[target_quadrant]);
+            glUniform1i(server->fullscreen_shader_scene_tex0_loc + target_quadrant, target_quadrant);
+        
+        
+    }
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+    } else if (server->cube_effect_active) {
+        // FIX 4: Proper alpha handling for cube effect
+        float now_float_sec = get_monotonic_time_seconds_as_float();
+        start_quadrant_animation(server->current_desktop, now_float_sec);
+        float animated_rotation = update_rotation_animation(server, now_float_sec);
+        last_rendered_rotation = animated_rotation;
+
+        // Background rendering with proper alpha
+        glDisable(GL_DEPTH_TEST);
+        glEnable(GL_BLEND);  // Ensure blending for background
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        
+        glUseProgram(server->cube_background_shader_program);
+        glUniform1f(server->cube_background_shader_time_loc, now_float_sec);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+        // Cube rendering with depth and alpha
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LESS);
+        glEnable(GL_CULL_FACE);
+        glFrontFace(GL_CCW);
+        // Keep blending enabled for cube faces
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        
+        glBindVertexArray(server->cube_vao);
+        glUseProgram(server->cube_shader_program);
+
+        glUniform1f(server->cube_shader_time_loc, animated_rotation);
+        glUniform1f(server->cube_shader_zoom_loc, server->cube_anim_current_factor);
+        glUniform1i(server->cube_shader_quadrant_loc, server->current_desktop);
+
+        for(int i = 0; i < 4; ++i) {
+            glActiveTexture(GL_TEXTURE0 + i);
+            glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[i]);
+            glUniform1i(server->cube_shader_scene_tex0_loc + i, i);
+        }
+        glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_INT, 0);
+    }
+} else {
+    // --- Normal Path: Render the current desktop directly into post_process_fbo ---
+    // FIX 5: Ensure proper blending for normal desktop rendering
+   
+}
+
+// Unbind our post-process FBO. Its texture is now filled with the complete scene.
+glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+// =========================================================================================
+// --- STAGE 3: Render The Post-Process Texture TO THE SCREEN With The Final Shader ---
+// =========================================================================================
+
+struct wlr_output_state final_state;
+wlr_output_state_init(&final_state);
+
+pixman_region32_t damage;
+pixman_region32_init_rect(&damage, 0, 0, wlr_output->width, wlr_output->height);
+wlr_output_state_set_damage(&final_state, &damage);
+pixman_region32_fini(&damage);
+
+struct wlr_render_pass *screen_pass = wlr_output_begin_render_pass(wlr_output, &final_state, NULL);
+if (!screen_pass) {
+    wlr_log(WLR_ERROR, "Final Pass: Failed to begin render pass to screen.");
+    wlr_output_state_finish(&final_state);
+    goto cleanup_frame;
+}
+
+// FIX 6: Final screen rendering with proper alpha handling
+glClearColor(0.0f, 0.0f, 0.0f, 1.0f);  // Opaque black for final output
+glClear(GL_COLOR_BUFFER_BIT);
+
+// FIX 7: Disable blending for final composite to avoid double-blending
+glDisable(GL_BLEND);
+glDisable(GL_DEPTH_TEST);
+glDisable(GL_CULL_FACE);
+
+glUseProgram(server->post_process_shader_program);
+glBindVertexArray(server->quad_vao);
+
+glActiveTexture(GL_TEXTURE0);
+glBindTexture(GL_TEXTURE_2D, server->post_process_texture);
+
+glUniform1i(server->post_process_shader_tex_loc, 0);
+glUniform1f(server->post_process_shader_time_loc, time_for_shader);
+
+ // <<< ADD THIS BLOCK TO SET THE RESOLUTION >>>
+    if (server->post_process_shader_resolution_loc != -1) {
+        glUniform2f(server->post_process_shader_resolution_loc, 
+                    (float)wlr_output->width, 
+                    (float)wlr_output->height);
+    }
+
+glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+
+// Cleanup GL state after drawing.
+glUseProgram(0);
+glBindVertexArray(0);
+glBindTexture(GL_TEXTURE_2D, 0);
+
+    if (!wlr_render_pass_submit(screen_pass)) {
+        wlr_log(WLR_ERROR, "Failed to submit final render pass.");
+    }
+
+    // --- RDP Transmit Logic (now simplified) ---
+    if (final_state.committed & WLR_OUTPUT_STATE_BUFFER) {
+        struct wlr_buffer *buffer_to_transmit = final_state.buffer;
+        if (buffer_to_transmit && buffer_to_transmit->width > 0) {
             pthread_mutex_lock(&rdp_transmit_mutex);
             struct wlr_buffer *locked_buffer = wlr_buffer_lock(buffer_to_transmit);
             if (locked_buffer) {
                 rdp_transmit_surface(locked_buffer);
                 wlr_buffer_unlock(locked_buffer);
-            } else {
-                wlr_log(WLR_ERROR, "[%s] Failed to lock buffer for RDP transmit.", wlr_output->name);
             }
             pthread_mutex_unlock(&rdp_transmit_mutex);
         }
     }
 
-    if (current_frame_fbo_path) {
-        wlr_output_state_finish(&output_state_effect);
-    } else {
-        wlr_output_state_finish(&output_state_direct);
-    }
-
-       // // TEMPORARY: Force continuous frame scheduling
-     //     wlr_output_schedule_frame(wlr_output);
-     
+    wlr_output_state_finish(&final_state);
+    wlr_output_state_finish(&output_state_direct);
 
 cleanup_frame:
+    // Final cleanup and frame signaling.
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_BLEND);
     wlr_scene_output_send_frame_done(scene_output, &now);
-    /*
-     // Schedule continuous frames if ANY effect is animating
-     if (server->effect_is_animating_zoom || server->cube_is_animating_zoom ||
-        (server->expo_effect_active && server->pending_desktop_switch != -1) ||
-        server->cube_effect_active) { // <-- THIS IS THE CRITICAL ADDITION
-        
-        wlr_output_schedule_frame(wlr_output);
-    }*/
-}
 
+    // --- Frame Scheduling Logic (no changes needed) ---
+    
+}
 
 
 
@@ -4160,78 +4135,62 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
     struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, map);
     struct wlr_xdg_toplevel *xdg_toplevel = toplevel->xdg_toplevel;
-    struct wlr_xdg_surface *xdg_surface_for_toplevel = xdg_toplevel->base; // Alias for clarity
     const char *title = (xdg_toplevel->title) ? xdg_toplevel->title : "N/A";
 
-    wlr_log(WLR_INFO, "[MAP:%s] Mapped. Current XDG configured content size: %dx%d",
-            title, xdg_toplevel->current.width, xdg_toplevel->current.height);
+    wlr_log(WLR_INFO, "[MAP:%s] Toplevel mapped. Starting geometry negotiation.", title);
     toplevel->mapped = true;
 
+    // Default content size if client provides no hints.
     int target_content_width = 800;
     int target_content_height = 600;
     bool size_from_client_geom = false;
 
-    struct wlr_box client_geom = xdg_surface_for_toplevel->geometry;
-    wlr_log(WLR_DEBUG, "[MAP:%s] Client's current xdg_surface->geometry: %dx%d at %d,%d",
-            title, client_geom.width, client_geom.height, client_geom.x, client_geom.y);
-
+    // Check if the client provided a preferred geometry.
+    struct wlr_box client_geom = xdg_toplevel->base->geometry;
     if (client_geom.width > 0 && client_geom.height > 0) {
         target_content_width = client_geom.width;
         target_content_height = client_geom.height;
         size_from_client_geom = true;
+        wlr_log(WLR_DEBUG, "[MAP:%s] Client suggested initial geometry: %dx%d", title, target_content_width, target_content_height);
     }
 
-    bool intend_server_decorations = false;
-    if (toplevel->decoration) {
-        if (toplevel->decoration->current.mode == WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE ||
-            toplevel->decoration->pending.mode == WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE) {
-            intend_server_decorations = true;
-        }
-    } else {
-        intend_server_decorations = true;
+    // --- CRITICAL FIX: PREDICT IF SSDs WILL BE USED ---
+    bool intend_server_decorations = true; // By default, we want to provide SSDs.
+
+    // If a decoration object already exists and the client explicitly requested CSD, then we don't intend to draw SSDs.
+    if (toplevel->decoration &&
+        (toplevel->decoration->current.mode == WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE ||
+         toplevel->decoration->pending.mode == WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE)) {
+        intend_server_decorations = false;
     }
 
+    // If we got a size from the client AND we intend to draw decorations,
+    // we assume the client might have given us the *total window size*.
+    // We derive the *content size* from that.
     if (size_from_client_geom && intend_server_decorations) {
         int derived_content_width = client_geom.width - (2 * BORDER_WIDTH);
         int derived_content_height = client_geom.height - TITLE_BAR_HEIGHT - BORDER_WIDTH;
 
+        // Sanity check: If the derived size is tiny, the client probably
+        // meant the content size, not the total size.
         if (derived_content_width >= 50 && derived_content_height >= 50) {
             target_content_width = derived_content_width;
             target_content_height = derived_content_height;
             wlr_log(WLR_INFO, "[MAP:%s] Client suggested total %dx%d. Server intends SSDs. Derived target CONTENT size: %dx%d.",
                     title, client_geom.width, client_geom.height, target_content_width, target_content_height);
         } else {
-            wlr_log(WLR_INFO, "[MAP:%s] Client suggested total %dx%d. Derived SSD content size %dx%d too small. Using client's suggestion as content or default.",
-                    title, client_geom.width, client_geom.height, derived_content_width, derived_content_height);
-            // If derived is too small, we either use client_geom directly as content or a larger default
-            // For now, if derived is too small, let's revert to client_geom as content, assuming client might not want SSDs yet.
-            target_content_width = client_geom.width; // Revert
-            target_content_height = client_geom.height; // Revert
-        }
-    } else if (size_from_client_geom) {
-         wlr_log(WLR_INFO, "[MAP:%s] Using client-suggested geometry directly as content (no SSDs intended yet): %dx%d",
-                title, target_content_width, target_content_height);
-    } else {
-        wlr_log(WLR_INFO, "[MAP:%s] No valid client geometry, using default content size: %dx%d.",
-                title, target_content_width, target_content_height);
-    }
-    
-    if ((xdg_toplevel->current.width == 0 && xdg_toplevel->current.height == 0) ||
-        xdg_toplevel->current.width != target_content_width ||
-        xdg_toplevel->current.height != target_content_height) {
-        wlr_log(WLR_INFO, "[MAP:%s] Setting XDG toplevel CONTENT size to %dx%d.", title, target_content_width, target_content_height);
-        wlr_xdg_toplevel_set_size(xdg_toplevel, target_content_width, target_content_height);
-    } else {
-        wlr_log(WLR_INFO, "[MAP:%s] XDG toplevel content size already %dx%d, not re-setting.", title, xdg_toplevel->current.width, xdg_toplevel->current.height);
-        if (toplevel->ssd_pending_enable && xdg_surface_for_toplevel->initialized) {
-             wlr_log(WLR_DEBUG, "[MAP:%s] Size matches but ssd_pending_enable, scheduling configure.", title);
-            wlr_xdg_surface_schedule_configure(xdg_surface_for_toplevel);
+             wlr_log(WLR_INFO, "[MAP:%s] Derived content size %dx%d was too small. Assuming client's suggestion was for content.",
+                    title, derived_content_width, derived_content_height);
         }
     }
+
+    // Now, set the final CONTENT size. The subsequent commit will handle creating
+    // the decoration visuals around this correctly-sized content area.
+    wlr_log(WLR_INFO, "[MAP:%s] Setting final XDG toplevel CONTENT size to %dx%d.", title, target_content_width, target_content_height);
+    wlr_xdg_toplevel_set_size(xdg_toplevel, target_content_width, target_content_height);
 
     focus_toplevel(toplevel);
 }
-
 
 static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
     struct tinywl_toplevel *toplevel_wrapper = wl_container_of(listener, toplevel_wrapper, unmap);
@@ -4274,7 +4233,6 @@ static struct wlr_scene_rect *create_decoration_rect(
 
 
 
-
 static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
     struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, commit);
     struct wlr_xdg_toplevel *xdg_toplevel = toplevel->xdg_toplevel;
@@ -4283,29 +4241,69 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
     struct tinywl_server *server = toplevel->server;
     const char *title = (xdg_toplevel->title) ? xdg_toplevel->title : "N/A";
 
-    if (!surface) {
-        wlr_log(WLR_ERROR, "[COMMIT:%s] Surface pointer was NULL!", title);
-        return;
-    }
-
-    enum wlr_xdg_toplevel_decoration_v1_mode mode_at_commit_entry = WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_NONE;
-    if (toplevel->decoration) {
-        mode_at_commit_entry = toplevel->decoration->current.mode;
-    }
+    if (!surface) return;
 
     wlr_log(WLR_INFO, "[COMMIT:%s] START - Mapped:%d, Init:%d, XDGConf:%d, SSD_EN:%d, SSD_PEND:%d. DecoCurr:%d, DecoPend:%d. Buf:%p(%dx%d), Seq:%u. XDGCurrentSize:%dx%d",
             title, surface->mapped, xdg_surface->initialized, xdg_surface->configured,
             toplevel->ssd.enabled, toplevel->ssd_pending_enable,
-            mode_at_commit_entry,
+            toplevel->decoration ? toplevel->decoration->current.mode : -1,
             toplevel->decoration ? toplevel->decoration->pending.mode : -1,
             (void*)surface->current.buffer, surface->current.buffer ? surface->current.buffer->width : 0, surface->current.buffer ? surface->current.buffer->height : 0,
             surface->current.seq, xdg_toplevel->current.width, xdg_toplevel->current.height);
 
+    bool needs_surface_configure = false;
+    enum wlr_xdg_toplevel_decoration_v1_mode server_preferred_mode =
+        WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE;
+
+    // If a decoration request is pending, now is the time to handle it.
+    if (toplevel->decoration && toplevel->ssd_pending_enable) {
+        // We only negotiate when the surface is ready (initialized or on its first commit).
+        if (xdg_surface->initialized || xdg_surface->initial_commit) {
+            wlr_log(WLR_INFO, "[COMMIT:%s] ssd_pending_enable=true. Setting preferred mode: %d.", title, server_preferred_mode);
+            wlr_xdg_toplevel_decoration_v1_set_mode(toplevel->decoration, server_preferred_mode);
+            needs_surface_configure = true; // MUST configure after setting mode.
+            toplevel->ssd_pending_enable = false;
+        }
+    }
+
+    // Now, make a decision based on the current, stable decoration mode.
+    enum wlr_xdg_toplevel_decoration_v1_mode effective_mode = WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_NONE;
+    if (toplevel->decoration) {
+        effective_mode = toplevel->decoration->current.mode;
+    }
+
+    if (effective_mode == server_preferred_mode) {
+        // The protocol state is SERVER_SIDE. Check if our internal state matches.
+        if (!toplevel->ssd.enabled) {
+            wlr_log(WLR_INFO, "[COMMIT:%s] Effective mode is SERVER_SIDE. Enabling SSDs.", title);
+            ensure_ssd_enabled(toplevel);
+            // This geometry change requires a configure.
+            needs_surface_configure = true;
+        }
+    } else {
+        // The protocol state is CLIENT_SIDE or NONE.
+        if (toplevel->ssd.enabled) {
+            wlr_log(WLR_INFO, "[COMMIT:%s] Effective mode is %d (NOT SERVER_SIDE). Disabling SSDs.", title, effective_mode);
+            ensure_ssd_disabled(toplevel);
+            // This geometry change requires a configure.
+            needs_surface_configure = true;
+        }
+    }
+
+    if (toplevel->ssd.enabled) {
+        update_decoration_geometry(toplevel);
+    }
+
+    // If we determined a configure is needed, or if the surface is still unconfigured, schedule it now.
+    if (needs_surface_configure || (xdg_surface->initialized && !xdg_surface->configured)) {
+        wlr_log(WLR_INFO, "[COMMIT:%s] Scheduling configure for xdg_surface.", title);
+        wlr_xdg_surface_schedule_configure(xdg_surface);
+    }
+
+    // Caching and redrawing logic remains the same.
     if (surface->current.buffer) {
         if (!(toplevel->cached_texture && toplevel->last_commit_seq == surface->current.seq)) {
-            if (toplevel->cached_texture) {
-                wlr_texture_destroy(toplevel->cached_texture);
-            }
+            if (toplevel->cached_texture) wlr_texture_destroy(toplevel->cached_texture);
             toplevel->cached_texture = wlr_texture_from_buffer(server->renderer, surface->current.buffer);
             toplevel->last_commit_seq = surface->current.seq;
         }
@@ -4317,81 +4315,6 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
         toplevel->last_commit_seq = surface->current.seq;
     }
 
-    bool needs_surface_configure = false;
-    enum wlr_xdg_toplevel_decoration_v1_mode server_preferred_mode = WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE;
-
-    if (xdg_surface->initial_commit) {
-        needs_surface_configure = true;
-        if (xdg_toplevel->current.width == 0 && xdg_toplevel->current.height == 0) {
-            wlr_xdg_toplevel_set_size(xdg_toplevel, 0, 0);
-        }
-    }
-
-    if (toplevel->decoration && toplevel->ssd_pending_enable) {
-        if (xdg_surface->initialized || xdg_surface->initial_commit) {
-            enum wlr_xdg_toplevel_decoration_v1_mode current_actual_mode = toplevel->decoration->current.mode;
-            enum wlr_xdg_toplevel_decoration_v1_mode pending_protocol_mode = toplevel->decoration->pending.mode;
-
-            if (current_actual_mode != server_preferred_mode ||
-                (pending_protocol_mode != WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_NONE && pending_protocol_mode != server_preferred_mode)) {
-                wlr_log(WLR_INFO, "[COMMIT:%s] ssd_pending_enable=true. Current deco mode: %d, Pending deco mode: %d. Server setting preferred mode: %d.",
-                        title, current_actual_mode, pending_protocol_mode, server_preferred_mode);
-                wlr_xdg_toplevel_decoration_v1_set_mode(toplevel->decoration, server_preferred_mode);
-                needs_surface_configure = true;
-            }
-            toplevel->ssd_pending_enable = false;
-        } else {
-            wlr_log(WLR_INFO, "[COMMIT:%s] ssd_pending_enable=true, but surface not initialized and not initial_commit. Deferring mode set logic.", title);
-        }
-    }
-
-    int content_width = xdg_toplevel->current.width;
-    int content_height = xdg_toplevel->current.height;
-
-    enum wlr_xdg_toplevel_decoration_v1_mode effective_mode_for_decision = WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_NONE;
-    if (toplevel->decoration) {
-        effective_mode_for_decision = (toplevel->decoration->pending.mode != WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_NONE) ?
-                                      toplevel->decoration->pending.mode : toplevel->decoration->current.mode;
-    }
-
-    if (effective_mode_for_decision == server_preferred_mode) {
-        if (content_width > 0 && content_height > 0) {
-            if (!toplevel->ssd.enabled) {
-                wlr_log(WLR_INFO, "[COMMIT:%s] Effective mode is SERVER_SIDE (%d) & content %dx%d. Enabling SSDs.",
-                        title, effective_mode_for_decision, content_width, content_height);
-                ensure_ssd_enabled(toplevel);
-                if (toplevel->ssd.enabled) {
-                    needs_surface_configure = true;
-                }
-            }
-        } else {
-            if (toplevel->ssd.enabled) {
-                wlr_log(WLR_INFO, "[COMMIT:%s] Effective mode is SERVER_SIDE (%d), but content size %dx%d is 0. Disabling SSDs.",
-                        title, effective_mode_for_decision, content_width, content_height);
-                ensure_ssd_disabled(toplevel);
-                needs_surface_configure = true;
-            }
-        }
-    } else {
-        if (toplevel->ssd.enabled) {
-            wlr_log(WLR_INFO, "[COMMIT:%s] Effective mode is %d (NOT SERVER_SIDE). Disabling SSDs.",
-                    title, effective_mode_for_decision);
-            ensure_ssd_disabled(toplevel);
-            needs_surface_configure = true;
-        }
-    }
-
-    if (toplevel->ssd.enabled) {
-        update_decoration_geometry(toplevel);
-    }
-
-    if (needs_surface_configure || (xdg_surface->initialized && !xdg_surface->configured) ) {
-        wlr_log(WLR_INFO, "[COMMIT:%s] Scheduling configure for xdg_surface. NeedsConfFlag:%d, InitAndNotYetXDGConfigured:%d",
-                title, needs_surface_configure, (xdg_surface->initialized && !xdg_surface->configured));
-        uint32_t serial = wlr_xdg_surface_schedule_configure(xdg_surface);
-        wlr_log(WLR_DEBUG, "[COMMIT:%s] Scheduled xdg_surface configure with serial %u.", title, serial);
-    }
-
     if (surface->mapped) {
         struct tinywl_output *output_iter;
         wl_list_for_each(output_iter, &server->outputs, link) {
@@ -4400,21 +4323,7 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
             }
         }
     }
-
-    enum wlr_xdg_toplevel_decoration_v1_mode mode_at_commit_exit = WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_NONE;
-    if (toplevel->decoration) {
-        mode_at_commit_exit = toplevel->decoration->current.mode;
-    }
-
-    wlr_log(WLR_INFO, "[COMMIT:%s] END - Mapped:%d, Init:%d, Conf:%d, SSD_EN:%d, DECO_CURR_MODE_EXIT:%d, Seq:%u. XDG_Size(current):%dx%d. Surface Buffer: %p (%dx%d)",
-            title, surface->mapped, xdg_surface->initialized, xdg_surface->configured,
-            toplevel->ssd.enabled, mode_at_commit_exit, surface->current.seq,
-            xdg_toplevel->current.width, xdg_toplevel->current.height,
-            (void*)surface->current.buffer,
-            surface->current.buffer ? surface->current.buffer->width : 0,
-            surface->current.buffer ? surface->current.buffer->height : 0);
 }
-
 
 static void decoration_handle_destroy(struct wl_listener *listener, void *data) {
     struct tinywl_toplevel *toplevel =
@@ -4884,20 +4793,20 @@ static void server_new_xdg_decoration(struct wl_listener *listener, void *data) 
     struct tinywl_server *server = wl_container_of(listener, server, xdg_decoration_new);
     struct wlr_xdg_toplevel_decoration_v1 *decoration = data;
     struct wlr_xdg_toplevel *xdg_toplevel = decoration->toplevel;
-    struct tinywl_toplevel *toplevel = xdg_toplevel->base->data; // xdg_surface is xdg_toplevel->base
+    struct tinywl_toplevel *toplevel = xdg_toplevel->base->data;
 
     const char *title_for_log = xdg_toplevel->title ? xdg_toplevel->title : "N/A";
 
-    wlr_log(WLR_INFO, "[DECO_MGR] New decoration object %p for toplevel '%s'. Initial client requested mode: %d",
-            (void*)decoration, title_for_log, decoration->requested_mode);
+    wlr_log(WLR_INFO, "[DECO_MGR] New decoration object %p for toplevel '%s'.",
+            (void*)decoration, title_for_log);
 
     if (!toplevel) {
         wlr_log(WLR_ERROR, "[DECO_MGR] No tinywl_toplevel for new decoration on '%s'.", title_for_log);
         return;
     }
 
-    if (toplevel->decoration && toplevel->decoration != decoration) {
-        wlr_log(WLR_INFO, "[DECO_MGR] Replacing old decoration for toplevel '%s'", title_for_log);
+    // Clean up old listeners if a decoration is being replaced
+    if (toplevel->decoration) {
         wl_list_remove(&toplevel->decoration_destroy_listener.link);
         wl_list_remove(&toplevel->decoration_request_mode_listener.link);
     }
@@ -4908,16 +4817,15 @@ static void server_new_xdg_decoration(struct wl_listener *listener, void *data) 
     toplevel->decoration_request_mode_listener.notify = decoration_handle_request_mode;
     wl_signal_add(&decoration->events.request_mode, &toplevel->decoration_request_mode_listener);
 
-    // CRITICAL CHANGE: Do NOT call wlr_xdg_toplevel_decoration_v1_set_mode() here.
-    // Only set the flag. The commit handler will call set_mode when the surface is initialized.
+    // --- THE FIX ---
+    // Instead of setting the mode here, just flag that we need to handle it.
     toplevel->ssd_pending_enable = true;
-    wlr_log(WLR_INFO, "[DECO_MGR] Toplevel '%s': Associated decoration. Marked ssd_pending_enable = true. Actual mode set and surface configure will occur on commit.", title_for_log);
+    wlr_log(WLR_INFO, "[DECO_MGR] Toplevel '%s': Marked ssd_pending_enable=true. Mode set will occur on next commit.", title_for_log);
 
-    // If the main xdg_surface IS ALREADY initialized, we can schedule a configure for it.
-    // This helps if the decoration is created *after* the surface's initial commit.
-    // The commit handler will then see ssd_pending_enable and call set_mode.
+    // If the surface is already up and running, we need to trigger a commit/configure
+    // cycle to apply the new decoration state.
     if (xdg_toplevel->base->initialized) {
-        wlr_log(WLR_DEBUG, "[DECO_MGR] Toplevel '%s' xdg_surface is already initialized. Scheduling configure for xdg_surface to process pending decoration.", title_for_log);
+        wlr_log(WLR_DEBUG, "[DECO_MGR] Surface for '%s' is already initialized. Scheduling configure to process pending decoration.", title_for_log);
         wlr_xdg_surface_schedule_configure(xdg_toplevel->base);
     }
 }
@@ -6783,6 +6691,333 @@ static const char *background_fragment_shader_src =
 "    FragColor = forCol2 + vec4(backCol2*0.6, 1.0).bgra;\n"
 "}\n";
 
+//tv effect
+static const char *post_process_vert =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "\n"
+    "// Input vertex position in [0, 1] range\n"
+    "layout(location = 0) in vec2 a_position_01;\n"
+    "// Input texture coordinate in [0, 1] range\n"
+    "layout(location = 1) in vec2 a_texcoord;\n"
+    "\n"
+    "// Pass texture coordinate to the fragment shader\n"
+    "out vec2 v_texcoord;\n"
+    "\n"
+    "void main() {\n"
+    "    // Convert [0, 1] position to [-1, 1] Normalized Device Coordinates\n"
+    "    gl_Position = vec4(a_position_01 * 2.0 - 1.0, 0.0, 1.0);\n"
+    "\n"
+    "    // Pass the texture coordinate through unchanged\n"
+    "    v_texcoord = a_texcoord;\n"
+    "}\n";
+
+
+//tv effect
+/*    
+static const char *post_process_frag =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "\n"
+    "uniform sampler2D u_scene_texture;\n"
+    "uniform float u_time;\n"
+    "uniform vec2 iResolution;\n"
+    "\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 FragColor;\n"
+    "\n"
+    "// --- HELPER FUNCTIONS (No change) ---\n"
+    "float rand(vec2 co){ return fract(sin(dot(co.xy, vec2(12.9898, 78.233))) * 43758.5453); }\n"
+    "float noise(vec2 pos) { vec2 i=floor(pos),f=fract(pos),u=f*f*(3.0-2.0*f); return mix(mix(rand(i),rand(i+vec2(1,0)),u.x),mix(rand(i+vec2(0,1)),rand(i+vec2(1,1)),u.x),u.y); }\n"
+    "vec3 chromaticAberration(sampler2D tex,vec2 uv,float s){ vec2 o=(uv-0.5)*s; return vec3(texture(tex,uv+o).r,texture(tex,uv).g,texture(tex,uv-o).b); }\n"
+    "float onOff(float a,float b,float c,float t){ return step(c,sin(t+a*cos(t*b))); }\n"
+    "float ramp(float y,float s,float e){ float i=step(s,y)-step(e,y); return(1.-(y-s)/(e-s))*i; }\n"
+    "float stripes(vec2 uv,float t){ float n=noise(uv*vec2(0.5,1)+vec2(1,3)); return ramp(mod(uv.y*4.+t/2.+sin(t+sin(t*0.63)),1.),0.5,0.6)*n; }\n"
+    "vec2 screenDistort(vec2 uv){ uv-=0.5; uv=uv*1.2*(1./1.2+2.*uv.x*uv.x*uv.y*uv.y); uv+=0.5; return uv; }\n"
+    "\n"
+    "void main() {\n"
+    "    // --- TIMING & PROGRESS (No change) ---\n"
+    "    float cycle_duration = 5.0;\n"
+    "    float half_cycle = cycle_duration / 2.0;\n"
+    "    float time_in_cycle = mod(u_time, cycle_duration);\n"
+    "    float progress;\n"
+    "    bool turning_on = (time_in_cycle < half_cycle);\n"
+    "    if (turning_on) { progress = time_in_cycle / half_cycle; } \n"
+    "    else { progress = 1.0 - (time_in_cycle - half_cycle) / half_cycle; }\n"
+    "    float eased_progress = pow(progress, 3.0);\n"
+    "\n"
+    "    float uniform_scale = eased_progress;\n"
+    "    vec2 center = vec2(0.5, 0.5);\n"
+    "    vec2 pos = v_texcoord - center;\n"
+    "\n"
+    "    // --- TV OFF STATE (No change) ---\n"
+    "    if (abs(pos.x) > uniform_scale / 2.0 || abs(pos.y) > uniform_scale / 2.0) {\n"
+    "        // ... (your existing off-state logic) ...\n"
+    "        FragColor = vec4(0.0, 0.0, 0.0, 1.0);\n"
+    "        return;\n"
+    "    }\n"
+    "\n"
+    "    // --- TV ON STATE --- \n"
+    "    vec2 sample_coords = pos / uniform_scale + center;\n"
+    "\n"
+    "    // <<< START OF THE FIX: Calculate a single 'glitch_amount' >>>\n"
+    "    // This variable will control ALL effects. It peaks in the middle of the animation\n"
+    "    // and is 0.0 when the animation starts and ends.\n"
+    "    float glitch_amount = progress * (1.0 - progress) * 7.0; // Parabolic curve, peaks at 1.0\n"
+    "    glitch_amount = pow(glitch_amount, 2.0); // Sharpen the peak\n"
+    "\n"
+    "    // 1. Calculate the final, clean texture coordinate\n"
+    "    vec2 clean_coords = sample_coords;\n"
+    "    vec3 clean_color = texture(u_scene_texture, clean_coords).rgb;\n"
+    "\n"
+    "    // 2. Calculate the fully distorted texture coordinate\n"
+    "    vec2 distorted_coords = screenDistort(sample_coords);\n"
+    "    float h_dist = sin(distorted_coords.y * 800.0 + u_time * 8.0) * 0.01;\n"
+    "    float v_dist = sin(distorted_coords.x * 600.0 + u_time * 6.0) * 0.005;\n"
+    "    distorted_coords += vec2(h_dist, v_dist);\n"
+    "    float vShift = 0.4 * onOff(2.0,3.0,0.9,u_time)*(sin(u_time)*sin(u_time*20.0) + (0.5 + 0.1*sin(u_time*200.0)*cos(u_time)));\n"
+    "    distorted_coords.y = mod(distorted_coords.y + vShift, 1.0);\n"
+    "    \n"
+    "    // 3. Blend between clean and distorted coordinates based on glitch_amount\n"
+    "    vec2 final_coords = mix(clean_coords, distorted_coords, glitch_amount);\n"
+    "\n"
+    "    // 4. Sample the texture and apply chromatic aberration\n"
+    "    vec3 color = chromaticAberration(u_scene_texture, final_coords, glitch_amount * 0.015);\n"
+    "\n"
+    "    // 5. Calculate all additive glitch effects (noise, stripes)\n"
+    "    float vigAmt = 3.0 + 0.3*sin(u_time + 5.0*cos(u_time*5.0));\n"
+    "    float vignette = (1.0 - vigAmt*(v_texcoord.y-0.5)*(v_texcoord.y-0.5)) * (1.0-vigAmt*(v_texcoord.x-0.5)*(v_texcoord.x-0.5));\n"
+    "    vec3 additive_glitches = vec3(0.0);\n"
+    "    additive_glitches += stripes(v_texcoord, u_time);\n"
+    "    additive_glitches += noise(v_texcoord * 2.0) * 0.5;\n"
+    "    additive_glitches *= vignette;\n"
+    "    additive_glitches *= (12.0 + mod(v_texcoord.y*30.0 + u_time, 1.0)) / 13.0;\n"
+    "\n"
+    "    // 6. Apply the glitches based on glitch_amount\n"
+    "    color += additive_glitches * glitch_amount;\n"
+    "\n"
+    "    // 7. Apply the flash, which is independent of the main glitch amount\n"
+    "    if (turning_on) {\n"
+    "        float flash_intensity = smoothstep(0.35, 0.0, progress) * 0.6;\n"
+    "        vec3 flash_color = vec3(1.8, 1.7, 1.6);\n"
+    "        color = mix(color, flash_color, flash_intensity);\n"
+    "    }\n"
+    "\n"
+    "    // 8. FINAL MIX: Blend the fully glitched color back to the clean color as the animation finishes.\n"
+    "    // When eased_progress is 1.0, glitch_amount is 0.0, so this becomes 100% clean_color.\n"
+    "    vec3 final_color = mix(color, clean_color, 1.0 - glitch_amount);\n"
+    "\n"
+    "    FragColor = vec4(clamp(final_color, 0.0, 1.0), 1.0);\n"
+    "}\n";
+*/
+
+//swirl
+/*
+static const char *post_process_frag =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "\n"
+    "uniform sampler2D u_scene_texture;\n"
+    "uniform float u_time;\n"
+    "uniform vec2 iResolution;\n"
+    "\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 FragColor;\n"
+    "\n"
+    "void main() {\n"
+    "    // --- TIMING & PROGRESS ---\n"
+    "    float cycle_duration = 5.0;\n"
+    "    float half_cycle = cycle_duration / 2.0;\n"
+    "    float time_in_cycle = mod(u_time, cycle_duration);\n"
+    "    float progress;\n"
+    "    bool flowing_in = (time_in_cycle < half_cycle);\n"
+    "    if (flowing_in) { \n"
+    "        progress = time_in_cycle / half_cycle; \n"
+    "    } else { \n"
+    "        progress = 1.0 - (time_in_cycle - half_cycle) / half_cycle; \n"
+    "    }\n"
+    "    \n"
+    "    float smooth_progress = smoothstep(0.0, 1.0, progress);\n"
+    "    \n"
+    "    // --- LIQUID FLOW DISTORTION ---\n"
+    "    vec2 uv = v_texcoord;\n"
+    "    \n"
+    "    // Create flowing liquid motion\n"
+    "    float wave1 = sin(uv.x * 6.0 + u_time * 2.0) * 0.03;\n"
+    "    float wave2 = sin(uv.y * 6.0 - u_time * 2.0) * 0.03;\n"
+    "    float wave3 = sin((uv.x + uv.y) * 10.0 + u_time * 3.0) * 0.02;\n"
+    "    \n"
+    "    // Flowing displacement based on progress\n"
+    "    vec2 flow_offset = vec2(wave1, wave2 ) * smooth_progress;\n"
+    "    \n"
+    "    // Radial distortion from center\n"
+    "    vec2 center = vec2(0.5);\n"
+    "    vec2 to_center = center - uv;\n"
+    "    float dist_to_center = length(to_center);\n"
+    "    \n"
+    "    // Smooth radial flow\n"
+    "    float radial_strength = smooth_progress * 0.01;\n"
+    "    vec2 radial_flow = normalize(to_center) * sin(dist_to_center * 175.0 - u_time * 4.0) * radial_strength;\n"
+    "    \n"
+    "    // Combine distortions\n"
+    "    vec2 distorted_uv = uv + flow_offset + radial_flow;\n"
+    "    \n"
+    "    // --- SAMPLING ---\n"
+    "    vec3 original_color = texture(u_scene_texture, uv).rgb;\n"
+    "    vec3 distorted_color = texture(u_scene_texture, distorted_uv).rgb;\n"
+    "    \n"
+    "    // --- FINAL BLEND ---\n"
+    "    vec3 final_color = mix(distorted_color, distorted_color, smooth_progress);\n"
+    "    \n"
+    "    FragColor = vec4(final_color, 1.0);\n"
+    "}\n";*/
+//crt
+/**/
+ static const char *post_process_frag =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "\n"
+    "// The texture containing our fully rendered scene\n"
+    "uniform sampler2D u_scene_texture;\n"
+    "// A time uniform, useful for animated effects\n"
+    "uniform float u_time;\n"
+    "uniform vec2 iResolution;\n"
+    "\n"
+    "// The texture coordinate received from the vertex shader\n"
+    "in vec2 v_texcoord;\n"
+    "\n"
+    "// The final output color for the pixel\n"
+    "out vec4 FragColor;\n"
+    "\n"
+    "// Enhanced CRT effect parameters\n"
+    "const float SCANLINE_INTENSITY = 0.6;\n"
+    "const float CHROMATIC_ABERRATION = 0.018;\n"
+    "const float BRIGHTNESS = 2.0;\n"
+    "const float CONTRAST = 1.3;\n"
+    "const float VIGNETTE_STRENGTH = 0.5;\n"
+    "const float FLICKER_INTENSITY = 0.18;\n"
+    "const float PHOSPHOR_GLOW = 0.3;\n"
+    "const float SCREEN_CURVE = 0.3;\n"
+    "\n"
+    "// Apply screen curvature like old CRT monitors\n"
+    "vec2 screenCurve(vec2 uv) {\n"
+    "    uv = uv * 2.0 - 1.0;\n"
+    "    vec2 offset = abs(uv.yx) * SCREEN_CURVE;\n"
+    "    uv = uv + uv * offset * offset;\n"
+    "    uv = uv * 0.5 + 0.5;\n"
+    "    return uv;\n"
+    "}\n"
+    "\n"
+    "// Generate enhanced scanlines with phosphor effect\n"
+    "float scanline(vec2 uv) {\n"
+    "    float line = sin(uv.y * 1000.0) * 0.5 + 0.5;\n"
+    "    float scanlineEffect = pow(line, 2.0);\n"
+    "    return 1.0 - SCANLINE_INTENSITY * (1.0 - scanlineEffect);\n"
+    "}\n"
+    "\n"
+    "// RGB phosphor pattern simulation\n"
+    "vec3 phosphorPattern(vec2 uv, vec3 color) {\n"
+    "    vec2 pixel = uv * iResolution.xy;\n"
+    "    \n"
+    "    // Create RGB sub-pixel pattern\n"
+    "    float subPixel = mod(pixel.x, 3.0);\n"
+    "    vec3 phosphor = vec3(1.0);\n"
+    "    \n"
+    "    if (subPixel < 1.0) {\n"
+    "        phosphor = vec3(1.2, 0.8, 0.8); // Red phosphor\n"
+    "    } else if (subPixel < 2.0) {\n"
+    "        phosphor = vec3(0.8, 1.2, 0.8); // Green phosphor\n"
+    "    } else {\n"
+    "        phosphor = vec3(0.8, 0.8, 1.2); // Blue phosphor\n"
+    "    }\n"
+    "    \n"
+    "    return color * mix(vec3(1.0), phosphor, PHOSPHOR_GLOW);\n"
+    "}\n"
+    "\n"
+    "// Apply vignette effect\n"
+    "float vignette(vec2 uv) {\n"
+    "    float dist = distance(uv, vec2(0.5));\n"
+    "    return 1.0 - smoothstep(0.3, 0.8, dist) * VIGNETTE_STRENGTH;\n"
+    "}\n"
+    "\n"
+    "// Enhanced flicker with multiple frequencies\n"
+    "float flicker(float time) {\n"
+    "    float flick1 = sin(time * 15.0) * 0.5 + 0.5;\n"
+    "    float flick2 = sin(time * 30.0 + 3.14159) * 0.3 + 0.7;\n"
+    "    float flick3 = sin(time * 60.0) * 0.1 + 0.9;\n"
+    "    return 1.0 + FLICKER_INTENSITY * (flick1 * flick2 * flick3 - 0.5);\n"
+    "}\n"
+    "\n"
+    "// Rolling interference lines\n"
+    "float interference(vec2 uv, float time) {\n"
+    "    float roll = sin((uv.y + time * 0.1) * 20.0) * 0.02;\n"
+    "    float noise = sin((uv.y + time * 0.05) * 200.0) * 0.01;\n"
+    "    return 1.0 + roll + noise;\n"
+    "}\n"
+    "\n"
+    "void main() {\n"
+    "    // --- TIMING SYSTEM ---\n"
+    "    float cycle_duration = 5.0;\n"
+    "    float time_in_cycle = mod(u_time, cycle_duration);\n"
+    "    float effect_intensity = smoothstep(0.0, 1.0, time_in_cycle / cycle_duration);\n"
+    "    effect_intensity = sin(effect_intensity * 3.14159); // Smooth rise and fall\n"
+    "    \n"
+    "    // Apply screen curvature\n"
+    "    vec2 curved_uv = mix(v_texcoord, screenCurve(v_texcoord), effect_intensity);\n"
+    "    \n"
+    "    // Check if we're outside the curved screen bounds\n"
+    "    if (curved_uv.x < 0.0 || curved_uv.x > 1.0 || curved_uv.y < 0.0 || curved_uv.y > 1.0) {\n"
+    "        FragColor = vec4(0.0, 0.0, 0.0, 1.0);\n"
+    "        return;\n"
+    "    }\n"
+    "    \n"
+    "    // Sample with enhanced chromatic aberration - now with wavy horizontal shift\n"
+    "    float wave = sin(curved_uv.y * 10.0 + u_time * 10.0) * 0.5;\n"
+    "    float aberration = CHROMATIC_ABERRATION * effect_intensity * (1.0 + wave);\n"
+    "    vec2 offset = vec2(aberration, 0.0);\n"
+    "    float r = texture(u_scene_texture, curved_uv + offset).r;\n"
+    "    float g = texture(u_scene_texture, curved_uv).g;\n"
+    "    float b = texture(u_scene_texture, curved_uv - offset).b;\n"
+    "    \n"
+    "    vec3 color = vec3(r, g, b);\n"
+    "    \n"
+    "    // Apply brightness and contrast\n"
+    "    float brightness = mix(1.0, BRIGHTNESS, effect_intensity);\n"
+    "    float contrast = mix(1.0, CONTRAST, effect_intensity);\n"
+    "    color = color * brightness;\n"
+    "    color = (color - 0.5) * contrast + 0.5;\n"
+    "    \n"
+    "    // Apply scanlines\n"
+    "    float scanline_effect = mix(1.0, scanline(curved_uv), effect_intensity);\n"
+    "    color *= scanline_effect;\n"
+    "    \n"
+    "    // Apply phosphor pattern\n"
+    "    color = mix(color, phosphorPattern(curved_uv, color), effect_intensity);\n"
+    "    \n"
+    "    // Apply vignette\n"
+    "    float vignette_effect = mix(1.0, vignette(curved_uv), effect_intensity);\n"
+    "    color *= vignette_effect;\n"
+    "    \n"
+    "    // Apply flicker\n"
+    "    float flicker_effect = mix(1.0, flicker(u_time), effect_intensity);\n"
+    "    color *= flicker_effect;\n"
+    "    \n"
+    "    // Apply interference\n"
+    "    float interference_effect = mix(1.0, interference(curved_uv, u_time), effect_intensity);\n"
+    "    color *= interference_effect;\n"
+    "    \n"
+    "    // Add authentic CRT green tint\n"
+    "    color.g *= mix(1.0, 1.08, effect_intensity);\n"
+    "    \n"
+    "    // Add slight warm glow\n"
+    "    vec3 glow = vec3(0.02, 0.01, 0.0) * effect_intensity;\n"
+    "    color += glow;\n"
+    "    \n"
+    "    // Clamp to prevent over-brightness\n"
+    "    color = clamp(color, 0.0, 1.0);\n"
+    "    \n"
+    "    FragColor = vec4(color, 1.0);\n"
+    "}\n";
     setenv("MESA_VK_VERSION_OVERRIDE", "1.2", 1);
     setenv("MESA_LOADER_DRIVER_OVERRIDE", "zink", 1);
    // setenv("GALLIUM_DRIVER", "zink", 1);
@@ -6819,8 +7054,17 @@ static const char *background_fragment_shader_src =
     }
 
     struct tinywl_server server = {0};
+    server.tv_is_on = true; // Start with the TV on
+       server.tv_effect_animating = false; // The effect is off by default
+    server.tv_effect_start_time = 0.0f;
+    server.tv_effect_duration = 5.0f; // This is our 0 -> 5 second timeline
     server.expo_effect_active = false;
-
+server.effect_is_target_zoomed=true;
+server.effect_anim_current_factor=0.0;
+ // <<< ADD THIS INITIALIZATION >>>
+       server.tv_effect_animating = false; // Start with the animation off
+    server.tv_effect_start_time = 0.0f;
+    server.tv_effect_duration = 5.0f; // The animation lasts 5 seconds
 // Initialize all lists
     wl_list_init(&server.toplevels);
     wl_list_init(&server.outputs);
@@ -7099,6 +7343,28 @@ for (int i = 0; i < 4; ++i) {
         return 1;
     }
 }
+
+  struct shader_uniform_spec post_process_uniforms[] = {
+        // The texture containing the entire pre-rendered scene.
+        // The shader expects this on texture unit 0, which we set with glUniform1i.
+        {"u_scene_texture", &server.post_process_shader_tex_loc},
+        // A time value (in seconds) for creating animated effects.
+        {"u_time", &server.post_process_shader_time_loc},
+        {"iResolution",     &server.post_process_shader_resolution_loc}
+    };
+
+    // 2. Call your generic function to create the shader program.
+    //    It will populate server.post_process_shader_program and the uniform locations.
+    if (!create_generic_shader_program(server.renderer, "PostProcessShader",
+                                     post_process_vert, post_process_frag,
+                                     &server.post_process_shader_program,
+                                     post_process_uniforms, 
+                                     sizeof(post_process_uniforms) / sizeof(post_process_uniforms[0]))) {
+        wlr_log(WLR_ERROR, "Failed to create the final post-processing shader program.");
+        // Your error handling here, e.g.:
+        server_destroy(&server); 
+        return 1;
+    }
 
     // Initialize zoom effect variables
     // Initialize zoom effect variables
