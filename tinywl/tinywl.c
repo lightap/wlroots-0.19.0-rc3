@@ -2431,31 +2431,37 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
 
 
     // --- Preview Rendering (modified for sequential positioning) ---
-if (toplevel && server->top_panel_node && server->top_panel_node->enabled &&
-    texture) { // Ensure texture is still valid
-
-    bool should_preview_this_toplevel = true;
-    
-    if (should_preview_this_toplevel) {
-        wlr_log(WLR_INFO, "[SCENE_ITERATOR_PREVIEW:%s] Rendering preview for '%s' onto panel.", output_name_log, tl_title_for_log);
+    // --- Preview Rendering (Corrected for per-desktop spacing) ---
+    if (toplevel && server->top_panel_node && server->top_panel_node->enabled && texture) {
         struct wlr_scene_rect *panel_srect = wlr_scene_rect_from_node(server->top_panel_node);
 
         if (panel_srect) {
+            // This toplevel is being rendered as part of the FBO for 'rdata->desktop_index'.
+            // We need to calculate its position in the panel based on its order *among other
+            // windows on the same desktop*.
+
+            int per_desktop_index = 0;
+            struct tinywl_toplevel *iter_tl;
+            wl_list_for_each(iter_tl, &server->toplevels, link) {
+                // Only consider windows that belong to the currently rendered desktop.
+                if (iter_tl->desktop == rdata->desktop_index) {
+                    if (iter_tl == toplevel) {
+                        // We've found the current toplevel. The count is its index.
+                        break;
+                    }
+                    // This is a different window on the same desktop that comes earlier.
+                    per_desktop_index++;
+                }
+            }
+
+            wlr_log(WLR_INFO, "[SCENE_ITERATOR_PREVIEW:%s] Rendering preview for '%s' for desktop %d at per-desktop index %d.",
+                    output_name_log, tl_title_for_log, rdata->desktop_index, per_desktop_index);
+
             int panel_screen_x = server->top_panel_node->x;
             int panel_screen_y = server->top_panel_node->y;
 
-            // Calculate this toplevel's index in the list
-            int toplevel_index = 0;
-            struct tinywl_toplevel *current_tl;
-            wl_list_for_each(current_tl, &server->toplevels, link) {
-                if (current_tl == toplevel) {
-                    break;
-                }
-                toplevel_index++;
-            }
-
-            // Position each preview at 20-pixel intervals: 20, 40, 60, etc.
-            float preview_x_offset_in_panel = 20.0f + (toplevel_index * 100.0f);
+            // Position each preview based on its per-desktop index.
+            float preview_x_offset_in_panel = 20.0f + (per_desktop_index * 100.0f);
             float preview_y_padding_in_panel = 5.0f;
             float preview_height_pixels = (float)panel_srect->height - 2.0f * preview_y_padding_in_panel;
             if (preview_height_pixels < 1.0f) preview_height_pixels = 1.0f;
@@ -2478,7 +2484,6 @@ if (toplevel && server->top_panel_node && server->top_panel_node->enabled &&
             };
 
             if (preview_box_on_screen.width > 0 && preview_box_on_screen.height > 0) {
-                // Rest of the preview rendering code remains the same...
                 float preview_mvp[9];
                 float p_box_scale_x = (float)preview_box_on_screen.width * (2.0f / output->width);
                 float p_box_scale_y = (float)preview_box_on_screen.height * (-2.0f / output->height);
@@ -2487,7 +2492,7 @@ if (toplevel && server->top_panel_node && server->top_panel_node->enabled &&
                 float p_model_view[9] = { p_box_scale_x, 0.0f, 0.0f, 0.0f, p_box_scale_y, 0.0f, p_box_translate_x, p_box_translate_y, 1.0f };
 
                 memcpy(preview_mvp, p_model_view, sizeof(p_model_view));
-                
+
                 // Apply output transform to the preview MVP
                 if (output->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
                     float temp_preview_mvp[9];
@@ -2498,12 +2503,10 @@ if (toplevel && server->top_panel_node && server->top_panel_node->enabled &&
                     wlr_matrix_multiply(preview_mvp, output_transform_matrix, temp_preview_mvp);
                 }
 
-
-
                 // Re-set uniforms for the preview draw call
                 GLint preview_mvp_loc = glGetUniformLocation(server->shader_program, "mvp");
                 if (preview_mvp_loc != -1) glUniformMatrix3fv(preview_mvp_loc, 1, GL_FALSE, preview_mvp);
-                
+
                 GLint preview_tex_loc = glGetUniformLocation(server->shader_program, "texture_sampler_uniform");
                 if (preview_tex_loc != -1) {
                     glActiveTexture(GL_TEXTURE0);
@@ -2519,8 +2522,8 @@ if (toplevel && server->top_panel_node && server->top_panel_node->enabled &&
                 }
 
                 glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
-                wlr_log(WLR_DEBUG, "[SCENE_ITERATOR_PREVIEW:%s] Drew preview #%d for '%s' at %d,%d %dx%d",
-                       output_name_log, toplevel_index, tl_title_for_log,
+                wlr_log(WLR_DEBUG, "[SCENE_ITERATOR_PREVIEW:%s] Drew preview for '%s' at %d,%d %dx%d",
+                       output_name_log, tl_title_for_log,
                        preview_box_on_screen.x, preview_box_on_screen.y,
                        preview_box_on_screen.width, preview_box_on_screen.height);
 
@@ -2534,8 +2537,6 @@ if (toplevel && server->top_panel_node && server->top_panel_node->enabled &&
             wlr_log(WLR_ERROR, "[SCENE_ITERATOR_PREVIEW:%s] Panel node is not a wlr_scene_rect, cannot get dimensions.", output_name_log);
         }
     }
-}
-
     // Cleanup like second version
     if (tex_loc != -1) {
         glActiveTexture(GL_TEXTURE0);
