@@ -310,6 +310,7 @@ struct desktop_fb {
 
 
 int DestopGridSize ; // 2x2 grid for 4 desktops
+float GLOBAL_vertical_offset;
 
 struct tinywl_server {
     struct wl_display *wl_display;
@@ -477,6 +478,9 @@ struct wl_listener pointer_motion;
     GLint cube_shader_zoom_loc;
     GLint cube_shader_zoom_center_loc;
     GLint cube_shader_quadrant_loc;
+     GLint cube_shader_vertical_offset_loc;
+     GLint cube_shader_global_vertical_offset_loc;
+
 
 
 
@@ -519,6 +523,12 @@ struct wl_listener pointer_motion;
     
     float cube_zoom_center_x;
     float cube_zoom_center_y;
+
+    // Add these to your server struct:
+ float current_interpolated_vertical_offset;
+ float target_vertical_offset;
+ float vertical_offset_animation_start_time;
+ bool vertical_offset_animating;
 
 
     struct wlr_xdg_decoration_manager_v1 *xdg_decoration_manager;
@@ -1351,6 +1361,7 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
         }
     }
 
+    
 
    if (!handled_by_compositor && event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
         if (!(modifiers & (WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT | WLR_MODIFIER_SHIFT | WLR_MODIFIER_LOGO))) {
@@ -1377,6 +1388,33 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
                 break; // Key handled, exit loop
             }
             // <<< END OF NEW CODE >>>
+
+            if (syms[i] == XKB_KEY_w || syms[i] == XKB_KEY_W) {
+                     if (server->cube_effect_active) {
+                       GLOBAL_vertical_offset += 1.2;
+                    } else {
+                        
+                    }
+                    update_toplevel_visibility(server);
+                    handled_by_compositor = true;
+                    break;
+                }
+
+                // --- BINDING: Toggle Cube View ('L' key) ---
+                if (syms[i] == XKB_KEY_S || syms[i] == XKB_KEY_s) {
+                     if (server->cube_effect_active) {
+                        GLOBAL_vertical_offset -= 1.2;
+                    } else {
+                       
+                    }
+                    update_toplevel_visibility(server);
+                    handled_by_compositor = true;
+                    break;
+                }
+            
+
+   
+
                 // --- BINDING: Toggle Expo View ('P' key) ---
                 if (syms[i] == XKB_KEY_p || syms[i] == XKB_KEY_P) {
                      if (!server->expo_effect_active) {
@@ -3914,45 +3952,93 @@ if (effects_frame_fbo_path) {
          glUniform1i(server->fullscreen_shader_desktop_grid_loc,DestopGridSize);
     }
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
-    } else if (server->cube_effect_active) {
-        // FIX 4: Proper alpha handling for cube effect
-        float now_float_sec = get_monotonic_time_seconds_as_float();
-        start_quadrant_animation(server->current_desktop, now_float_sec);
-        float animated_rotation = update_rotation_animation(server, now_float_sec);
-        last_rendered_rotation = animated_rotation;
+    } 
+else if (server->cube_effect_active) {
+    // FIX 4: Proper alpha handling for cube effect
+    float now_float_sec = get_monotonic_time_seconds_as_float();
+    start_quadrant_animation(server->current_desktop, now_float_sec);
+    float animated_rotation = update_rotation_animation(server, now_float_sec);
+    last_rendered_rotation = animated_rotation;
 
-        // Background rendering with proper alpha
-        glDisable(GL_DEPTH_TEST);
-        glEnable(GL_BLEND);  // Ensure blending for background
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    // Interpolate vertical offset
+    if (server->vertical_offset_animating) {
+        float animation_duration = 0.5f; // 0.5 seconds for smooth transition
+        float elapsed = now_float_sec - server->vertical_offset_animation_start_time;
+        float t = elapsed / animation_duration;
         
-        glUseProgram(server->cube_background_shader_program);
-        glUniform1f(server->cube_background_shader_time_loc, now_float_sec);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        if (t >= 1.0f) {
+            // Animation complete
+            t = 1.0f;
+            server->vertical_offset_animating = false;
+            server->current_interpolated_vertical_offset = server->target_vertical_offset;
+        } else {
+            // Smooth interpolation using ease-out curve
+            t = 1.0f - (1.0f - t) * (1.0f - t); // Quadratic ease-out
+            server->current_interpolated_vertical_offset = 
+                server->current_interpolated_vertical_offset * (1.0f - t) + 
+                server->target_vertical_offset * t;
+        }
+    } else {
+        // Check if we need to start a new animation
+        if (fabs(GLOBAL_vertical_offset - server->target_vertical_offset) > 0.01f) {
+            server->target_vertical_offset = GLOBAL_vertical_offset;
+            server->vertical_offset_animation_start_time = now_float_sec;
+            server->vertical_offset_animating = true;
+        }
+    }
 
-        // Cube rendering with depth and alpha
-        glEnable(GL_DEPTH_TEST);
-        glDepthFunc(GL_LESS);
-        glEnable(GL_CULL_FACE);
-        glFrontFace(GL_CCW);
-        // Keep blending enabled for cube faces
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        
-        glBindVertexArray(server->cube_vao);
-        glUseProgram(server->cube_shader_program);
+    // Background rendering with proper alpha
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);  // Ensure blending for background
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    
+    glUseProgram(server->cube_background_shader_program);
+    glUniform1f(server->cube_background_shader_time_loc, now_float_sec);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
-        glUniform1f(server->cube_shader_time_loc, animated_rotation);
-        glUniform1f(server->cube_shader_zoom_loc, server->cube_anim_current_factor);
-        glUniform1i(server->cube_shader_quadrant_loc, server->current_desktop);
+    // Cube rendering with depth and alpha
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
+    glEnable(GL_CULL_FACE);
+    glFrontFace(GL_CCW);
+    // Keep blending enabled for cube faces
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    
+    glBindVertexArray(server->cube_vao);
+    glUseProgram(server->cube_shader_program);
 
-        for(int i = 0; i < server->num_desktops; ++i) {
+    glUniform1f(server->cube_shader_time_loc, animated_rotation);
+    glUniform1f(server->cube_shader_zoom_loc, server->cube_anim_current_factor);
+    glUniform1i(server->cube_shader_quadrant_loc, server->current_desktop);
+
+    // Loop 4 times with vertical offset
+    for(int loop = 0; loop < 4; ++loop) {
+        for(int i = 0; i < server->num_desktops/4; ++i) {
             glActiveTexture(GL_TEXTURE0 + i);
-            glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[i]);
+            glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[i+(loop*4)]);
             glUniform1i(server->cube_shader_scene_tex0_loc + i, i);
         }
+
+        float vertical_offset = (float)loop * -1.2f; // Local offset for each cube
+        glUniform1f(server->cube_shader_vertical_offset_loc, vertical_offset);
+        
+        // Use interpolated global vertical offset for smooth animation
+        glUniform1f(server->cube_shader_global_vertical_offset_loc, server->current_interpolated_vertical_offset);
+        
         glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_INT, 0);
     }
+    
+    // Schedule next frame if still animating
+    if (server->vertical_offset_animating) {
+        struct tinywl_output *output;
+        wl_list_for_each(output, &server->outputs, link) {
+            if (output->wlr_output && output->wlr_output->enabled) {
+                wlr_output_schedule_frame(output->wlr_output);
+            }
+        }
+    }
+}
 } else {
     // --- Normal Path: Render the current desktop directly into post_process_fbo ---
     // FIX 5: Ensure proper blending for normal desktop rendering
@@ -6196,6 +6282,8 @@ static const char *cube_vertex_shader_src =
        "uniform float u_zoom;           // Zoom factor (higher is further away)\n"
        "uniform float u_rotation_y;     // The final Y rotation angle from C code\n"
        "uniform float u_time;           // Time uniform for animation (add this to your C code)\n"
+       "uniform float u_vertical_offset; // Vertical movement offset\n"
+       "uniform float GLOBAL_u_vertical_offset; // Vertical movement offset\n"
        "\n"
        "out vec2 v_texcoord_to_fs;\n"
        "out float v_face_id;\n"
@@ -6239,6 +6327,8 @@ static const char *cube_vertex_shader_src =
        "    \n"
        "    pos = rotY * rotX * pos;\n"
        "    pos.z -= zoom_distance;\n"
+       "   pos.y += u_vertical_offset;\n"
+       "   pos.y += GLOBAL_u_vertical_offset;\n"
        "\n"
        "    mat4 proj = perspective(45.0 * 3.14159 / 180.0, 1.0, 0.1, 10.0);\n"
        "    gl_Position = proj * pos;\n"
@@ -8139,8 +8229,9 @@ if (!create_generic_shader_program(server.renderer, "ScaledSceneViewShader",
         {"u_zoom_center", &server.cube_shader_zoom_center_loc},
          {"u_zoom", &server.cube_shader_zoom_loc},
         {"u_rotation_y", &server.cube_shader_time_loc}, // RENAMED in shader, but C variable is the same
-        {"u_quadrant", &server.cube_shader_quadrant_loc}
-        
+        {"u_quadrant", &server.cube_shader_quadrant_loc},
+        {"u_vertical_offset", &server.cube_shader_vertical_offset_loc}, // Not used, but defined for consistency
+         {"GLOBAL_u_vertical_offset", &server.cube_shader_global_vertical_offset_loc} 
     };
 
 if (!create_generic_shader_program(server.renderer, "CubeShader",
