@@ -1,3 +1,24 @@
+/*Copyright (c) 2025 Andrew Pliatsikas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+*/
+
 #include <wlr/types/wlr_xdg_shell.h>
 #include <assert.h>
 #include <getopt.h>
@@ -288,6 +309,8 @@ struct desktop_fb {
 };
 
 
+int DestopGridSize ; // 2x2 grid for 4 desktops
+
 struct tinywl_server {
     struct wl_display *wl_display;
     struct wlr_backend *backend;
@@ -397,20 +420,40 @@ struct wl_listener pointer_motion;
     // Fullscreen shader effect (as before)
     GLuint fullscreen_shader_program;
     GLint fullscreen_shader_mvp_loc;
-     GLint fullscreen_shader_time_loc; // Keep if shader uses it for non-rotation anim
+     GLint fullscreen_shader_time_loc;
+      // Keep if shader uses it for non-rotation anim
     GLint fullscreen_shader_scene_tex0_loc;
    GLint fullscreen_shader_scene_tex1_loc;
     GLint fullscreen_shader_scene_tex2_loc;
     GLint fullscreen_shader_scene_tex3_loc;
-    GLint fullscreen_shader_tex_matrix_loc;   // Location for texture matrix uniform
- GLint fullscreen_shader_resolution_loc;
 
+     GLint fullscreen_shader_scene_tex4_loc;
+   GLint fullscreen_shader_scene_tex5_loc;
+    GLint fullscreen_shader_scene_tex6_loc;
+    GLint fullscreen_shader_scene_tex7_loc;
+
+     GLint fullscreen_shader_scene_tex8_loc;
+   GLint fullscreen_shader_scene_tex9_loc;
+    GLint fullscreen_shader_scene_tex10_loc;
+    GLint fullscreen_shader_scene_tex11_loc;
+
+     GLint fullscreen_shader_scene_tex12_loc;
+   GLint fullscreen_shader_scene_tex13_loc;
+    GLint fullscreen_shader_scene_tex14_loc;
+    GLint fullscreen_shader_scene_tex15_loc;
+
+    GLint fullscreen_shader_desktop_grid_loc;
+  
+ GLint fullscreen_shader_resolution_loc;
+    GLint fullscreen_switch_mode;
+     GLint fullscreen_switchXY; 
 
    // GLint fullscreen_shader_current_quad_loc;   
 
 
 // Add these new zoom uniform locations:
     GLint fullscreen_shader_zoom_loc;
+    GLint fullscreen_shader_move_loc;
     GLint fullscreen_shader_zoom_center_loc;
     GLint fullscreen_shader_quadrant_loc;
 
@@ -482,25 +525,25 @@ struct wl_listener pointer_motion;
 struct wl_listener xdg_decoration_new;
 
  // Instead of single desktop_fbos[0], use arrays or separate fields:
-    GLuint desktop_fbos[4];        // Support up to 4 virtual desktops
-    GLuint desktop_rbos[4];        // Render buffer objects if needed
-int intermediate_width[4];
-int intermediate_height[4];
-GLuint intermediate_texture[4];
-GLuint intermediate_rbo[4];
+    GLuint desktop_fbos[16];        // Support up to 4 virtual desktops
+    GLuint desktop_rbos[16];        // Render buffer objects if needed
+int intermediate_width[16];
+int intermediate_height[16];
+GLuint intermediate_texture[16];
+GLuint intermediate_rbo[16];
 
-    int desktop_count;             // Number of active desktops
+             
     int current_desktop;
      struct desktop_fb *desktops;
     int num_desktops;
 
      int pending_desktop_switch;
 
-       GLuint desktop_background_shaders[4];
-    GLint desktop_bg_shader_mvp_loc[4];
-    GLint desktop_bg_shader_time_loc[4];
-    GLint desktop_bg_shader_res_loc[4];
-    GLint desktop_bg_shader_color_loc[4]; // In case your shaders use a base color
+       GLuint desktop_background_shaders[16];
+    GLint desktop_bg_shader_mvp_loc[16];
+    GLint desktop_bg_shader_time_loc[16];
+    GLint desktop_bg_shader_res_loc[16];
+    GLint desktop_bg_shader_color_loc[16]; // In case your shaders use a base color
 
    // New cube geometry (add these)
     GLuint cube_vao, cube_vbo, cube_ibo;
@@ -528,6 +571,7 @@ GLuint intermediate_rbo[4];
     float tv_effect_start_time;
     float tv_effect_duration; 
     bool tv_is_on; 
+    
 
 };
 
@@ -675,6 +719,9 @@ struct shader_uniform_spec {
     const char *name;       // Name of the uniform in GLSL
     GLint *location_ptr;  // Pointer to where the GLint location should be stored
 };
+
+   int switch_mode=0;
+    int switchXY=0;
 
 
 /* Function declarations */
@@ -1308,13 +1355,37 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
    if (!handled_by_compositor && event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
         if (!(modifiers & (WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT | WLR_MODIFIER_SHIFT | WLR_MODIFIER_LOGO))) {
             for (int i = 0; i < nsyms; i++) {
+
+                 // <<< START OF NEW CODE >>>
+            // BINDING: Cycle Expo Effect Mode ('A' key)
+            if (syms[i] == XKB_KEY_a || syms[i] == XKB_KEY_A) {
+                // Cycle between mode 0 (Zoom) and 1 (Slide)
+                switch_mode= (switch_mode + 1) % 2;
+                wlr_log(WLR_INFO, "Expo effect mode switched to: %s",
+                        switch_mode == 0 ? "Zoom" : "Slide");
+                handled_by_compositor = true;
+                break; // Key handled, exit loop
+            }
+
+            // BINDING: Toggle Expo Slide Direction ('Q' key)
+            if (syms[i] == XKB_KEY_q || syms[i] == XKB_KEY_Q) {
+                // Toggle between 0 (Horizontal) and 1 (Vertical)
+                switchXY = 1 - switchXY;
+                wlr_log(WLR_INFO, "Expo slide direction switched to: %s",
+                        switchXY== 0 ? "Horizontal" : "Vertical");
+                handled_by_compositor = true;
+                break; // Key handled, exit loop
+            }
+            // <<< END OF NEW CODE >>>
                 // --- BINDING: Toggle Expo View ('P' key) ---
                 if (syms[i] == XKB_KEY_p || syms[i] == XKB_KEY_P) {
                      if (!server->expo_effect_active) {
                         server->expo_effect_active = true;
                         wlr_log(WLR_INFO, "Expo Fullscreen Shader Effect ENABLED via 'P'.");
                         server->effect_is_target_zoomed = true;
+                     
                         server->effect_anim_start_factor = server->effect_zoom_factor_normal;
+                       
                         server->effect_anim_target_factor = server->effect_zoom_factor_zoomed;
                         if (fabs(server->effect_anim_start_factor - server->effect_anim_target_factor) > 1e-4f) {
                             server->effect_anim_start_time_sec = get_monotonic_time_seconds_as_float();
@@ -1322,7 +1393,9 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
                         }
                     } else {
                         server->effect_is_target_zoomed = !server->effect_is_target_zoomed;
+                      
                         server->effect_anim_start_factor = server->effect_anim_current_factor;
+                       
                         server->effect_anim_target_factor = server->effect_is_target_zoomed ?
                             server->effect_zoom_factor_zoomed : server->effect_zoom_factor_normal;
                         if (fabs(server->effect_anim_start_factor - server->effect_anim_target_factor) > 1e-4f) {
@@ -1369,10 +1442,12 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
         // --- BINDING: Switch Desktop ('O' key) ---
         if (!handled_by_compositor && !(modifiers & (WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT | WLR_MODIFIER_SHIFT | WLR_MODIFIER_LOGO))) {
             for (int i = 0; i < nsyms; i++) {
-                if (syms[i] == XKB_KEY_o) {
+                if (syms[i] == XKB_KEY_O || syms[i] == XKB_KEY_o){
                     int target_desktop = (server->current_desktop + 1) % server->num_desktops;
                     if (server->expo_effect_active) {
+                       if (switch_mode == 0) {
                         server->pending_desktop_switch = target_desktop;
+                       }
                         wlr_log(WLR_INFO, "Desktop switch to %d deferred.", target_desktop);
                     } else {
                         server->current_desktop = target_desktop;
@@ -1386,6 +1461,8 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
             }
         }
     }
+
+ 
 
 
     // <<< ADD THIS NEW BINDING FOR 'K' >>>
@@ -2637,7 +2714,7 @@ static void render_rect_node(struct wlr_scene_node *node, void *user_data) {
 
     if (is_main_background) {
         int desktop_idx = rdata->desktop_index;
-        if (desktop_idx < 0 || desktop_idx >= 4) {
+        if (desktop_idx < 0 || desktop_idx >= server->num_desktops) {
             desktop_idx = 0;
         }
 
@@ -2936,7 +3013,7 @@ static void render_panel_node(struct wlr_scene_node *node, void *user_data) {
         // DO NOT destroy `texture_for_preview` here (it's cached)
     }
 }
-
+/*
 static void render_desktop_content(struct tinywl_server *server,
                                    struct wlr_output *wlr_output,
                                    struct render_data *current_rdata,
@@ -3022,7 +3099,66 @@ if (desktop_to_render == 3) {
     glBindVertexArray(0);
     glUseProgram(0);
 }
+*/
 
+static void render_desktop_content(struct tinywl_server *server,
+                                   struct wlr_output *wlr_output,
+                                   struct render_data *current_rdata,
+                                   int desktop_to_render) {
+    if (server->quad_vao == 0) return;
+    glBindVertexArray(server->quad_vao);
+
+    // --- Render Desktop-Specific Chrome (Background, Panel, etc.) ---
+
+    // *** THE FIX IS HERE: Render the background on EVERY desktop. ***
+    // The specific shader for this desktop is chosen inside render_rect_node
+    // based on the `desktop_to_render` index passed in `current_rdata`.
+    if (server->main_background_node && server->main_background_node->enabled) {
+        render_rect_node(server->main_background_node, current_rdata);
+    }
+
+    // Render the top panel on every desktop. This part was already correct.
+    if (server->top_panel_node && server->top_panel_node->enabled) {
+        render_panel_node(server->top_panel_node, current_rdata);
+    }
+
+    // --- Render Windows (Surface + Decorations) ---
+    struct wlr_scene_node *iter_node_lvl1;
+    wl_list_for_each(iter_node_lvl1, &server->scene->tree.children, link) {
+        // Skip nodes that are disabled or are part of the desktop chrome we handled above
+        if (!iter_node_lvl1->enabled || iter_node_lvl1 == server->main_background_node || iter_node_lvl1 == server->top_panel_node) {
+            continue;
+        }
+
+        if (iter_node_lvl1->type == WLR_SCENE_NODE_TREE) {
+            struct tinywl_toplevel *toplevel_ptr = iter_node_lvl1->data;
+
+            // THIS IS THE KEY CHECK: Only render toplevels belonging to the target desktop
+            if (toplevel_ptr && toplevel_ptr->type == TINYWL_TOPLEVEL_XDG && toplevel_ptr->desktop == desktop_to_render) {
+                struct wlr_scene_tree *toplevel_s_tree = wlr_scene_tree_from_node(iter_node_lvl1);
+
+                // First render SSD decorations if enabled
+                if (toplevel_ptr->ssd.enabled) {
+                    struct wlr_scene_node *ssd_node_candidate;
+                    wl_list_for_each(ssd_node_candidate, &toplevel_s_tree->children, link) {
+                        if (ssd_node_candidate->enabled && ssd_node_candidate->type == WLR_SCENE_NODE_RECT) {
+                            render_rect_node(ssd_node_candidate, current_rdata);
+                        }
+                    }
+                }
+
+                // Then render the window surface/buffers
+                if (server->shader_program != 0) {
+                    glUseProgram(server->shader_program);
+                    wlr_scene_node_for_each_buffer(&toplevel_s_tree->node, scene_buffer_iterator, current_rdata);
+                }
+            }
+        }
+    }
+
+    glBindVertexArray(0);
+    glUseProgram(0);
+}
 
 // Helper function to manually create a texture transform matrix (if wlr_matrix_texture_transform is missing)
 // This is a simplified version. A full one would handle all 8 transforms.
@@ -3371,10 +3507,10 @@ static void output_frame(struct wl_listener *listener, void *data) {
     bool has_damage = wlr_scene_output_build_state(scene_output, &output_state_direct, &opts);
     
     // Check if we need effects or if we can use direct path
-    bool current_frame_fbo_path = server->expo_effect_active || server->cube_effect_active;
+    bool effects_frame_fbo_path = server->expo_effect_active || server->cube_effect_active;
     
     // Only do early exit if no effects are active
-    if (!current_frame_fbo_path && !has_damage && !(output_state_direct.committed & WLR_OUTPUT_STATE_BUFFER)) {
+    if (!effects_frame_fbo_path && !has_damage && !(output_state_direct.committed & WLR_OUTPUT_STATE_BUFFER)) {
         wlr_log(WLR_DEBUG, "[%s] Direct: No damage or buffer, skipping.", wlr_output->name);
         wlr_output_state_finish(&output_state_direct);
         wlr_scene_output_send_frame_done(scene_output, &now);
@@ -3466,7 +3602,9 @@ server->effect_is_target_zoomed=false;
             float t = (server->effect_anim_duration_sec > 1e-5f) ? (elapsed_sec / server->effect_anim_duration_sec) : 1.0f;
 
               if (t >= 1.0f) {
-                server->effect_anim_current_factor = server->effect_anim_target_factor;
+                 
+                        server->effect_anim_start_factor = server->effect_zoom_factor_normal;
+                       
                 server->effect_is_animating_zoom = false;
 
                 // This code block runs ONLY when the zoom-out animation finishes.
@@ -3511,13 +3649,18 @@ server->effect_is_target_zoomed=false;
                     
                 }
             } else {
+                 
                 server->effect_anim_current_factor = server->effect_anim_start_factor + (server->effect_anim_target_factor - server->effect_anim_start_factor) * t;
+                     
             }
         } else {
+            
             server->effect_anim_current_factor = server->effect_is_target_zoomed ? server->effect_zoom_factor_zoomed : server->effect_zoom_factor_normal;
+             
         }
     } else {
         server->effect_is_animating_zoom = false;
+       
         server->effect_anim_current_factor = server->effect_zoom_factor_normal;
     }
 
@@ -3612,7 +3755,7 @@ if (server->tv_effect_animating) {
     // =========================================================================================
     // --- STAGE 1 (Conditional): Prepare Textures for Multi-Desktop Effects ---
     // =========================================================================================
-    if (current_frame_fbo_path) {
+    if (effects_frame_fbo_path) {
         // When an effect is active, enable all toplevels in the scene so they can be
         // rendered into their respective desktop FBOs.
         struct tinywl_toplevel *toplevel;
@@ -3621,9 +3764,9 @@ if (server->tv_effect_animating) {
                 wlr_scene_node_set_enabled(&toplevel->scene_tree->node, toplevel->scale > 0.01);
             }
         }
-      if (server->effect_anim_current_factor<2.0){
+      if (server->effect_anim_current_factor<2.0 ||switch_mode==1){
         // Setup and render each desktop into its own intermediate FBO.
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < server->num_desktops; ++i) {
     if (!setup_intermediate_framebuffer(server, wlr_output->width, wlr_output->height, i)) {
          wlr_log(WLR_ERROR, "Failed to setup desktop FBO %d. Aborting frame.", i);
          goto cleanup_frame;
@@ -3650,7 +3793,7 @@ if (server->tv_effect_animating) {
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-}}else if (server->effect_anim_current_factor==2.0){
+}}else if (server->effect_anim_current_factor==2.0 && switch_mode==0) {
         // Setup and render each desktop into its own intermediate FBO.
      int target_quadrant = server->pending_desktop_switch != -1 ? server->pending_desktop_switch : server->current_desktop;
          
@@ -3715,10 +3858,10 @@ glClearColor(0.0f, 0.0f, 0.0f, 0.0f);  // Changed alpha from 1.0f to 0.0f
 glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
 // Now, draw either the effect view or the normal desktop view INTO this FBO.
-if (current_frame_fbo_path) {
+if (effects_frame_fbo_path) {
     // --- Effect Path: Render Expo or Cube effect using textures from Stage 1 ---
     if (server->expo_effect_active) {
-        if (server->effect_anim_current_factor<2.0)
+        if (server->effect_anim_current_factor<2.0 ||switch_mode==1)
         {
         // FIX 3: Ensure consistent GL state for expo
         glDisable(GL_DEPTH_TEST);
@@ -3730,15 +3873,23 @@ if (current_frame_fbo_path) {
         glUseProgram(server->fullscreen_shader_program);
         
         glUniform1f(server->fullscreen_shader_zoom_loc, server->effect_anim_current_factor);
+        glUniform1f(server->fullscreen_shader_move_loc, server->effect_anim_current_factor);
+
         int target_quadrant = server->pending_desktop_switch != -1 ? server->pending_desktop_switch : server->current_desktop;
-        glUniform1i(server->fullscreen_shader_quadrant_loc, target_quadrant);
         
-        for(int i = 0; i < 4; ++i) {
+        glUniform1i(server->fullscreen_shader_quadrant_loc, target_quadrant);
+        glUniform1i(server->fullscreen_switch_mode, switch_mode);
+        glUniform1i(server->fullscreen_switchXY, switchXY);
+        // Bind all 4 textures for the fullscreen shader
+        
+        for(int i = 0; i < server->num_desktops; ++i) {
             glActiveTexture(GL_TEXTURE0 + i);
             glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[i]);
             glUniform1i(server->fullscreen_shader_scene_tex0_loc + i, i);
         } 
-    }else if (server->effect_anim_current_factor==2.0)
+
+        glUniform1i(server->fullscreen_shader_desktop_grid_loc,DestopGridSize);
+    }else if (server->effect_anim_current_factor==2.0 & switch_mode==0)
         {
         // FIX 3: Ensure consistent GL state for expo
         glDisable(GL_DEPTH_TEST);
@@ -3750,15 +3901,17 @@ if (current_frame_fbo_path) {
         glUseProgram(server->fullscreen_shader_program);
         
         glUniform1f(server->fullscreen_shader_zoom_loc, server->effect_anim_current_factor);
+        glUniform1f(server->fullscreen_shader_move_loc, server->effect_anim_current_factor);
         int target_quadrant = server->pending_desktop_switch != -1 ? server->pending_desktop_switch : server->current_desktop;
         glUniform1i(server->fullscreen_shader_quadrant_loc, target_quadrant);
-        
+        glUniform1i(server->fullscreen_switch_mode, switch_mode);
+        glUniform1i(server->fullscreen_switchXY, switchXY);
        
             glActiveTexture(GL_TEXTURE0 + target_quadrant);
             glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[target_quadrant]);
             glUniform1i(server->fullscreen_shader_scene_tex0_loc + target_quadrant, target_quadrant);
         
-        
+         glUniform1i(server->fullscreen_shader_desktop_grid_loc,DestopGridSize);
     }
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
     } else if (server->cube_effect_active) {
@@ -3793,7 +3946,7 @@ if (current_frame_fbo_path) {
         glUniform1f(server->cube_shader_zoom_loc, server->cube_anim_current_factor);
         glUniform1i(server->cube_shader_quadrant_loc, server->current_desktop);
 
-        for(int i = 0; i < 4; ++i) {
+        for(int i = 0; i < server->num_desktops; ++i) {
             glActiveTexture(GL_TEXTURE0 + i);
             glBindTexture(GL_TEXTURE_2D, server->intermediate_texture[i]);
             glUniform1i(server->cube_shader_scene_tex0_loc + i, i);
@@ -4895,90 +5048,6 @@ static const char *rect_vertex_shader_src =
     "    v_texcoord = texcoord;\n"
     "}\n";
 
-static const char *rect_fragment_shader_src =
-    "/* Creative Commons Licence Attribution-NonCommercial-ShareAlike \n"
-    "phreax/jiagual 2025 \n"
-    "Variation of https://www.shadertoy.com/view/tfG3zt\n"
-    "             https://www.shadertoy.com/view/3XjXzK\n"
-    "Inspired by Xor's recent volumetric shaders\n"
-    "https://www.shadertoy.com/view/tXlXDX\n"
-    "*/\n"
-    "#version 300 es\n"
-    "precision mediump float;\n"
-    "\n"
-    "in vec2 v_texcoord;\n"
-    "out vec4 frag_color;\n"
-    "\n"
-    "uniform float time;\n"
-    "uniform vec4 u_color;\n"
-    "\n"
-    "#define PALETTE 6\n"
-    "\n"
-    "mat2 rot(float x) {return mat2(cos(x), -sin(x), sin(x), cos(x));}\n"
-    "vec3 pal(float x) {return .5+.5*cos(6.28*x-vec3(5,4,1));}\n"
-    "\n"
-    "vec3 getPal(int palette, float x) {\n"
-    "    return pal(x);\n"
-    "}\n"
-    "\n"
-    "#define SIN(x) sin(x)\n"
-    "\n"
-    "void main() {\n"
-    "    vec2 fragCoord = gl_FragCoord.xy;\n"
-    "    vec2 iResolution = vec2(1024.0, 768.0);\n"
-    "    float iTime = time * 0.5;\n"
-    "    \n"
-    "    vec2 uv = (fragCoord - .5*iResolution.xy)/min(iResolution.x, iResolution.y);\n"
-    "    float tt = iTime*.5;\n"
-    "    \n"
-    "    uv.xy *= mix(.8, 1.2, SIN(-tt+5.*length(uv.xy)));\n"
-    "    \n"
-    "    vec3 col = vec3(0);\n"
-    "    vec3 rd = vec3(uv, 1);\n"
-    "    vec3 p = vec3(0);\n"
-    "    float t = .1;\n"
-    "    \n"
-    "    for(float i=0.; i<120.; i++) {\n"
-    "        vec3 p = t*rd + rd;\n"
-    "        \n"
-    "        float r = length(p);\n"
-    "        \n"
-    "        float z = p.z;\n"
-    "        p.xy *= rot(p.z*.75);\n"
-    "      \n"
-    "        // log spherical coords\n"
-    "        p = vec3(log(r)*.5,\n"
-    "            acos(p.z / r),\n"
-    "            atan(p.y, p.x));\n"
-    "        p = abs(p)-mix(.1, .5, SIN(.2*tt));\n"
-    "    \n"
-    "        for(float j=0.; j < 3.; j++) {     \n"
-    "            float  a= exp(j)/exp2(j);\n"
-    "            p += cos(2.*p.yzx*a + .5*tt - length(p.xy)*9.)/a; \n"
-    "        }\n"
-    "        \n"
-    "        float d = 0.007 + abs((exp2(1.4*p)-vec3(0,1.+.7*SIN(tt),0)).y-1.)/14.;\n"
-    "        float k = t*.7 +length(p)*.1 - .2*tt + z*.1;\n"
-    "        vec3 c = getPal(PALETTE, k);\n"
-    "        c = mix(c, c*vec3(0.922,0.973,0.725), SIN(z*.5));\n"
-    "        col += c*1e-3/d;       \n"
-    "        t += d/4.;\n"
-    "    }\n"
-    "    \n"
-    "    // add glow in the center\n"
-    "    float gl = exp(-17.*length(uv.xy));\n"
-    "    col += .4*mix(vec3(0.361,0.957,1.000), vec3(0.847,1.000,0.561), SIN(gl*2.-tt))*pow(gl*11., 1.);\n"
-    "    \n"
-    "    // tone mapping & gamma correction\n"
-    "    col *= tanh(col*.1);\n"
-    "    col = pow(col, vec3(.45));\n"
-    "    \n"
-    "    // Apply user color as subtle accent\n"
-    "    col = mix(col, col * u_color.rgb, 0.1);\n"
-    "    \n"
-    "    frag_color = vec4(col, u_color.a).bgra;\n"
-    "}\n";
-
 const char *vertex_shader_src =
         "#version 300 es\n"
     "precision mediump float;\n"
@@ -5784,7 +5853,7 @@ static const char *fullscreen_vertex_shader_src =
        "    v_texcoord_to_fs = a_texcoord;\n"
        "}\n";
 
-static const char *fullscreen_fragment_shader_src =
+static const char *expo_fragment_shader_src =
        "#version 300 es\n"
        "precision mediump float;\n"
        "in vec2 v_texcoord_to_fs;\n"
@@ -5820,7 +5889,7 @@ static const char *fullscreen_vertex_shader_src =
        "    v_texcoord_to_fs = a_texcoord;\n"
        "}\n";
 
-static const char *fullscreen_fragment_shader_src =
+static const char *expo_fragment_shader_src =
        "#version 300 es\n"
        "precision mediump float;\n"
        "in vec2 v_texcoord_to_fs;\n"
@@ -5909,7 +5978,7 @@ static const char *fullscreen_vertex_shader_src =
 
 // Fragment Shader
 /*
-static const char *fullscreen_fragment_shader_src =
+static const char *expo_fragment_shader_src =
 "#version 300 es\n"
 "precision mediump float;\n"
 "precision mediump int;\n"
@@ -5973,75 +6042,150 @@ static const char *fullscreen_fragment_shader_src =
 "}\n";
 */
 
-static const char *fullscreen_fragment_shader_src =
+static const char *expo_fragment_shader_src =
 "#version 300 es\n"
 "precision mediump float;\n"
 "precision mediump int;\n"
 "\n"
-"uniform sampler2D u_scene_texture0;  // Texture for top-left quadrant\n"
-"uniform sampler2D u_scene_texture1;  // Texture for top-right quadrant\n"
-"uniform sampler2D u_scene_texture2;  // Texture for bottom-left quadrant\n"
-"uniform sampler2D u_scene_texture3;  // Texture for bottom-right quadrant\n"
-"uniform float u_zoom;               // 1.0 to 2.0\n"
-"uniform highp int u_quadrant;       // Which quadrant to expand (0-3)\n"
+"uniform sampler2D u_scene_texture0;   // Desktop 0 (row 0, col 0)\n"
+"uniform sampler2D u_scene_texture1;   // Desktop 1 (row 0, col 1)\n"
+"uniform sampler2D u_scene_texture2;   // Desktop 2 (row 0, col 2)\n"
+"uniform sampler2D u_scene_texture3;   // Desktop 3 (row 0, col 3)\n"
+"uniform sampler2D u_scene_texture4;   // Desktop 4 (row 1, col 0)\n"
+"uniform sampler2D u_scene_texture5;   // Desktop 5 (row 1, col 1)\n"
+"uniform sampler2D u_scene_texture6;   // Desktop 6 (row 1, col 2)\n"
+"uniform sampler2D u_scene_texture7;   // Desktop 7 (row 1, col 3)\n"
+"uniform sampler2D u_scene_texture8;   // Desktop 8 (row 2, col 0)\n"
+"uniform sampler2D u_scene_texture9;   // Desktop 9 (row 2, col 1)\n"
+"uniform sampler2D u_scene_texture10;  // Desktop 10 (row 2, col 2)\n"
+"uniform sampler2D u_scene_texture11;  // Desktop 11 (row 2, col 3)\n"
+"uniform sampler2D u_scene_texture12;  // Desktop 12 (row 3, col 0)\n"
+"uniform sampler2D u_scene_texture13;  // Desktop 13 (row 3, col 1)\n"
+"uniform sampler2D u_scene_texture14;  // Desktop 14 (row 3, col 2)\n"
+"uniform sampler2D u_scene_texture15;  // Desktop 15 (row 3, col 3)\n"
+"uniform float u_zoom;                 // 1.0 to 2.0\n"
+"uniform float u_move;\n"
+"uniform highp int u_quadrant;         // Which desktop to expand (0-15)\n"
+"uniform int DesktopGrid;\n"
+"uniform int switch_mode;\n"
+"uniform int u_switchXY;\n"
 "\n"
 "in vec2 v_texcoord_to_fs;\n"
 "out vec4 FragColor;\n"
 "\n"
+"vec4 sampleDesktop(int desktop_id, vec2 uv) {\n"
+"    if (desktop_id == 0) return texture(u_scene_texture0, uv);\n"
+"    else if (desktop_id == 1) return texture(u_scene_texture1, uv);\n"
+"    else if (desktop_id == 2) return texture(u_scene_texture2, uv);\n"
+"    else if (desktop_id == 3) return texture(u_scene_texture3, uv);\n"
+"    else if (desktop_id == 4) return texture(u_scene_texture4, uv);\n"
+"    else if (desktop_id == 5) return texture(u_scene_texture5, uv);\n"
+"    else if (desktop_id == 6) return texture(u_scene_texture6, uv);\n"
+"    else if (desktop_id == 7) return texture(u_scene_texture7, uv);\n"
+"    else if (desktop_id == 8) return texture(u_scene_texture8, uv);\n"
+"    else if (desktop_id == 9) return texture(u_scene_texture9, uv);\n"
+"    else if (desktop_id == 10) return texture(u_scene_texture10, uv);\n"
+"    else if (desktop_id == 11) return texture(u_scene_texture11, uv);\n"
+"    else if (desktop_id == 12) return texture(u_scene_texture12, uv);\n"
+"    else if (desktop_id == 13) return texture(u_scene_texture13, uv);\n"
+"    else if (desktop_id == 14) return texture(u_scene_texture14, uv);\n"
+"    else return texture(u_scene_texture15, uv);\n"
+"}\n"
+"\n"
 "void main() {\n"
-"    float t = clamp(u_zoom - 1.0, 0.0, 1.0);\n"
-"    vec2 uv = v_texcoord_to_fs;\n"
-"    \n"
-"    // Define the center point of each quadrant in the 2x2 grid\n"
-"    vec2 quad_centers[4];\n"
-"    quad_centers[0] = vec2(0.0, 1.0);  // Top-left\n"
-"    quad_centers[1] = vec2(1.0, 1.0);  // Top-right\n"
-"    quad_centers[2] = vec2(0.00, 0.00);  // Bottom-left\n"
-"    quad_centers[3] = vec2(1.00, 0.00);  // Bottom-right\n"
-"    \n"
-"    // Get the center of the selected quadrant\n"
-"    vec2 zoom_center = quad_centers[u_quadrant];\n"
-"    \n"
-"    // Transform UV: zoom in from the selected quadrant's center\n"
-"    vec2 offset_from_center = uv - zoom_center;\n"
-"    vec2 scaled_offset = offset_from_center / (1.0 + t);\n"
-"    vec2 transformed_uv = zoom_center + scaled_offset;\n"
-"    \n"
-"    // Map the transformed UV to the original texture coordinates\n"
-"    vec2 texture_uv;\n"
-"    int target_quad;\n"
-"    if (transformed_uv.x < 0.5 && transformed_uv.y > 0.5) target_quad = 0;\n"
-"    else if (transformed_uv.x > 0.5 && transformed_uv.y > 0.5) target_quad = 1;\n"
-"    else if (transformed_uv.x < 0.5 && transformed_uv.y < 0.5) target_quad = 2;\n"
-"    else target_quad = 3;\n"
-"    \n"
-"    vec4 color;\n"
-"    // Map to texture coordinates based on which quadrant\n"
-"    if (target_quad == 0) {\n"
-"        // Top-left quadrant - RED TINT\n"
-"        texture_uv = vec2(transformed_uv.x * 2.0, (transformed_uv.y - 0.5) * 2.0);\n"
-"        color = texture(u_scene_texture0, texture_uv);\n"
-"     //   color.rgb *= vec3(1.5, 0.7, 0.7);  // Enhance red, reduce green/blue\n"
-"    } else if (target_quad == 1) {\n"
-"        // Top-right quadrant - GREEN TINT\n"
-"        texture_uv = vec2((transformed_uv.x - 0.5) * 2.0, (transformed_uv.y - 0.5) * 2.0);\n"
-"        color = texture(u_scene_texture1, texture_uv);\n"
-"     //   color.rgb *= vec3(0.7, 1.5, 0.7);  // Enhance green, reduce red/blue\n"
-"    } else if (target_quad == 2) {\n"
-"        // Bottom-left quadrant - BLUE TINT\n"
-"        texture_uv = vec2(transformed_uv.x * 2.0, transformed_uv.y * 2.0);\n"
-"        color = texture(u_scene_texture2, texture_uv);\n"
-"      //  color.rgb *= vec3(0.7, 0.7, 1.5);  // Enhance blue, reduce red/green\n"
-"    } else {\n"
-"        // Bottom-right quadrant - YELLOW TINT\n"
-"        texture_uv = vec2((transformed_uv.x - 0.5) * 2.0, transformed_uv.y * 2.0);\n"
-"        color = texture(u_scene_texture3, texture_uv);\n"
-"      //  color.rgb *= vec3(1.3, 1.3, 0.5);  // Enhance red/green, reduce blue\n"
+"    if (switch_mode == 0) {\n"
+"        // --- ZOOM MODE (4x4 grid) ---\n"
+"        float t = clamp(u_zoom - 1.0, 0.0, 1.0) * (float(DesktopGrid) - 1.0);\n"
+"        vec2 uv = v_texcoord_to_fs;\n"
+"        \n"
+"        // Calculate logical row and column of the selected desktop (e.g., top-left is row 0, col 0)\n"
+"        int selected_row = u_quadrant / DesktopGrid;\n"
+"        int selected_col = u_quadrant % DesktopGrid;\n"
+"        \n"
+"        // Calculate the zoom center in screen coordinates\n"
+"        // We invert the selected_row because screen Y-coordinates are 0 at the bottom.\n"
+"        vec2 zoom_center = vec2(\n"
+"            float(selected_col) / (float(DesktopGrid) - 1.0), \n"
+"            float((DesktopGrid - 1) - selected_row) / float(DesktopGrid - 1)\n"
+"        );\n"
+"        \n"
+"        // Transform UV: zoom in from the selected desktop's center\n"
+"        vec2 offset_from_center = uv - zoom_center;\n"
+"        vec2 scaled_offset = offset_from_center / (1.0 + t);\n"
+"        vec2 transformed_uv = zoom_center + scaled_offset;\n"
+"        \n"
+"        // Determine which desktop we're sampling from in the 4x4 grid\n"
+"        // Invert the row lookup to match the visual layout\n"
+"        int target_row = (DesktopGrid - 1) - int(floor(transformed_uv.y * float(DesktopGrid)));\n"
+"        int target_col = int(floor(transformed_uv.x * float(DesktopGrid)));\n"
+"        \n"
+"        // Clamp to valid range\n"
+"        target_row = clamp(target_row, 0, 3);\n"
+"        target_col = clamp(target_col, 0, 3);\n"
+"        \n"
+"        int target_desktop = target_row * DesktopGrid + target_col;\n"
+"        \n"
+"        // Calculate texture coordinates within the desktop\n"
+"        vec2 texture_uv = vec2(\n"
+"            fract(transformed_uv.x * float(DesktopGrid)),\n"
+"            fract(transformed_uv.y * float(DesktopGrid))\n"
+"        );\n"
+"        \n"
+"        vec4 color = sampleDesktop(target_desktop, texture_uv);\n"
+"        FragColor = color;\n"
+"        \n"
+"    } else if (switch_mode == 1) {\n"
+"        // --- SLIDE MODE ---\n"
+"        float slide_progress = clamp(u_move - 1.0, 0.0, 1.0);\n"
+"        vec2 uv = v_texcoord_to_fs;\n"
+"        float slide_offset = slide_progress;\n"
+"        \n"
+"        int current_desktop = u_quadrant;\n"
+"        int next_desktop;\n"
+"        \n"
+"        vec2 current_uv, next_uv;\n"
+"\n"
+"        if (u_switchXY == 0) {\n"
+"            // === HORIZONTAL SLIDE LOGIC (4x4 grid) ===\n"
+"            int current_row = current_desktop / 4;\n"
+"            int current_col = current_desktop % 4;\n"
+"            \n"
+"            // Move to next column in same row (wrap around)\n"
+"            int next_col = (current_col + 1) % 4;\n"
+"            next_desktop = current_row * 4 + next_col;\n"
+"\n"
+"            // Current desktop slides LEFT, next desktop is revealed from RIGHT\n"
+"            current_uv = vec2(uv.x + slide_offset, uv.y);\n"
+"            next_uv    = vec2(uv.x + slide_offset - 1.0, uv.y);\n"
+"\n"
+"        } else {\n"
+"            // === VERTICAL SLIDE LOGIC (4x4 grid) ===\n"
+"            int current_row = current_desktop / 4;\n"
+"            int current_col = current_desktop % 4;\n"
+"            \n"
+"            // Move to next row in same column (wrap around)\n"
+"            int next_row = (current_row + 1) % 4;\n"
+"            next_desktop = next_row * 4 + current_col;\n"
+"\n"
+"            // Current desktop slides UP, next desktop is revealed from BOTTOM\n"
+"            current_uv = vec2(uv.x, uv.y + slide_offset);\n"
+"            next_uv    = vec2(uv.x, uv.y + slide_offset - 1.0);\n"
+"        }\n"
+"        \n"
+"        vec4 current_color = sampleDesktop(current_desktop, current_uv);\n"
+"        vec4 next_color = sampleDesktop(next_desktop, next_uv);\n"
+"        \n"
+"        // Choose which color to use based on whether the current UV is within bounds\n"
+"        vec4 color;\n"
+"        if (current_uv.x >= 0.0 && current_uv.x <= 1.0 && current_uv.y >= 0.0 && current_uv.y <= 1.0) {\n"
+"             color = current_color;\n"
+"        } else {\n"
+"             color = next_color;\n"
+"        }\n"
+"        \n"
+"        FragColor = color;\n"
 "    }\n"
-"    \n"
-"    FragColor = color;\n"
 "}\n";
-
 static const char *cube_vertex_shader_src =
        "#version 300 es\n"
        "precision mediump float;\n"
@@ -6355,6 +6499,92 @@ static const char *cube_fragment_shader_src =
 "    FragColor = color;\n"
 "}\n";
 
+//https://www.shadertoy.com/view/WcKGWd
+static const char *desktop_0_fs_src =
+    "/* Creative Commons Licence Attribution-NonCommercial-ShareAlike \n"
+    "phreax/jiagual 2025 \n"
+    "Variation of https://www.shadertoy.com/view/tfG3zt\n"
+    "             https://www.shadertoy.com/view/3XjXzK\n"
+    "Inspired by Xor's recent volumetric shaders\n"
+    "https://www.shadertoy.com/view/tXlXDX\n"
+    "*/\n"
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "\n"
+    "uniform float time;\n"
+    "uniform vec4 u_color;\n"
+    "\n"
+    "#define PALETTE 6\n"
+    "\n"
+    "mat2 rot(float x) {return mat2(cos(x), -sin(x), sin(x), cos(x));}\n"
+    "vec3 pal(float x) {return .5+.5*cos(6.28*x-vec3(5,4,1));}\n"
+    "\n"
+    "vec3 getPal(int palette, float x) {\n"
+    "    return pal(x);\n"
+    "}\n"
+    "\n"
+    "#define SIN(x) sin(x)\n"
+    "\n"
+    "void main() {\n"
+    "    vec2 fragCoord = gl_FragCoord.xy;\n"
+    "    vec2 iResolution = vec2(1024.0, 768.0);\n"
+    "    float iTime = time * 0.5;\n"
+    "    \n"
+    "    vec2 uv = (fragCoord - .5*iResolution.xy)/min(iResolution.x, iResolution.y);\n"
+    "    float tt = iTime*.5;\n"
+    "    \n"
+    "    uv.xy *= mix(.8, 1.2, SIN(-tt+5.*length(uv.xy)));\n"
+    "    \n"
+    "    vec3 col = vec3(0);\n"
+    "    vec3 rd = vec3(uv, 1);\n"
+    "    vec3 p = vec3(0);\n"
+    "    float t = .1;\n"
+    "    \n"
+    "    for(float i=0.; i<120.; i++) {\n"
+    "        vec3 p = t*rd + rd;\n"
+    "        \n"
+    "        float r = length(p);\n"
+    "        \n"
+    "        float z = p.z;\n"
+    "        p.xy *= rot(p.z*.75);\n"
+    "      \n"
+    "        // log spherical coords\n"
+    "        p = vec3(log(r)*.5,\n"
+    "            acos(p.z / r),\n"
+    "            atan(p.y, p.x));\n"
+    "        p = abs(p)-mix(.1, .5, SIN(.2*tt));\n"
+    "    \n"
+    "        for(float j=0.; j < 3.; j++) {     \n"
+    "            float  a= exp(j)/exp2(j);\n"
+    "            p += cos(2.*p.yzx*a + .5*tt - length(p.xy)*9.)/a; \n"
+    "        }\n"
+    "        \n"
+    "        float d = 0.007 + abs((exp2(1.4*p)-vec3(0,1.+.7*SIN(tt),0)).y-1.)/14.;\n"
+    "        float k = t*.7 +length(p)*.1 - .2*tt + z*.1;\n"
+    "        vec3 c = getPal(PALETTE, k);\n"
+    "        c = mix(c, c*vec3(0.922,0.973,0.725), SIN(z*.5));\n"
+    "        col += c*1e-3/d;       \n"
+    "        t += d/4.;\n"
+    "    }\n"
+    "    \n"
+    "    // add glow in the center\n"
+    "    float gl = exp(-17.*length(uv.xy));\n"
+    "    col += .4*mix(vec3(0.361,0.957,1.000), vec3(0.847,1.000,0.561), SIN(gl*2.-tt))*pow(gl*11., 1.);\n"
+    "    \n"
+    "    // tone mapping & gamma correction\n"
+    "    col *= tanh(col*.1);\n"
+    "    col = pow(col, vec3(.45));\n"
+    "    \n"
+    "    // Apply user color as subtle accent\n"
+    "    col = mix(col, col * u_color.rgb, 0.1);\n"
+    "    \n"
+    "    frag_color = vec4(col, u_color.a).bgra;\n"
+    "}\n";
+
+
 // Shader for Desktop 1 (Starfield)
 static const char *desktop_1_fs_src =
     "#version 300 es\n"
@@ -6495,6 +6725,614 @@ static const char *desktop_3_fs_src =
     "    O = tanh(O*O / 4e8);\n"
     "    frag_color = vec4(O.rgb * u_color.rgb, 1.0).bgra;\n"
     "}\n";
+//https://www.shadertoy.com/view/3f3SWf
+static const char *desktop_4_fs_src = 
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "uniform float time;\n"
+    "uniform vec2 iResolution;\n"
+    "uniform vec4 u_color;\n"
+    "void main() {\n"
+    "    vec2 C = gl_FragCoord.xy;\n"
+    "    vec4 O = vec4(0.0);\n"
+    "    float i = 0.0,\n"
+    "          d,\n"
+    "          t = 0.2 * time,\n"
+    "          z = 0.1 * fract(dot(C, sin(C)));\n"
+    "    vec4 p, P;\n"
+    "    \n"
+    "    for (vec2 r = iResolution.xy; ++i < 77.0; z += 0.2 * d + 1e-3) {\n"
+    "        p = vec4(z * normalize(vec3(C - 0.5 * r, r.y)), 0.0);\n"
+    "        p.xy += 6.0;\n"
+    "        p.z += t;\n"
+    "        \n"
+    "        d = 4.0;\n"
+    "        \n"
+    "        for (P = p; d < 7.0; d /= 0.8)\n"
+    "            p += cos(p.zxyw * d + 0.6 * t) / d;\n"
+    "        \n"
+    "        P = 1.0 + sin(vec4(0, 1, 2, 0) + 9.0 * length(P - p));\n"
+    "        \n"
+    "        p -= round(p);\n"
+    "        d = abs(min(length(p.yz), min(length(p.xy), length(p.xz))) - 0.1 * tanh(z) + 2e-2);\n"
+    "        \n"
+    "        O += P.w / max(d, 1e-3) * P;\n"
+    "    }\n"
+    "    \n"
+    "    O = tanh(O / 2e4);\n"
+    "    frag_color = vec4(O.rgb * u_color.rgb, 1.0).bgra;\n"
+    "}\n";  
+    
+//https://www.shadertoy.com/view/tf3SWB    
+static const char *desktop_5_fs_src = 
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "uniform float time;\n"
+    "uniform vec2 iResolution;\n"
+    "uniform vec4 u_color;\n"
+    "void main() {\n"
+    "    vec2 C = gl_FragCoord.xy;\n"
+    "    vec4 O = vec4(0.0);\n"
+    "    float d, s, j, i = 0.0, z = 0.0, N, D, k, t = time;\n"
+    "    vec4 o = vec4(0.0), p, U = vec4(3, 1, 2, 0);\n"
+    "    \n"
+    "    for (vec2 q, r = iResolution.xy; ++i < 70.0; z += 0.5 * d + 1E-3) {\n"
+    "        p = vec4(z * normalize(vec3(C - 0.5 * r, r.y)), 0.0);\n"
+    "        p.z -= 3.0;\n"
+    "        \n"
+    "        // Rotation matrix multiplication: p.xz *= mat2(.8,.6,-.8,.6)\n"
+    "        vec2 temp = p.xz;\n"
+    "        p.x = temp.x * 0.8 + temp.y * 0.6;\n"
+    "        p.z = temp.x * (-0.8) + temp.y * 0.6;\n"
+    "        \n"
+    "        p *= k = 8.0 / dot(p, p);\n"
+    "        q = p.xy;\n"
+    "        q -= round(q / 5.0) * 5.0;\n"
+    "        \n"
+    "        // Create rotation matrix R\n"
+    "        float angle = 0.5 * t + log2(k) + 11.0 * U.w;\n"
+    "        float cos_a = cos(angle);\n"
+    "        float sin_a = sin(angle);\n"
+    "        mat2 R = mat2(cos_a, sin_a, -sin_a, cos_a);\n"
+    "        \n"
+    "        d = 1.0;\n"
+    "        s = 1.0;\n"
+    "        j = 1.0;\n"
+    "        \n"
+    "        for (; ++j < 6.0; s *= 0.5) {\n"
+    "            q = abs(q * R) - 2.0 * s / j;\n"
+    "            D = length(q) - s / 8.0;\n"
+    "            if (D < d) {\n"
+    "                N = j;\n"
+    "                d = D;\n"
+    "            }\n"
+    "        }\n"
+    "        \n"
+    "        d = abs(d) / k;\n"
+    "        p = 1.0 + sin(p.z + U.zywz - t + N);\n"
+    "        \n"
+    "        o += p.w / max(d, 1E-3) * p + exp(0.3 * k) * 6.0 * U;\n"
+    "    }\n"
+    "    \n"
+    "    O = tanh(o / 3e4);\n"
+    "    frag_color = vec4(O.rgb * u_color.rgb, 1.0).bgra;\n"
+    "}\n"; 
+
+// https://www.shadertoy.com/view/w32XDc
+static const char *desktop_6_fs_src = 
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "uniform float time;\n"
+    "uniform vec2 iResolution;\n"
+    "uniform vec4 u_color;\n"
+    "\n"
+    "/*\n"
+    "    See here for how to do a tiny raymarch loop and translucency:\n"
+    "        https://www.shadertoy.com/view/wXjSRt\n"
+    "        https://www.shadertoy.com/view/wXSXzV\n"
+    "        \n"
+    "    See here for how to do a basic tunnel:\n"
+    "        https://www.shadertoy.com/view/Wcf3D7\n"
+    "        \n"
+    "    Converted to OpenGL ES 3.0\n"
+    "*/\n"
+    "\n"
+    "#define iTime time\n"
+    "#define P(z) vec3(cos(vec2(.15,.2)*(z))*5.,z)\n"
+    "\n"
+    "void main() {\n"
+    "    vec2 u = gl_FragCoord.xy;\n"
+    "    vec4 o = vec4(0.0);\n"
+    "    float i = 0.0, d = 0.0, s = 0.0, n = 0.0, t = iTime * 3.0;\n"
+    "    vec3 q = vec3(iResolution, 0.0);\n"
+    "    vec3 p = P(t);\n"
+    "    vec3 Z = normalize(P(t + 1.0) - p);\n"
+    "    vec3 X = normalize(vec3(Z.z, 0.0, -Z.x));\n"
+    "    vec3 D = vec3((u - q.xy / 2.0) / q.y, 1.0) * mat3(-X, cross(X, Z), Z);\n"
+    "    \n"
+    "    for(o *= i; i < 100.0; i++) {\n"
+    "        p += D * s;\n"
+    "        q = P(p.z) + cos(t + p.yzx) * 0.3;\n"
+    "        s = 2.0 - min(length((p - q).xy),\n"
+    "                 min(length(p.xy - vec2(q.y)),\n"
+    "                     length(p.xy - vec2(q.x))));\n"
+    "        \n"
+    "        for (n = 0.1; n < 1.0; n += n) {\n"
+    "            s -= abs(dot(sin(p * n * 16.0), vec3(0.03))) / n;\n"
+    "        }\n"
+    "        \n"
+    "        d += s = 0.04 + abs(s) * 0.2;\n"
+    "        o += (1.0 + cos(d + vec4(4.0, 2.0, 1.0, 0.0))) / s / d;\n"
+    "    }\n"
+    "    \n"
+    "    o = tanh(o / 200.0);\n"
+    "    frag_color = vec4(o.rgb * u_color.rgb, 1.0);\n"
+    "}\n";
+    
+    
+// https://www.shadertoy.com/view/XcS3zK
+static const char *desktop_7_fs_src = 
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "uniform float time;\n"
+    "uniform vec2 iResolution;\n"
+    "uniform vec4 u_color;\n"
+    "\n"
+    "/* Shading constants */\n"
+    "const vec3 LP = vec3(-0.6, 0.7, -0.3);\n"
+    "const vec3 LC = vec3(0.85, 0.80, 0.70);\n"
+    "const vec3 HC1 = vec3(0.5, 0.4, 0.3);\n"
+    "const vec3 HC2 = vec3(0.1, 0.1, 0.6) * 0.5;\n"
+    "const vec3 HLD = vec3(0.0, 1.0, 0.0);\n"
+    "const vec3 BC = vec3(0.25, 0.25, 0.25);\n"
+    "const vec3 FC = vec3(1.30, 1.20, 1.00);\n"
+    "const float AS = 0.5;\n"
+    "const float DS = 1.0;\n"
+    "const float BS = 0.3;\n"
+    "const float FS = 0.3;\n"
+    "\n"
+    "/* Raymarching constants */\n"
+    "const float MAX_TRACE_DISTANCE = 10.0;\n"
+    "const float INTERSECTION_PRECISION = 0.0001;\n"
+    "const int NUM_OF_TRACE_STEPS = 64;\n"
+    "const float STEP_MULTIPLIER = 1.0;\n"
+    "\n"
+    "/* Structures */\n"
+    "struct Camera {\n"
+    "    vec3 ro;\n"
+    "    vec3 rd;\n"
+    "    vec3 forward;\n"
+    "    vec3 right;\n"
+    "    vec3 up;\n"
+    "    float FOV;\n"
+    "};\n"
+    "\n"
+    "struct Surface {\n"
+    "    float len;\n"
+    "    vec3 position;\n"
+    "    vec3 colour;\n"
+    "    float id;\n"
+    "    float steps;\n"
+    "    float AO;\n"
+    "};\n"
+    "\n"
+    "struct Model {\n"
+    "    float dist;\n"
+    "    vec3 colour;\n"
+    "    float id;\n"
+    "};\n"
+    "\n"
+    "/* Utilities */\n"
+    "vec2 toScreenspace(in vec2 p) {\n"
+    "    vec2 uv = (p - 0.5 * iResolution.xy) / min(iResolution.y, iResolution.x);\n"
+    "    return uv;\n"
+    "}\n"
+    "\n"
+    "mat2 R(float a) {\n"
+    "    float c = cos(a);\n"
+    "    float s = sin(a);\n"
+    "    return mat2(c, -s, s, c);\n"
+    "}\n"
+    "\n"
+    "Camera getCamera(in vec2 uv, in vec3 pos, in vec3 target) {\n"
+    "    vec3 f = normalize(target - pos);\n"
+    "    vec3 r = normalize(vec3(f.z, 0.0, -f.x));\n"
+    "    vec3 u = normalize(cross(f, r));\n"
+    "    \n"
+    "    float FOV = 1.0 + cos(time * 0.1) * 0.8;\n"
+    "    \n"
+    "    return Camera(pos, normalize(f + FOV * uv.x * r + FOV * uv.y * u), f, r, u, FOV);\n"
+    "}\n"
+    "\n"
+    "/* Modelling */\n"
+    "float G(vec3 p) {\n"
+    "    return dot(sin(p.yzx), cos(p.zxy));\n"
+    "}\n"
+    "\n"
+    "Model model(vec3 p) {\n"
+    "    float t = time * 0.1;\n"
+    "    p.xz *= R(t);\n"
+    "    p.xy *= R(0.3);\n"
+    "    p.xy -= 0.5;\n"
+    "    float d = abs(-(length(vec2(p.y, length(p.xz) - 2.0)) - 1.8 + cos(t) * 0.3));\n"
+    "    \n"
+    "    float g = G(p.yxz * 4.0) / 4.0;\n"
+    "    \n"
+    "    d = length(vec2(d, g)) - 0.3;\n"
+    "    vec3 colour = vec3(g);\n"
+    "    \n"
+    "    return Model(d, colour, 1.0);\n"
+    "}\n"
+    "\n"
+    "Model map(vec3 p) {\n"
+    "    return model(p);\n"
+    "}\n"
+    "\n"
+    "vec3 calcNormal(in vec3 pos) {\n"
+    "    vec3 eps = vec3(0.001, 0.0, 0.0);\n"
+    "    vec3 nor = vec3(\n"
+    "        map(pos + eps.xyy).dist - map(pos - eps.xyy).dist,\n"
+    "        map(pos + eps.yxy).dist - map(pos - eps.yxy).dist,\n"
+    "        map(pos + eps.yyx).dist - map(pos - eps.yyx).dist\n"
+    "    );\n"
+    "    return normalize(nor);\n"
+    "}\n"
+    "\n"
+    "/* Raymarcher */\n"
+    "Surface march(in Camera cam) {\n"
+    "    float h = 1e4;\n"
+    "    float d = 0.0;\n"
+    "    float id = -1.0;\n"
+    "    float s = 0.0;\n"
+    "    float ao = 0.0;\n"
+    "    vec3 p;\n"
+    "    vec3 c;\n"
+    "\n"
+    "    for (int i = 0; i < NUM_OF_TRACE_STEPS; i++) {\n"
+    "        if (abs(h) < INTERSECTION_PRECISION || d > MAX_TRACE_DISTANCE) break;\n"
+    "        p = cam.ro + cam.rd * d;\n"
+    "        Model m = map(p);\n"
+    "        h = m.dist;\n"
+    "        d += h * STEP_MULTIPLIER;\n"
+    "        id = m.id;\n"
+    "        s += 1.0;\n"
+    "        ao += max(h, 0.0);\n"
+    "        c = m.colour;\n"
+    "    }\n"
+    "\n"
+    "    if (d >= MAX_TRACE_DISTANCE) id = -1.0;\n"
+    "\n"
+    "    return Surface(d, p, c, id, s, ao);\n"
+    "}\n"
+    "\n"
+    "/* Shading */\n"
+    "float softshadow(in vec3 ro, in vec3 rd, in float mint, in float tmax) {\n"
+    "    float res = 1.0;\n"
+    "    float t = mint;\n"
+    "    for (int i = 0; i < 16; i++) {\n"
+    "        float h = map(ro + rd * t).dist;\n"
+    "        res = min(res, 8.0 * h / t);\n"
+    "        t += clamp(h, 0.02, 0.10);\n"
+    "        if (h < 0.001 || t > tmax) break;\n"
+    "    }\n"
+    "    return clamp(res, 0.0, 1.0);\n"
+    "}\n"
+    "\n"
+    "float AO(in vec3 pos, in vec3 nor) {\n"
+    "    float occ = 0.0;\n"
+    "    float sca = 1.0;\n"
+    "    for (int i = 0; i < 5; i++) {\n"
+    "        float hr = 0.01 + 0.12 * float(i) / 4.0;\n"
+    "        vec3 aopos = nor * hr + pos;\n"
+    "        float dd = map(aopos).dist;\n"
+    "        occ += -(dd - hr) * sca;\n"
+    "        sca *= 0.95;\n"
+    "    }\n"
+    "    return clamp(1.0 - 3.0 * occ, 0.0, 1.0);\n"
+    "}\n"
+    "\n"
+    "vec3 shade(vec3 col, vec3 pos, vec3 nor, vec3 ref, Camera cam) {\n"
+    "    vec3 plp = LP - pos;\n"
+    "    \n"
+    "    float o = AO(pos, nor);\n"
+    "    vec3 l = normalize(plp);\n"
+    "    \n"
+    "    float d = clamp(dot(nor, l), 0.0, 1.0) * DS;\n"
+    "    float b = clamp(dot(nor, normalize(vec3(-l.x, 0.0, -l.z))), 0.0, 1.0) * clamp(1.0 - pos.y, 0.0, 1.0) * BS;\n"
+    "    float f = pow(clamp(1.0 + dot(nor, cam.rd), 0.0, 1.0), 2.0) * FS;\n"
+    "\n"
+    "    vec3 c = vec3(0.0);\n"
+    "    c += d * LC;\n"
+    "    c += mix(HC1, HC2, dot(nor, HLD)) * AS;\n"
+    "    c += b * BC * o;\n"
+    "    c += f * FC * o;\n"
+    "    \n"
+    "    return col * c;\n"
+    "}\n"
+    "\n"
+    "vec3 render(Surface surface, Camera cam, vec2 uv) {\n"
+    "    vec3 colour = vec3(0.04, 0.045, 0.05);\n"
+    "    colour = vec3(0.35, 0.5, 0.75);\n"
+    "    vec3 colourB = vec3(0.9, 0.85, 0.8);\n"
+    "    \n"
+    "    colour = mix(colourB, colour, pow(length(uv), 2.0) / 1.5);\n"
+    "\n"
+    "    if (surface.id > -1.0) {\n"
+    "        vec3 surfaceNormal = calcNormal(surface.position);\n"
+    "        vec3 ref = reflect(cam.rd, surfaceNormal);\n"
+    "        colour = surfaceNormal;\n"
+    "        vec3 pos = surface.position;\n"
+    "        \n"
+    "        float t = time;\n"
+    "        vec3 col = mix(\n"
+    "            mix(\n"
+    "                vec3(0.8, 0.3, 0.6),\n" 
+    "                vec3(0.6, 0.3, 0.8),\n"
+    "                dot(surfaceNormal, surfaceNormal.zxy)\n"
+    "            ),\n"
+    "            vec3(1.0),\n"
+    "            smoothstep(0.0, 0.1, cos(surface.colour.r * 40.0))\n"
+    "        );\n"
+    "        \n"
+    "        colour = shade(col, pos, surfaceNormal, ref, cam);\n"
+    "    }\n"
+    "\n"
+    "    return colour;\n"
+    "}\n"
+    "\n"
+    "void main() {\n"
+    "    vec3 c = vec3(0.0);\n"
+    "    for (int x = 0; x < 2; x++) {\n"
+    "        for (int y = 0; y < 2; y++) {\n"
+    "            vec2 uv = toScreenspace(gl_FragCoord.xy + vec2(float(x), float(y)) * 0.5);\n"
+    "\n"
+    "            Camera cam = getCamera(uv, vec3(1.5, 0.0, 1.5), vec3(0.0));\n"
+    "            Surface surface = march(cam);\n"
+    "\n"
+    "            c += render(surface, cam, uv);\n"
+    "        }\n"
+    "    }\n"
+    "    \n"
+    "    vec4 final_color = vec4(c * 0.25, 1.0);\n"
+    "    frag_color = vec4(final_color.rgb * u_color.rgb, 1.0).bgra;\n"
+    "}\n"; 
+    
+    
+// Shader for Desktop 3 (Simple Noise)
+static const char *desktop_8_fs_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "uniform float time;\n"
+    "uniform vec2 iResolution;\n"
+    "uniform vec4 u_color;\n"
+    "void main() {\n"
+    "    vec2 I = gl_FragCoord.xy;\n"
+    "    vec4 O = vec4(0.0);\n"
+    "    float t = time,\n"
+    "          i = 0.0,\n"
+    "          z = 0.0,\n"
+    "          d,\n"
+    "          s;\n"
+    "    for(O*=i; i++<1e2; ) {\n"
+    "        vec3 p = z * normalize( vec3(I+I,0) - iResolution.xyy );\n"
+    "        for(d=5.; d<2e2; d+=d)\n"
+    "            p += .6*sin(p.yzx*d - .2*t) / d;\n"
+    "        z += d = .005 + max(s=.3-abs(p.y), -s*.2)/4.;\n"
+    "        O += (cos(s/.07+p.x+.5*t-vec4(3,4,5,0)) + 1.5) * exp(s/.1) / d;\n"
+    "    }\n"
+    "    O = tanh(O*O / 4e8);\n"
+    "    frag_color = vec4(O.rgb * u_color.rgb, 1.0).bgra;\n"
+    "}\n";
+    
+// Shader for Desktop 3 (Simple Noise)
+static const char *desktop_9_fs_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "uniform float time;\n"
+    "uniform vec2 iResolution;\n"
+    "uniform vec4 u_color;\n"
+    "void main() {\n"
+    "    vec2 I = gl_FragCoord.xy;\n"
+    "    vec4 O = vec4(0.0);\n"
+    "    float t = time,\n"
+    "          i = 0.0,\n"
+    "          z = 0.0,\n"
+    "          d,\n"
+    "          s;\n"
+    "    for(O*=i; i++<1e2; ) {\n"
+    "        vec3 p = z * normalize( vec3(I+I,0) - iResolution.xyy );\n"
+    "        for(d=5.; d<2e2; d+=d)\n"
+    "            p += .6*sin(p.yzx*d - .2*t) / d;\n"
+    "        z += d = .005 + max(s=.3-abs(p.y), -s*.2)/4.;\n"
+    "        O += (cos(s/.07+p.x+.5*t-vec4(3,4,5,0)) + 1.5) * exp(s/.1) / d;\n"
+    "    }\n"
+    "    O = tanh(O*O / 4e8);\n"
+    "    frag_color = vec4(O.rgb * u_color.rgb, 1.0).bgra;\n"
+    "}\n";  
+    
+    
+// Shader for Desktop 3 (Simple Noise)
+static const char *desktop_10_fs_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "uniform float time;\n"
+    "uniform vec2 iResolution;\n"
+    "uniform vec4 u_color;\n"
+    "void main() {\n"
+    "    vec2 I = gl_FragCoord.xy;\n"
+    "    vec4 O = vec4(0.0);\n"
+    "    float t = time,\n"
+    "          i = 0.0,\n"
+    "          z = 0.0,\n"
+    "          d,\n"
+    "          s;\n"
+    "    for(O*=i; i++<1e2; ) {\n"
+    "        vec3 p = z * normalize( vec3(I+I,0) - iResolution.xyy );\n"
+    "        for(d=5.; d<2e2; d+=d)\n"
+    "            p += .6*sin(p.yzx*d - .2*t) / d;\n"
+    "        z += d = .005 + max(s=.3-abs(p.y), -s*.2)/4.;\n"
+    "        O += (cos(s/.07+p.x+.5*t-vec4(3,4,5,0)) + 1.5) * exp(s/.1) / d;\n"
+    "    }\n"
+    "    O = tanh(O*O / 4e8);\n"
+    "    frag_color = vec4(O.rgb * u_color.rgb, 1.0).bgra;\n"
+    "}\n"; 
+    
+    
+// Shader for Desktop 3 (Simple Noise)
+static const char *desktop_11_fs_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "uniform float time;\n"
+    "uniform vec2 iResolution;\n"
+    "uniform vec4 u_color;\n"
+    "void main() {\n"
+    "    vec2 I = gl_FragCoord.xy;\n"
+    "    vec4 O = vec4(0.0);\n"
+    "    float t = time,\n"
+    "          i = 0.0,\n"
+    "          z = 0.0,\n"
+    "          d,\n"
+    "          s;\n"
+    "    for(O*=i; i++<1e2; ) {\n"
+    "        vec3 p = z * normalize( vec3(I+I,0) - iResolution.xyy );\n"
+    "        for(d=5.; d<2e2; d+=d)\n"
+    "            p += .6*sin(p.yzx*d - .2*t) / d;\n"
+    "        z += d = .005 + max(s=.3-abs(p.y), -s*.2)/4.;\n"
+    "        O += (cos(s/.07+p.x+.5*t-vec4(3,4,5,0)) + 1.5) * exp(s/.1) / d;\n"
+    "    }\n"
+    "    O = tanh(O*O / 4e8);\n"
+    "    frag_color = vec4(O.rgb * u_color.rgb, 1.0).bgra;\n"
+    "}\n";    
+
+// Shader for Desktop 3 (Simple Noise)
+static const char *desktop_12_fs_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "uniform float time;\n"
+    "uniform vec2 iResolution;\n"
+    "uniform vec4 u_color;\n"
+    "void main() {\n"
+    "    vec2 I = gl_FragCoord.xy;\n"
+    "    vec4 O = vec4(0.0);\n"
+    "    float t = time,\n"
+    "          i = 0.0,\n"
+    "          z = 0.0,\n"
+    "          d,\n"
+    "          s;\n"
+    "    for(O*=i; i++<1e2; ) {\n"
+    "        vec3 p = z * normalize( vec3(I+I,0) - iResolution.xyy );\n"
+    "        for(d=5.; d<2e2; d+=d)\n"
+    "            p += .6*sin(p.yzx*d - .2*t) / d;\n"
+    "        z += d = .005 + max(s=.3-abs(p.y), -s*.2)/4.;\n"
+    "        O += (cos(s/.07+p.x+.5*t-vec4(3,4,5,0)) + 1.5) * exp(s/.1) / d;\n"
+    "    }\n"
+    "    O = tanh(O*O / 4e8);\n"
+    "    frag_color = vec4(O.rgb * u_color.rgb, 1.0).bgra;\n"
+    "}\n";
+
+
+// Shader for Desktop 3 (Simple Noise)
+static const char *desktop_13_fs_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "uniform float time;\n"
+    "uniform vec2 iResolution;\n"
+    "uniform vec4 u_color;\n"
+    "void main() {\n"
+    "    vec2 I = gl_FragCoord.xy;\n"
+    "    vec4 O = vec4(0.0);\n"
+    "    float t = time,\n"
+    "          i = 0.0,\n"
+    "          z = 0.0,\n"
+    "          d,\n"
+    "          s;\n"
+    "    for(O*=i; i++<1e2; ) {\n"
+    "        vec3 p = z * normalize( vec3(I+I,0) - iResolution.xyy );\n"
+    "        for(d=5.; d<2e2; d+=d)\n"
+    "            p += .6*sin(p.yzx*d - .2*t) / d;\n"
+    "        z += d = .005 + max(s=.3-abs(p.y), -s*.2)/4.;\n"
+    "        O += (cos(s/.07+p.x+.5*t-vec4(3,4,5,0)) + 1.5) * exp(s/.1) / d;\n"
+    "    }\n"
+    "    O = tanh(O*O / 4e8);\n"
+    "    frag_color = vec4(O.rgb * u_color.rgb, 1.0).bgra;\n"
+    "}\n"; 
+    
+    
+// Shader for Desktop 3 (Simple Noise)
+static const char *desktop_14_fs_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "uniform float time;\n"
+    "uniform vec2 iResolution;\n"
+    "uniform vec4 u_color;\n"
+    "void main() {\n"
+    "    vec2 I = gl_FragCoord.xy;\n"
+    "    vec4 O = vec4(0.0);\n"
+    "    float t = time,\n"
+    "          i = 0.0,\n"
+    "          z = 0.0,\n"
+    "          d,\n"
+    "          s;\n"
+    "    for(O*=i; i++<1e2; ) {\n"
+    "        vec3 p = z * normalize( vec3(I+I,0) - iResolution.xyy );\n"
+    "        for(d=5.; d<2e2; d+=d)\n"
+    "            p += .6*sin(p.yzx*d - .2*t) / d;\n"
+    "        z += d = .005 + max(s=.3-abs(p.y), -s*.2)/4.;\n"
+    "        O += (cos(s/.07+p.x+.5*t-vec4(3,4,5,0)) + 1.5) * exp(s/.1) / d;\n"
+    "    }\n"
+    "    O = tanh(O*O / 4e8);\n"
+    "    frag_color = vec4(O.rgb * u_color.rgb, 1.0).bgra;\n"
+    "}\n";  
+    
+// Shader for Desktop 3 (Simple Noise)
+static const char *desktop_15_fs_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "uniform float time;\n"
+    "uniform vec2 iResolution;\n"
+    "uniform vec4 u_color;\n"
+    "void main() {\n"
+    "    vec2 I = gl_FragCoord.xy;\n"
+    "    vec4 O = vec4(0.0);\n"
+    "    float t = time,\n"
+    "          i = 0.0,\n"
+    "          z = 0.0,\n"
+    "          d,\n"
+    "          s;\n"
+    "    for(O*=i; i++<1e2; ) {\n"
+    "        vec3 p = z * normalize( vec3(I+I,0) - iResolution.xyy );\n"
+    "        for(d=5.; d<2e2; d+=d)\n"
+    "            p += .6*sin(p.yzx*d - .2*t) / d;\n"
+    "        z += d = .005 + max(s=.3-abs(p.y), -s*.2)/4.;\n"
+    "        O += (cos(s/.07+p.x+.5*t-vec4(3,4,5,0)) + 1.5) * exp(s/.1) / d;\n"
+    "    }\n"
+    "    O = tanh(O*O / 4e8);\n"
+    "    frag_color = vec4(O.rgb * u_color.rgb, 1.0).bgra;\n"
+    "}\n";    
 
 // Background Vertex Shader - Simple fullscreen quad
 
@@ -6898,7 +7736,7 @@ static const char *post_process_frag =
     "const float VIGNETTE_STRENGTH = 0.5;\n"
     "const float FLICKER_INTENSITY = 0.18;\n"
     "const float PHOSPHOR_GLOW = 0.3;\n"
-    "const float SCREEN_CURVE = 0.3;\n"
+    "const float SCREEN_CURVE = 0.0;\n"
     "\n"
     "// Apply screen curvature like old CRT monitors\n"
     "vec2 screenCurve(vec2 uv) {\n"
@@ -7059,9 +7897,9 @@ static const char *post_process_frag =
        server.tv_effect_animating = false; // The effect is off by default
     server.tv_effect_start_time = 0.0f;
     server.tv_effect_duration = 5.0f; // This is our 0 -> 5 second timeline
-    server.expo_effect_active = false;
+    server.expo_effect_active = true;
 server.effect_is_target_zoomed=true;
-server.effect_anim_current_factor=0.0;
+server.effect_anim_current_factor=1.0;
  // <<< ADD THIS INITIALIZATION >>>
        server.tv_effect_animating = false; // Start with the animation off
     server.tv_effect_start_time = 0.0f;
@@ -7172,7 +8010,7 @@ const char *vendor = (const char *)glGetString(GL_VENDOR);
     };
      if (!create_generic_shader_program(server.renderer, "MeltRectShader",
                                      rect_vertex_shader_src,
-                                     rect_fragment_shader_src, // Use the modified one from above
+                                     desktop_0_fs_src, // Use the modified one from above
                                      &server.rect_shader_program,
                                      melt_rect_uniforms, sizeof(melt_rect_uniforms) / sizeof(melt_rect_uniforms[0]))) {
         wlr_log(WLR_ERROR, "Failed to create 'Melt' rect shader program.");
@@ -7257,15 +8095,31 @@ const char *vendor = (const char *)glGetString(GL_VENDOR);
     {"u_scene_texture1", &server.fullscreen_shader_scene_tex1_loc},
     {"u_scene_texture2", &server.fullscreen_shader_scene_tex2_loc},
     {"u_scene_texture3", &server.fullscreen_shader_scene_tex3_loc},
+    {"u_scene_texture4", &server.fullscreen_shader_scene_tex4_loc},
+    {"u_scene_texture5", &server.fullscreen_shader_scene_tex5_loc},
+    {"u_scene_texture6", &server.fullscreen_shader_scene_tex6_loc},
+    {"u_scene_texture7", &server.fullscreen_shader_scene_tex7_loc},
+    {"u_scene_texture8", &server.fullscreen_shader_scene_tex8_loc},
+    {"u_scene_texture9", &server.fullscreen_shader_scene_tex9_loc},
+    {"u_scene_texture10", &server.fullscreen_shader_scene_tex10_loc},
+    {"u_scene_texture11", &server.fullscreen_shader_scene_tex11_loc},
+    {"u_scene_texture12", &server.fullscreen_shader_scene_tex12_loc},
+    {"u_scene_texture13", &server.fullscreen_shader_scene_tex13_loc},
+    {"u_scene_texture14", &server.fullscreen_shader_scene_tex14_loc},
+    {"u_scene_texture15", &server.fullscreen_shader_scene_tex15_loc},
+    {"DesktopGrid", &server.fullscreen_shader_desktop_grid_loc},
     {"u_zoom", &server.fullscreen_shader_zoom_loc},
+    {"u_move", &server.fullscreen_shader_move_loc},
     {"u_zoom_center", &server.fullscreen_shader_zoom_center_loc},
-    {"u_quadrant", &server.fullscreen_shader_quadrant_loc}  // Add this if using the uniform version
+    {"u_quadrant", &server.fullscreen_shader_quadrant_loc},
+    {"switch_mode",&server.fullscreen_switch_mode},
+    {"u_switchXY",&server.fullscreen_switchXY} // Add this if using the uniform version
 // {"u_current_quad", &server.fullscreen_shader_current_quad_loc} 
 };
 
 if (!create_generic_shader_program(server.renderer, "ScaledSceneViewShader",
                                  fullscreen_vertex_shader_src,
-                                 fullscreen_fragment_shader_src,
+                                 expo_fragment_shader_src,
                                  &server.fullscreen_shader_program,
                                  scaled_scene_uniforms,
                                  sizeof(scaled_scene_uniforms) / sizeof(scaled_scene_uniforms[0]))) {
@@ -7285,7 +8139,8 @@ if (!create_generic_shader_program(server.renderer, "ScaledSceneViewShader",
         {"u_zoom_center", &server.cube_shader_zoom_center_loc},
          {"u_zoom", &server.cube_shader_zoom_loc},
         {"u_rotation_y", &server.cube_shader_time_loc}, // RENAMED in shader, but C variable is the same
-        {"u_quadrant", &server.cube_shader_quadrant_loc},
+        {"u_quadrant", &server.cube_shader_quadrant_loc}
+        
     };
 
 if (!create_generic_shader_program(server.renderer, "CubeShader",
@@ -7317,13 +8172,26 @@ if (!create_generic_shader_program(server.renderer, "CubeBackgroundShader",
 }
 
 const char *desktop_fs_sources[] = {
-    rect_fragment_shader_src, // Desktop 0 uses the "Melt" shader
+    desktop_0_fs_src, // Desktop 0 uses the "Melt" shader
     desktop_1_fs_src,         // Desktop 1 uses "Starfield"
     desktop_2_fs_src,         // Desktop 2 uses "Tunnel"
-    desktop_3_fs_src          // Desktop 3 uses "Noise"
+    desktop_3_fs_src,          // Desktop 3 uses "Noise"
+    desktop_4_fs_src, // Desktop 0 uses the "Melt" shader
+    desktop_5_fs_src,         // Desktop 1 uses "Starfield"
+    desktop_6_fs_src,         // Desktop 2 uses "Tunnel"
+    desktop_7_fs_src,          // Desktop 3 uses "Noise"
+    desktop_8_fs_src, // Desktop 0 uses the "Melt" shader
+    desktop_9_fs_src,         // Desktop 1 uses "Starfield"
+    desktop_10_fs_src,         // Desktop 2 uses "Tunnel"
+    desktop_11_fs_src,          // Desktop 3 uses "Noise"
+    desktop_12_fs_src, // Desktop 0 uses the "Melt" shader
+    desktop_13_fs_src,         // Desktop 1 uses "Starfield"
+    desktop_14_fs_src,         // Desktop 2 uses "Tunnel"
+    desktop_15_fs_src          // Desktop 3 uses "Noise"
+    
 };
 
-for (int i = 0; i < 4; ++i) {
+for (int i = 0; i < 16; ++i) {
     char log_name[64];
     snprintf(log_name, sizeof(log_name), "DesktopBGShader%d", i);
 
@@ -7371,8 +8239,8 @@ for (int i = 0; i < 4; ++i) {
     // Initialize zoom effect variables
 
     server.current_desktop = 0;
-    server.desktop_count = 4;
-    server.num_desktops = 4; // Assuming 4 desktops for the example
+    DestopGridSize = 4; // Assuming a 4x4 grid for 16 desktops
+    server.num_desktops = DestopGridSize* DestopGridSize; // Assuming 4 desktops for the example
    
     server.effect_zoom_factor_normal = 2.0f;
     server.effect_zoom_factor_zoomed = 1.0f;
