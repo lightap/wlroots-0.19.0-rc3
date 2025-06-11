@@ -1390,34 +1390,46 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
             // <<< END OF NEW CODE >>>
 
             if (syms[i] == XKB_KEY_w || syms[i] == XKB_KEY_W) {
-                     if (server->cube_effect_active) {
-                       GLOBAL_vertical_offset += 1.2;
-                    } else {
-                        
-                    }
-                    update_toplevel_visibility(server);
-                    handled_by_compositor = true;
-                    break;
-                }
+    int new_desktop = server->current_desktop - 4;
+    
+    // Only change if the new desktop would be within range
+    if (new_desktop >= 0) {
+        GLOBAL_vertical_offset -= 1.2;
+        server->current_desktop = new_desktop;
+    } else {
+        // Clamp to minimum
+        server->current_desktop = 0;
+    }
+    
+    update_toplevel_visibility(server);
+    handled_by_compositor = true;
+    break;
+}
 
-                // --- BINDING: Toggle Cube View ('L' key) ---
-                if (syms[i] == XKB_KEY_S || syms[i] == XKB_KEY_s) {
-                     if (server->cube_effect_active) {
-                        GLOBAL_vertical_offset -= 1.2;
-                    } else {
-                       
-                    }
-                    update_toplevel_visibility(server);
-                    handled_by_compositor = true;
-                    break;
-                }
+// --- BINDING: Toggle Cube View ('S' key) ---
+if (syms[i] == XKB_KEY_S || syms[i] == XKB_KEY_s) {
+    int new_desktop = server->current_desktop + 4;
+    
+    // Only change if the new desktop would be within range
+    if (new_desktop <= 15) {
+        GLOBAL_vertical_offset += 1.2;
+        server->current_desktop = new_desktop;
+    } else {
+        // Clamp to maximum
+        server->current_desktop = 15;
+    }
+    
+    update_toplevel_visibility(server);
+    handled_by_compositor = true;
+    break;
+}
             
 
    
 
                 // --- BINDING: Toggle Expo View ('P' key) ---
                 if (syms[i] == XKB_KEY_p || syms[i] == XKB_KEY_P) {
-                     if (!server->expo_effect_active) {
+                     if (!server->expo_effect_active && !server->cube_effect_active) {
                         server->expo_effect_active = true;
                         wlr_log(WLR_INFO, "Expo Fullscreen Shader Effect ENABLED via 'P'.");
                         server->effect_is_target_zoomed = true;
@@ -1430,6 +1442,7 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
                             server->effect_is_animating_zoom = true;
                         }
                     } else {
+                        
                         server->effect_is_target_zoomed = !server->effect_is_target_zoomed;
                       
                         server->effect_anim_start_factor = server->effect_anim_current_factor;
@@ -1479,25 +1492,41 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 
         // --- BINDING: Switch Desktop ('O' key) ---
         if (!handled_by_compositor && !(modifiers & (WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT | WLR_MODIFIER_SHIFT | WLR_MODIFIER_LOGO))) {
-            for (int i = 0; i < nsyms; i++) {
-                if (syms[i] == XKB_KEY_O || syms[i] == XKB_KEY_o){
-                    int target_desktop = (server->current_desktop + 1) % server->num_desktops;
-                    if (server->expo_effect_active) {
-                       if (switch_mode == 0) {
-                        server->pending_desktop_switch = target_desktop;
-                       }
-                        wlr_log(WLR_INFO, "Desktop switch to %d deferred.", target_desktop);
-                    } else {
-                        server->current_desktop = target_desktop;
-                        server->pending_desktop_switch = -1;
-                        wlr_log(WLR_INFO, "Switched to desktop %d", server->current_desktop);
-                        update_toplevel_visibility(server); // Update which windows are visible
-                    }
-                    handled_by_compositor = true;
-                    break;
-                }
+    for (int i = 0; i < nsyms; i++) {
+        if (syms[i] == XKB_KEY_O || syms[i] == XKB_KEY_o){
+            // Calculate which group of 4 the current desktop is in
+            int group_start = (server->current_desktop / 4) * 4;
+            int group_end = group_start + 3;
+            
+            // Ensure group_end doesn't exceed available desktops
+            if (group_end >= server->num_desktops) {
+                group_end = server->num_desktops - 1;
             }
+            
+            // Calculate next desktop within the group
+            int target_desktop;
+            if (server->current_desktop >= group_end) {
+                target_desktop = group_start; // Wrap to start of group
+            } else {
+                target_desktop = server->current_desktop + 1; // Next in group
+            }
+            
+            if (server->expo_effect_active) {
+               if (switch_mode == 0) {
+                server->pending_desktop_switch = target_desktop;
+               }
+                wlr_log(WLR_INFO, "Desktop switch to %d deferred.", target_desktop);
+            } else {
+                server->current_desktop = target_desktop;
+                server->pending_desktop_switch = -1;
+                wlr_log(WLR_INFO, "Switched to desktop %d", server->current_desktop);
+                update_toplevel_visibility(server); // Update which windows are visible
+            }
+            handled_by_compositor = true;
+            break;
         }
+    }
+}
     }
 
  
