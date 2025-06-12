@@ -525,6 +525,7 @@ struct wl_listener pointer_motion;
     float cube_zoom_center_y;
 
     // Add these to your server struct:
+float start_vertical_offset;     
  float current_interpolated_vertical_offset;
  float target_vertical_offset;
  float vertical_offset_animation_start_time;
@@ -1389,40 +1390,40 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
             }
             // <<< END OF NEW CODE >>>
 
-            if (syms[i] == XKB_KEY_w || syms[i] == XKB_KEY_W) {
-    int new_desktop = server->current_desktop - 4;
-    
-    // Only change if the new desktop would be within range
-    if (new_desktop >= 0) {
-        GLOBAL_vertical_offset -= 1.2;
-        server->current_desktop = new_desktop;
-    } else {
-        // Clamp to minimum
-        server->current_desktop = 0;
-    }
-    
-    update_toplevel_visibility(server);
-    handled_by_compositor = true;
-    break;
-}
+             if (syms[i] == XKB_KEY_w || syms[i] == XKB_KEY_W) {
+                int new_desktop = server->current_desktop - 4;
+                
+                // Only change if the new desktop would be within range
+                if (new_desktop >= 0) {
+                    GLOBAL_vertical_offset -= 1.2;
+                    server->current_desktop = new_desktop;
+                } else {
+                    // Clamp to minimum
+                    server->current_desktop = 0;
+                }
+                
+                update_toplevel_visibility(server);
+                handled_by_compositor = true;
+                break;
+            }
 
-// --- BINDING: Toggle Cube View ('S' key) ---
-if (syms[i] == XKB_KEY_S || syms[i] == XKB_KEY_s) {
-    int new_desktop = server->current_desktop + 4;
-    
-    // Only change if the new desktop would be within range
-    if (new_desktop <= 15) {
-        GLOBAL_vertical_offset += 1.2;
-        server->current_desktop = new_desktop;
-    } else {
-        // Clamp to maximum
-        server->current_desktop = 15;
-    }
-    
-    update_toplevel_visibility(server);
-    handled_by_compositor = true;
-    break;
-}
+            // --- BINDING: Toggle Cube View ('S' key) ---
+            if (syms[i] == XKB_KEY_S || syms[i] == XKB_KEY_s) {
+                int new_desktop = server->current_desktop + 4;
+                
+                // Only change if the new desktop would be within range
+                if (new_desktop <= 15) {
+                    GLOBAL_vertical_offset += 1.2;
+                    server->current_desktop = new_desktop;
+                } else {
+                    // Clamp to maximum
+                    server->current_desktop = 15;
+                }
+                
+                update_toplevel_visibility(server);
+                handled_by_compositor = true;
+                break;
+            }
             
 
    
@@ -3577,12 +3578,12 @@ static void output_frame(struct wl_listener *listener, void *data) {
     bool effects_frame_fbo_path = server->expo_effect_active || server->cube_effect_active;
     
     // Only do early exit if no effects are active
-    if (!effects_frame_fbo_path && !has_damage && !(output_state_direct.committed & WLR_OUTPUT_STATE_BUFFER)) {
-        wlr_log(WLR_DEBUG, "[%s] Direct: No damage or buffer, skipping.", wlr_output->name);
-        wlr_output_state_finish(&output_state_direct);
-        wlr_scene_output_send_frame_done(scene_output, &now);
-        return;
-    }
+   // if (!effects_frame_fbo_path && !has_damage && !(output_state_direct.committed & WLR_OUTPUT_STATE_BUFFER)) {
+   //     wlr_log(WLR_DEBUG, "[%s] Direct: No damage or buffer, skipping.", wlr_output->name);
+   //     wlr_output_state_finish(&output_state_direct);
+   //     wlr_scene_output_send_frame_done(scene_output, &now);
+   //     return;
+   // }
 
 if (!server->cube_effect_active) {
   if (last_quadrant != server->current_desktop) {
@@ -3598,7 +3599,8 @@ if (!server->cube_effect_active) {
         current_rotation = target_rotation;
         last_rendered_rotation = target_rotation;
         animating = false; // Ensure no old rotation animation is running.
-    }}
+    }
+}
 
 
       // --- Cube Effect Animation State Calculation (Completely Separate) ---
@@ -3990,29 +3992,36 @@ else if (server->cube_effect_active) {
     last_rendered_rotation = animated_rotation;
 
     // Interpolate vertical offset
+     if (fabs(GLOBAL_vertical_offset - server->target_vertical_offset) > 0.01f) {
+        // A new target has been set. Start a new animation.
+        // The animation begins from wherever the cube *currently is visually*.
+        server->start_vertical_offset = server->current_interpolated_vertical_offset;
+        
+        // Lock in the new destination.
+        server->target_vertical_offset = GLOBAL_vertical_offset;
+        
+        // Reset the timer and flag that we are animating.
+        server->vertical_offset_animation_start_time = now_float_sec;
+        server->vertical_offset_animating = true;
+    }
+
+    // 2. If an animation is in progress, calculate its current state.
     if (server->vertical_offset_animating) {
-        float animation_duration = 1.0f; // 0.5 seconds for smooth transition
+        float animation_duration = 0.4f; // A nice, smooth duration
         float elapsed = now_float_sec - server->vertical_offset_animation_start_time;
         float t = elapsed / animation_duration;
-        
+
         if (t >= 1.0f) {
-            // Animation complete
-            t = 1.0f;
-            server->vertical_offset_animating = false;
+            // Animation is finished. Snap to the final position.
             server->current_interpolated_vertical_offset = server->target_vertical_offset;
+            server->vertical_offset_animating = false;
         } else {
-            // Smooth interpolation using ease-out curve
-            t = 1.0f - (1.0f - t) * (1.0f - t); // Quadratic ease-out
-            server->current_interpolated_vertical_offset = 
-                server->current_interpolated_vertical_offset * (1.0f - t) + 
-                server->target_vertical_offset * t;
-        }
-    } else {
-        // Check if we need to start a new animation
-        if (fabs(GLOBAL_vertical_offset - server->target_vertical_offset) > 0.01f) {
-            server->target_vertical_offset = GLOBAL_vertical_offset;
-            server->vertical_offset_animation_start_time = now_float_sec;
-            server->vertical_offset_animating = true;
+            // Animation is ongoing. Use a smooth easing curve for a professional feel.
+            float eased_t = 1.0f - pow(1.0f - t, 3.0f); // Ease-out cubic
+
+            // Interpolate from the fixed start point to the fixed target.
+            server->current_interpolated_vertical_offset =
+                server->start_vertical_offset + (server->target_vertical_offset - server->start_vertical_offset) * eased_t;
         }
     }
 
