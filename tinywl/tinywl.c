@@ -5564,6 +5564,7 @@ static const char *panel_fragment_shader_src =
     "\n"
     "    frag_color = final_pixel_color.bgra;\n"
     "}";*/
+    
 static const char *panel_fragment_shader_src =
     "#version 300 es\n"
     "precision mediump float;\n"
@@ -6290,13 +6291,10 @@ static const char *ssd_fragment_shader_src =
     "// --- End of Seigaiha Mandala shader ---";*/
 
 //https://www.shadertoy.com/view/wlscWX
+
+/*
 static const char *ssd_fragment_shader_src =
-  "/*\n"
-  "   Shader Combination: Pyramid Pattern by Shane (https://www.shadertoy.com/view/tdVBRh)\n"
-  "   integrated into a resolution-independent, rounded-corner panel framework.\n"
-  "   The core pattern logic is from the Pyramid shader, while the scaling and\n"
-  "   masking are from the pre-existing panel setup.\n"
-  "*/\n"
+
   "\n"
     "#version 300 es\n"
     "precision mediump float;\n"
@@ -6445,7 +6443,103 @@ static const char *ssd_fragment_shader_src =
     "    // Combine the pattern color with the shape mask\n"
     "    frag_color = vec4(final_pattern_color, shape_alpha_mask);\n"
     "}\n"
-    "// --- End of shader ---";   
+    "// --- End of shader ---";  
+    */
+    
+    static const char *ssd_fragment_shader_src =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "\n"
+    "uniform float time;\n"
+    "uniform vec2 iResolution;\n"
+    "\n"
+    "// --- Effect Parameters ---\n"
+    "const float cornerRadius = 20.0;\n" // Reduced to fit smaller boxes
+    "const float borderWidth = 2.0;\n"   // Reduced for smaller boxes
+    "const float aa = 1.5;\n"
+    "\n"
+    "// --- Helper Functions ---\n"
+    "float sdRoundedBox(vec2 p, vec2 b, float r) {\n"
+    "    vec2 q = abs(p) - b + r;\n"
+    "    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;\n"
+    "}\n"
+    "\n"
+    "vec3 hsv2rgb(vec3 c) {\n"
+    "    vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);\n"
+    "    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);\n"
+    "    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);\n"
+    "}\n"
+    "\n"
+    "float hash21(vec2 p) {\n"
+    "    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);\n"
+    "}\n"
+    "\n"
+    "vec2 hash22(vec2 p) {\n"
+    "    float n = sin(dot(p, vec2(41.0, 289.0)));\n"
+    "    return fract(vec2(262144.0, 32768.0) * n);\n"
+    "}\n"
+    "\n"
+    "// --- Voronoi Pattern Function ---\n"
+    "vec3 voronoiEffect(vec2 uv, float time) {\n"
+    "    vec2 p = uv * iResolution / 150.0;\n"
+    "    vec2 i = floor(p);\n"
+    "    vec2 f = fract(p);\n"
+    "    float minDist = 1.0;\n"
+    "    vec2 minPoint;\n"
+    "    float cellId = 0.0;\n"
+    "    for (int y = -1; y <= 1; y++) {\n"
+    "        for (int x = -1; x <= 1; x++) {\n"
+    "            vec2 neighbor = vec2(float(x), float(y));\n"
+    "            vec2 point = hash22(i + neighbor);\n"
+    "            point = 0.5 + 0.5 * sin(time * 0.5 + 6.2831 * point);\n"
+    "            vec2 diff = neighbor + point - f;\n"
+    "            float dist = length(diff);\n"
+    "            if (dist < minDist) {\n"
+    "                minDist = dist;\n"
+    "                minPoint = point;\n"
+    "                cellId = hash21(i + neighbor);\n"
+    "            }\n"
+    "        }\n"
+    "    }\n"
+    "    float hue = fract(cellId + time * 0.1);\n"
+    "    float saturation = 0.7 + 0.3 * sin(minDist * 5.0);\n"
+    "    float brightness = 0.6 + 0.4 * cos(minDist * 3.0 + time);\n"
+    "    vec3 color = hsv2rgb(vec3(hue, saturation, brightness));\n"
+    "    float border = smoothstep(0.05, 0.1, minDist);\n"
+    "    color *= (1.0 - border * 0.5);\n"
+    "    return color;\n"
+    "}\n"
+    "\n"
+    "void main() {\n"
+    "    vec2 p = (v_texcoord - 0.5) * iResolution;\n"
+    "    vec2 grid_uv = v_texcoord * 2.0;\n"
+    "    vec2 grid_id = floor(grid_uv);\n"
+    "    vec2 grid_coord = fract(grid_uv);\n"
+    "    vec2 grid_center = (grid_id - 0.5) * 0.5;\n"
+    "    vec2 box_pos = p - grid_center * iResolution * 0.5;\n"
+    "    vec2 box_size = iResolution * 0.2;\n" // Smaller boxes (0.4 * 0.5 for grid)
+    "    float d = sdRoundedBox(box_pos, box_size, cornerRadius);\n"
+    "\n"
+    "    vec3 fill_color = vec3(0.0);\n"
+    "    float final_alpha = 0.0;\n"
+    "    if (grid_id.x < 2.0 && grid_id.y < 2.0) {\n"
+    "        fill_color = voronoiEffect(grid_coord, time);\n"
+    "        vec3 border_color = hsv2rgb(vec3(fract(time * 0.15), 0.9, 1.0));\n"
+    "        float border_mix = smoothstep(-borderWidth, -borderWidth + aa, d);\n"
+    "        vec3 final_rgb = mix(border_color, fill_color, border_mix);\n"
+    "        float border_alpha = 0.95;\n"
+    "        float fill_alpha = 0.45;\n"
+    "        final_alpha = mix(border_alpha, fill_alpha, border_mix);\n"
+    "        final_alpha *= (1.0 - smoothstep(-aa, aa, d));\n"
+    "        frag_color = vec4(final_rgb, final_alpha).bgra;\n"
+    "    } else {\n"
+    "        frag_color = vec4(0.0, 0.0, 0.0, 0.0).bgra;\n"
+    "    }\n"
+    "}\n";
+
 /*
 // Add these near your other shader source strings
 static const char *fullscreen_vertex_shader_src =
