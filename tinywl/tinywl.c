@@ -397,6 +397,13 @@ struct wl_listener pointer_motion;
  GLint ssd_shader_resolution_loc;
     struct wlr_scene_node *main_background_node;
 
+// NEW: 2nd Shader for SSDs    
+    GLuint ssd2_shader_program;
+    GLint ssd2_shader_mvp_loc;
+    GLint ssd2_shader_color_loc;
+    GLint ssd2_shader_time_loc;
+    GLint ssd2_shader_resolution_loc;
+
     GLuint back_shader_program;
     GLint back_shader_mvp_loc;
     GLint back_shader_time_loc;
@@ -2775,39 +2782,66 @@ static void render_rect_node(struct wlr_scene_node *node, void *user_data) {
     GLuint program_to_use = 0;
     GLint mvp_loc = -1, color_loc = -1, time_loc = -1, output_res_loc = -1;
     
-    // Default to the color stored in the scene graph node.
     const float *color_to_use = scene_rect->color; 
 
     bool is_main_background = (server->main_background_node == node);
 
     if (is_main_background) {
+        // --- Desktop background logic (unchanged) ---
         int desktop_idx = rdata->desktop_index;
         if (desktop_idx < 0 || desktop_idx >= server->num_desktops) {
             desktop_idx = 0;
         }
-
         program_to_use = server->desktop_background_shaders[desktop_idx];
         mvp_loc = server->desktop_bg_shader_mvp_loc[desktop_idx];
         color_loc = server->desktop_bg_shader_color_loc[desktop_idx];
         time_loc = server->desktop_bg_shader_time_loc[desktop_idx];
         output_res_loc = server->desktop_bg_shader_res_loc[desktop_idx];
-
-        // *** THE FIX IS HERE ***
-        // For any desktop other than 0, use a neutral white color
-        // to prevent tinting the shader's output.
         if (desktop_idx != 0) {
             static const float neutral_color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
             color_to_use = neutral_color;
         }
-        // For desktop 0, color_to_use will remain pointing to the rect's red color.
 
-    } else { // SSD (Server-Side Decoration) logic
-        program_to_use = server->ssd_shader_program;
-        mvp_loc = server->ssd_shader_mvp_loc;
-        color_loc = server->ssd_shader_color_loc;
-        time_loc = server->ssd_shader_time_loc;
-        output_res_loc = server->ssd_shader_resolution_loc;
-        // color_to_use is already correctly pointing to the SSD's own color
+    } else { 
+        // --- SSD (Server-Side Decoration) logic ---
+        bool is_alacritty = false;
+        struct tinywl_toplevel *toplevel = node->data; // This now works because of Step 1
+
+        if (toplevel && toplevel->xdg_toplevel) {
+            // Priority 1: Check app_id (more reliable)
+            if (toplevel->xdg_toplevel->app_id && 
+                strcasestr(toplevel->xdg_toplevel->app_id, "alacritty") != NULL) {
+                is_alacritty = true;
+                wlr_log(WLR_DEBUG, "Detected Alacritty via app_id: '%s'", toplevel->xdg_toplevel->app_id);
+            } 
+            // Priority 2: Fallback to checking the title
+            else if (toplevel->xdg_toplevel->title && 
+                     strcasestr(toplevel->xdg_toplevel->title, "alacritty") != NULL) {
+                is_alacritty = true;
+                wlr_log(WLR_DEBUG, "Detected Alacritty via title: '%s'", toplevel->xdg_toplevel->title);
+            }
+        } else if (node->data) {
+             wlr_log(WLR_DEBUG, "SSD rect has node->data, but it's not a valid toplevel or has no xdg_toplevel.");
+        } else {
+             wlr_log(WLR_DEBUG, "SSD rect has NULL node->data.");
+        }
+
+
+        if (is_alacritty) {
+            // Use the special Alacritty shader
+            program_to_use = server->ssd2_shader_program;
+            mvp_loc = server->ssd2_shader_mvp_loc;
+            color_loc = server->ssd2_shader_color_loc;
+            time_loc = server->ssd2_shader_time_loc;
+            output_res_loc = server->ssd2_shader_resolution_loc;
+        } else {
+            // Use the default SSD shader
+            program_to_use = server->ssd_shader_program;
+            mvp_loc = server->ssd_shader_mvp_loc;
+            color_loc = server->ssd_shader_color_loc;
+            time_loc = server->ssd_shader_time_loc;
+            output_res_loc = server->ssd_shader_resolution_loc;
+        }
     }
 
     if (program_to_use == 0) {
@@ -2815,7 +2849,7 @@ static void render_rect_node(struct wlr_scene_node *node, void *user_data) {
     }
     glUseProgram(program_to_use);
 
-    // MVP setup logic (remains the same)
+    // --- Uniform setup (unchanged) ---
     float mvp[9];
     float box_scale_x = (float)scene_rect->width * (2.0f / output->width);
     float box_scale_y = (float)scene_rect->height * (-2.0f / output->height);
@@ -2830,12 +2864,8 @@ static void render_rect_node(struct wlr_scene_node *node, void *user_data) {
         memcpy(mvp, base_mvp, sizeof(base_mvp));
     }
 
-    // Set uniforms
     if (mvp_loc != -1) glUniformMatrix3fv(mvp_loc, 1, GL_FALSE, mvp);
-    
-    // This will now use the neutral white color for desktops 1, 2, and 3
     if (color_loc != -1) glUniform4fv(color_loc, 1, color_to_use);
-
     if (time_loc != -1) glUniform1f(time_loc, get_monotonic_time_seconds_as_float());
     if (output_res_loc != -1) glUniform2f(output_res_loc, scene_rect->width, scene_rect->height);
 
@@ -4497,13 +4527,22 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
 
 
 // Helper function to create a scene rect
+// Modify the function signature to accept the toplevel
 static struct wlr_scene_rect *create_decoration_rect(
     struct wlr_scene_tree *parent,
+    struct tinywl_toplevel *toplevel, // <<< ADD THIS ARGUMENT
     int width, int height, int x, int y, float color[4]) {
+    
     struct wlr_scene_rect *rect = wlr_scene_rect_create(parent, width, height, color);
     if (rect) {
         wlr_scene_node_set_position(&rect->node, x, y);
-        wlr_scene_node_set_enabled(&rect->node, true); // Initially enabled
+        wlr_scene_node_set_enabled(&rect->node, true);
+        
+        // --- THIS IS THE CRITICAL FIX ---
+        // Store a pointer to the parent toplevel in the node's data field.
+        rect->node.data = toplevel;
+        wlr_log(WLR_DEBUG, "Created decoration rect %p, set its node->data to toplevel %p", (void*)rect, (void*)toplevel);
+
     } else {
         wlr_log(WLR_ERROR, "Failed to create decoration rect");
     }
@@ -5033,15 +5072,14 @@ void ensure_ssd_enabled(struct tinywl_toplevel *toplevel) {
     if (toplevel->ssd.border_right) { wlr_scene_node_destroy(&toplevel->ssd.border_right->node); toplevel->ssd.border_right = NULL; }
     if (toplevel->ssd.border_bottom) { wlr_scene_node_destroy(&toplevel->ssd.border_bottom->node); toplevel->ssd.border_bottom = NULL; }
 
+ float title_bar_color[4] = {0.0f, 0.0f, 0.8f, 0.7f};
+    float border_color[4]    = {0.1f, 0.1f, 0.1f, 0.7f};
 
-    float title_bar_color[4] = {0.0f, 0.0f, 0.8f, 0.7f}; // Slightly transparent
-    float border_color[4]    = {0.1f, 0.1f, 0.1f, 0.7f}; // Slightly transparent
-
-    toplevel->ssd.title_bar    = create_decoration_rect(toplevel->scene_tree, 0, 0, 0, 0, title_bar_color);
-    toplevel->ssd.border_left  = create_decoration_rect(toplevel->scene_tree, 0, 0, 0, 0, border_color);
-    toplevel->ssd.border_right = create_decoration_rect(toplevel->scene_tree, 0, 0, 0, 0, border_color);
-    toplevel->ssd.border_bottom= create_decoration_rect(toplevel->scene_tree, 0, 0, 0, 0, border_color);
-
+    // Pass the toplevel pointer to the helper function
+    toplevel->ssd.title_bar    = create_decoration_rect(toplevel->scene_tree, toplevel, 0, 0, 0, 0, title_bar_color);
+    toplevel->ssd.border_left  = create_decoration_rect(toplevel->scene_tree, toplevel, 0, 0, 0, 0, border_color);
+    toplevel->ssd.border_right = create_decoration_rect(toplevel->scene_tree, toplevel, 0, 0, 0, 0, border_color);
+    toplevel->ssd.border_bottom= create_decoration_rect(toplevel->scene_tree, toplevel, 0, 0, 0, 0, border_color);
     if (!toplevel->ssd.title_bar || !toplevel->ssd.border_left ||
         !toplevel->ssd.border_right || !toplevel->ssd.border_bottom) {
         wlr_log(WLR_ERROR, "[SSD_HELPER] FAILED TO CREATE SOME SSD ELEMENTS for %s", title);
@@ -5754,8 +5792,8 @@ static const char *ssd_vertex_shader_src =
     "}\n";
 
 //army
-/*
-static const char *ssd_fragment_shader_src =
+
+static const char *ssd2_fragment_shader_src =
     "#version 300 es\n"
     "precision mediump float;\n"
     "\n"
@@ -5964,7 +6002,7 @@ static const char *ssd_fragment_shader_src =
     "\n"
     "    frag_color = vec4(col, final_alpha*0.8).bgra;\n"
     "}\n"
-    "// --- End of Inigo Quilez's shader code (adapted) ---\n";*/
+    "// --- End of Inigo Quilez's shader code (adapted) ---\n";
 /*
 static const char *ssd_fragment_shader_src =
   "// Seigaiha Mandala shader converted to panel format, with curved corners using v_texcoord \n"
@@ -6120,7 +6158,7 @@ static const char *ssd_fragment_shader_src =
     "    frag_color = vec4(col, final_alpha).bgra;\n"
     "}\n"
     "// --- End of Seigaiha Mandala shader ---";*/
-    
+
 //https://www.shadertoy.com/view/wlscWX
 static const char *ssd_fragment_shader_src =
   "/*\n"
@@ -9273,6 +9311,27 @@ const char *vendor = (const char *)glGetString(GL_VENDOR);
         server_destroy(&server); return 1;
     }
 
+    
+   struct shader_uniform_spec ssd2_shader_uniforms[] = {
+        {"mvp", &server.ssd2_shader_mvp_loc},
+        {"u_color", &server.ssd2_shader_color_loc},
+        // These are not used by the checkerboard shader, so their locations will be -1.
+        // This is fine as render_rect_node doesn't try to set them for SSDs.
+        {"time", &server.ssd2_shader_time_loc},
+         {"u_rectPixelDimensions", &server.ssd_shader_rect_pixel_dimensions_loc},
+         {"iResolution", &server.ssd2_shader_resolution_loc},
+    };
+
+    // Use the correctly named global shader sources
+    if (!create_generic_shader_program(server.renderer, "SSDShader2", // Updated log name
+                                     ssd_vertex_shader_src,  // Use the renamed global VS
+                                     ssd2_fragment_shader_src, // Use the renamed global FS
+                                     &server.ssd2_shader_program,
+                                     ssd2_shader_uniforms,
+                                     sizeof(ssd2_shader_uniforms) / sizeof(ssd2_shader_uniforms[0]))) {
+        wlr_log(WLR_ERROR, "Failed to create SSD2 shader program.");
+        server_destroy(&server); return 1;
+    }
 
 
 
