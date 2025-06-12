@@ -593,6 +593,10 @@ GLuint intermediate_rbo[16];
      GLuint passthrough_shader_program;
     GLint passthrough_shader_mvp_loc;
     GLint passthrough_shader_tex_loc;
+
+     GLint passthrough_shader_res_loc;
+    GLint passthrough_shader_cornerRadius_loc;
+    GLint passthrough_shader_bevelColor_loc;
     
 
 };
@@ -2584,6 +2588,56 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
     float resolution_iter_draw[2] = {(float)output->width, (float)output->height};
     GLint resolution_loc_iter_draw = glGetUniformLocation(server->shader_program, "iResolution");
     if (resolution_loc_iter_draw != -1) glUniform2fv(resolution_loc_iter_draw, 1, resolution_iter_draw);
+
+ // --- SET THE NEW UNIFORMS HERE ---
+        // Pass the dimensions of the final rendered box (in pixels) to the shader.
+        glUniform2f(server->passthrough_shader_res_loc, (float)main_render_box.width, (float)main_render_box.height);
+
+        // Set the corner radius in pixels. You can make this configurable.
+        glUniform1f(server->passthrough_shader_cornerRadius_loc, 12.0f); // e.g., 12 pixel radius
+
+         // ====================================================================
+    // --- NEW: LOGIC TO CALCULATE CYCLING BEVEL COLOR ---
+    // ====================================================================
+    
+    // 1. Define our color palette
+    static const float color_palette[][4] = {
+        {1.0f, 0.2f, 0.2f, 0.7f}, // Red
+        {1.0f, 1.0f, 0.2f, 0.7f}, // Yellow
+        {0.2f, 1.0f, 0.2f, 0.7f}, // Green
+        {0.2f, 1.0f, 1.0f, 0.7f}, // Cyan
+        {0.2f, 0.2f, 1.0f, 0.7f}, // Blue
+        {1.0f, 0.2f, 1.0f, 0.7f}  // Magenta
+    };
+    const int num_colors = sizeof(color_palette) / sizeof(color_palette[0]);
+    
+    // 2. Calculate timing for the cycle
+    float time_sec = get_monotonic_time_seconds_as_float();
+    float time_per_color = 2.0f; // Each color transition takes 2 seconds
+    float total_cycle_duration = (float)num_colors * time_per_color;
+    float time_in_cycle = fmod(time_sec, total_cycle_duration);
+
+    // 3. Determine which two colors to blend between
+    int current_color_idx = (int)floor(time_in_cycle / time_per_color);
+    int next_color_idx = (current_color_idx + 1) % num_colors; // Wrap around to the start
+
+    // 4. Calculate the blend factor for a smooth transition
+    float time_in_transition = fmod(time_in_cycle, time_per_color);
+    float mix_factor = time_in_transition / time_per_color;
+    // Apply a smooth easing function (smoothstep)
+    float eased_mix_factor = mix_factor * mix_factor * (3.0f - 2.0f * mix_factor);
+
+    // 5. Interpolate between the two colors
+    float final_bevel_color[4];
+    for (int i = 0; i < 4; ++i) {
+        final_bevel_color[i] = 
+            color_palette[current_color_idx][i] * (1.0f - eased_mix_factor) +
+            color_palette[next_color_idx][i] * eased_mix_factor;
+    }
+
+    // 6. Set the final calculated color as the uniform
+    glUniform4fv(server->passthrough_shader_bevelColor_loc, 1, final_bevel_color);
+        // --- END OF NEW UNIFORMS ---
 
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
     wlr_log(WLR_DEBUG, "[SCENE_ITERATOR:%s] Drew main window for '%s'", output_name_log, tl_title_for_log);
@@ -9097,7 +9151,7 @@ static const char *post_process_frag =
     "    FragColor = vec4(color, 1.0);\n"
     "}\n";
 
-
+/*
 // NEW: A simple vertex shader, can be the same as your others.
 static const char *passthrough_vertex_shader_src =
     "#version 300 es\n"
@@ -9122,6 +9176,91 @@ static const char *passthrough_fragment_shader_src =
     "void main() {\n"
     "    // Just sample the texture and output its color, swizzling to BGRA.\n"
     "    frag_color = texture(u_texture, v_texcoord).bgra;\n"
+    "}\n";
+*/
+
+// The vertex shader can remain the same.
+static const char *passthrough_vertex_shader_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "layout(location = 0) in vec2 position;\n"
+    "layout(location = 1) in vec2 texcoord;\n"
+    "out vec2 v_texcoord;\n"
+    "uniform mat3 mvp;\n"
+    "void main() {\n"
+    "    vec3 pos_transformed = mvp * vec3(position, 1.0);\n"
+    "    gl_Position = vec4(pos_transformed.xy, 0.0, 1.0);\n"
+    "    v_texcoord = texcoord;\n"
+    "}\n";
+
+// NEW: Enhanced fragment shader with rounded corners and a bevel.
+// NEW: Enhanced fragment shader with a cycling gradient bevel.
+// NEW: Enhanced fragment shader with a cycling gradient bevel.
+static const char *passthrough_fragment_shader_src =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "\n"
+    "uniform sampler2D u_texture;\n"
+    "uniform vec2 iResolution;\n"
+    "uniform float cornerRadius;\n"
+    "uniform vec4 bevelColor; // This is now IGNORED, but kept for compatibility.\n"
+    "uniform float time; // We now use the time uniform.\n"
+    "\n"
+    "const float bevelWidth = 4.0;\n"
+    "const float aa = 1.5;\n"
+    "\n"
+    "// SDF for a 2D rounded box (unchanged).\n"
+    "float sdRoundedBox(vec2 p, vec2 b, float r) {\n"
+    "    vec2 q = abs(p) - b + r;\n"
+    "    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;\n"
+    "}\n"
+    "\n"
+    "// Helper function to create a rainbow color from a single value (hue).\n"
+    "vec3 hsv2rgb(vec3 c) {\n"
+    "    vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);\n"
+    "    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);\n"
+    "    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);\n"
+    "}\n"
+    "\n"
+    "void main() {\n"
+    "    // --- 1. Shape Calculation (unchanged) ---\n"
+    "    vec2 halfRes = iResolution * 0.5;\n"
+    "    vec2 p = (v_texcoord - 0.5) * iResolution;\n"
+    "    float d = sdRoundedBox(p, halfRes, cornerRadius);\n"
+    "\n"
+    "    // --- 2. Alpha Mask (unchanged) ---\n"
+    "    float shape_alpha = 1.0 - smoothstep(-aa, aa, d);\n"
+    "\n"
+    "    // --- 3. Bevel Calculation (unchanged) ---\n"
+    "    float bevel_intensity = smoothstep(-bevelWidth, 0.0, d);\n"
+    "    bevel_intensity -= smoothstep(0.0, aa, d);\n"
+    "\n"
+    "    // --- 4. NEW: Cycling Gradient Color Calculation ---\n"
+    "    // Calculate the angle of the current pixel relative to the center.\n"
+    "    // atan(y, x) gives an angle from -PI to PI.\n"
+    "    float angle = atan(p.y, p.x);\n"
+    "    // Normalize angle to a 0.0 - 1.0 range.\n"
+    "    float hue = angle / (2.0 * 3.14159) + 0.5;\n"
+    "\n"
+    "    // Make the hue cycle over time.\n"
+    "    hue = fract(hue + time * 0.1);\n"
+    "\n"
+    "    // Convert the cycling hue into an RGB color.\n"
+    "    // We use full saturation (1.0) and brightness (1.0) for a vibrant rainbow.\n"
+    "    vec3 gradient_bevel_color = hsv2rgb(vec3(hue, 1.0, 1.0));\n"
+    "    float bevel_alpha = 0.8; // Set a fixed alpha for the bevel.\n"
+    "\n"
+    "    // --- 5. Color Sampling & Composition ---\n"
+    "    vec4 tex_color = texture(u_texture, v_texcoord);\n"
+    "\n"
+    "    // Mix the texture color with our NEW dynamic gradient color.\n"
+    "    vec3 final_rgb = mix(tex_color.rgb, gradient_bevel_color, bevel_intensity * bevel_alpha);\n"
+    "\n"
+    "    // --- 6. Final Output ---\n"
+    "    float final_alpha = tex_color.a * shape_alpha;\n"
+    "    frag_color = vec4(final_rgb, final_alpha).bgra;\n"
     "}\n";
 
     setenv("MESA_VK_VERSION_OVERRIDE", "1.2", 1);
@@ -9526,9 +9665,13 @@ for (int i = 0; i < 16; ++i) {
     }
 
 
-      struct shader_uniform_spec passthrough_uniforms[] = {
+       struct shader_uniform_spec passthrough_uniforms[] = {
         {"mvp", &server.passthrough_shader_mvp_loc},
-        {"u_texture", &server.passthrough_shader_tex_loc}
+        {"u_texture", &server.passthrough_shader_tex_loc},
+        // --- ADD THESE ---
+        {"iResolution", &server.passthrough_shader_res_loc},
+        {"cornerRadius", &server.passthrough_shader_cornerRadius_loc},
+        {"bevelColor", &server.passthrough_shader_bevelColor_loc}
     };
     if (!create_generic_shader_program(server.renderer, "PassThroughShader",
                                      passthrough_vertex_shader_src, 
