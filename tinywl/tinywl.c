@@ -643,7 +643,7 @@ struct tinywl_decoration { // Your struct for SSD scene rects
 
 };
 
-#define TITLE_BAR_HEIGHT 50
+#define TITLE_BAR_HEIGHT 10
 #define BORDER_WIDTH 10
 
 struct tinywl_toplevel {
@@ -5859,7 +5859,7 @@ static const char *ssd_vertex_shader_src =
     "}\n";
 
 //army
-
+/*
 static const char *ssd2_fragment_shader_src =
     "#version 300 es\n"
     "precision mediump float;\n"
@@ -6069,7 +6069,70 @@ static const char *ssd2_fragment_shader_src =
     "\n"
     "    frag_color = vec4(col, final_alpha*0.8).bgra;\n"
     "}\n"
-    "// --- End of Inigo Quilez's shader code (adapted) ---\n";
+    "// --- End of Inigo Quilez's shader code (adapted) ---\n";*/
+
+// NEW: Converted ssd2 shader with rounded corners and cycling gradient bevel.
+// NEW: SSD shader for a translucent, color-matched fill with a cycling gradient border.
+// NEW: SSD shader for a translucent fill with a HORIZONTAL cycling gradient border.
+static const char *ssd2_fragment_shader_src =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "\n"
+    "uniform float time;\n"
+    "uniform vec2 iResolution; // Resolution of the rect being drawn\n"
+    "\n"
+    "// --- Effect Parameters ---\n"
+    "const float cornerRadius = 40.0;\n"
+    "const float borderWidth = 4.0;\n"
+    "const float aa = 1.5;\n"
+    "\n"
+    "// --- Helper functions (unchanged) ---\n"
+    "float sdRoundedBox(vec2 p, vec2 b, float r) {\n"
+    "    vec2 q = abs(p) - b + r;\n"
+    "    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;\n"
+    "}\n"
+    "\n"
+    "vec3 hsv2rgb(vec3 c) {\n"
+    "    vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);\n"
+    "    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);\n"
+    "    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);\n"
+    "}\n"
+    "\n"
+    "void main() {\n"
+    "    // --- 1. Shape Calculation (unchanged) ---\n"
+    "    vec2 p = (v_texcoord - 0.5) * iResolution;\n"
+    "    float d = sdRoundedBox(p, iResolution * 0.5, cornerRadius);\n"
+    "\n"
+    "    // =========================================================\n"
+    "    // --- 2. NEW: Horizontal Gradient Color Calculation ---\n"
+    "    // =========================================================\n"
+    "    // Instead of using an angle, we use the horizontal texture coordinate.\n"
+    "    // v_texcoord.x ranges from 0.0 on the left to 1.0 on the right.\n"
+    "    float hue_base = v_texcoord.x;\n"
+    "\n"
+    "    // Animate the hue by shifting it over time. The fract() makes it loop.\n"
+    "    float hue = fract(hue_base - time * 0.15);\n"
+    "\n"
+    "    // Create the two colors from the same hue, but with different saturation/brightness.\n"
+    "    vec3 border_color = hsv2rgb(vec3(hue, 0.9, 1.0)); // Bright, saturated border\n"
+    "    vec3 fill_color   = hsv2rgb(vec3(hue, 0.8, 0.5)); // Dimmer, less saturated fill\n"
+    "\n"
+    "    // --- 3. Final Composition (unchanged) ---\n"
+    "    float border_mix = smoothstep(-borderWidth, -borderWidth + aa, d);\n"
+    "    vec3 final_rgb = mix(border_color, fill_color, border_mix);\n"
+    "\n"
+    "    float border_alpha = 0.95;\n"
+    "    float fill_alpha = 0.45;\n"
+    "    float final_alpha = mix(border_alpha, fill_alpha, border_mix);\n"
+    "\n"
+    "    final_alpha *= (1.0 - smoothstep(-aa, aa, d));\n"
+    "\n"
+    "    frag_color = vec4(final_rgb, final_alpha).bgra;\n"
+    "}\n";
+
 /*
 static const char *ssd_fragment_shader_src =
   "// Seigaiha Mandala shader converted to panel format, with curved corners using v_texcoord \n"
