@@ -589,6 +589,10 @@ GLuint intermediate_rbo[16];
     float tv_effect_start_time;
     float tv_effect_duration; 
     bool tv_is_on; 
+
+     GLuint passthrough_shader_program;
+    GLint passthrough_shader_mvp_loc;
+    GLint passthrough_shader_tex_loc;
     
 
 };
@@ -1127,6 +1131,7 @@ static void server_destroy(struct tinywl_server *server) {
 
     if (egl_destroy && wlr_egl_make_current(egl_destroy, NULL)) {
         if (server->shader_program) glDeleteProgram(server->shader_program);
+        if (server->passthrough_shader_program) glDeleteProgram(server->passthrough_shader_program);
         if (server->rect_shader_program) glDeleteProgram(server->rect_shader_program);
         if (server->panel_shader_program) glDeleteProgram(server->panel_shader_program);
         if (server->ssd_shader_program) glDeleteProgram(server->ssd_shader_program);
@@ -2502,6 +2507,8 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
     }
     wlr_gles2_texture_get_attribs(texture, &tex_attribs);
 
+ glUseProgram(server->passthrough_shader_program);
+
     struct wlr_box main_render_box = {
         .x = (int)round((double)sx + (double)texture->width * (1.0 - (double)anim_scale_factor) / 2.0),
         .y = (int)round((double)sy + (double)texture->height * (1.0 - (double)anim_scale_factor) / 2.0),
@@ -2591,7 +2598,7 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
             // This toplevel is being rendered as part of the FBO for 'rdata->desktop_index'.
             // We need to calculate its position in the panel based on its order *among other
             // windows on the same desktop*.
-
+glUseProgram(server->shader_program);
             int per_desktop_index = 0;
             struct tinywl_toplevel *iter_tl;
             wl_list_for_each(iter_tl, &server->toplevels, link) {
@@ -2672,6 +2679,8 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
                     float preview_res_vec[2] = {(float)preview_box_on_screen.width, (float)preview_box_on_screen.height};
                     glUniform2fv(preview_res_loc, 1, preview_res_vec);
                 }
+
+                 glUniform1f(server->flame_shader_time_loc, get_monotonic_time_seconds_as_float());
 
                 glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
                 wlr_log(WLR_DEBUG, "[SCENE_ITERATOR_PREVIEW:%s] Drew preview for '%s' at %d,%d %dx%d",
@@ -9087,6 +9096,34 @@ static const char *post_process_frag =
     "    \n"
     "    FragColor = vec4(color, 1.0);\n"
     "}\n";
+
+
+// NEW: A simple vertex shader, can be the same as your others.
+static const char *passthrough_vertex_shader_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "layout(location = 0) in vec2 position;\n"
+    "layout(location = 1) in vec2 texcoord;\n"
+    "out vec2 v_texcoord;\n"
+    "uniform mat3 mvp;\n"
+    "void main() {\n"
+    "    vec3 pos_transformed = mvp * vec3(position, 1.0);\n"
+    "    gl_Position = vec4(pos_transformed.xy, 0.0, 1.0);\n"
+    "    v_texcoord = texcoord;\n"
+    "}\n";
+
+// NEW: A simple fragment shader that just renders a texture as-is.
+static const char *passthrough_fragment_shader_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "uniform sampler2D u_texture;\n"
+    "void main() {\n"
+    "    // Just sample the texture and output its color, swizzling to BGRA.\n"
+    "    frag_color = texture(u_texture, v_texcoord).bgra;\n"
+    "}\n";
+
     setenv("MESA_VK_VERSION_OVERRIDE", "1.2", 1);
     setenv("MESA_LOADER_DRIVER_OVERRIDE", "zink", 1);
    // setenv("GALLIUM_DRIVER", "zink", 1);
@@ -9488,6 +9525,21 @@ for (int i = 0; i < 16; ++i) {
         return 1;
     }
 
+
+      struct shader_uniform_spec passthrough_uniforms[] = {
+        {"mvp", &server.passthrough_shader_mvp_loc},
+        {"u_texture", &server.passthrough_shader_tex_loc}
+    };
+    if (!create_generic_shader_program(server.renderer, "PassThroughShader",
+                                     passthrough_vertex_shader_src, 
+                                     passthrough_fragment_shader_src,
+                                     &server.passthrough_shader_program,
+                                     passthrough_uniforms, 
+                                     sizeof(passthrough_uniforms) / sizeof(passthrough_uniforms[0]))) {
+        wlr_log(WLR_ERROR, "Failed to create pass-through shader program.");
+        server_destroy(&server); 
+        return 1;
+    }
     // Initialize zoom effect variables
     // Initialize zoom effect variables
 
