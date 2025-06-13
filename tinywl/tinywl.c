@@ -776,6 +776,8 @@ static void update_decoration_geometry(struct tinywl_toplevel *toplevel);
  void ensure_ssd_enabled(struct tinywl_toplevel *toplevel);
  static bool setup_desktop_framebuffer(struct tinywl_server *server, int desktop_idx, int width, int height);
  void update_toplevel_visibility(struct tinywl_server *server) ;
+ void update_compositor_state(struct tinywl_server *server);
+ static void begin_interactive(struct tinywl_toplevel *toplevel, enum tinywl_cursor_mode mode, uint32_t edges);
 // Function to compile a shader
 static GLuint compile_shader(GLenum type, const char *source) {
     GLuint shader = glCreateShader(type);
@@ -1316,26 +1318,22 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
     struct wlr_keyboard_key_event *event = data;
     struct wlr_seat *seat = server->seat;
 
-    // --- Duplicate event detection ---
-    static uint32_t last_keycode_event_kbd = 0;
-    static uint32_t last_state_event_kbd = 0;
-    static uint32_t last_time_event_kbd = 0;
-    if (last_keycode_event_kbd == event->keycode &&
-        last_state_event_kbd == event->state &&
-        event->time_msec > 0 && last_time_event_kbd > 0 &&
-        (event->time_msec - last_time_event_kbd < 5 || last_time_event_kbd - event->time_msec < 5)) {
+    // Duplicate event detection
+    static uint32_t last_keycode = 0, last_state = 0, last_time = 0;
+    if (last_keycode == event->keycode && last_state == event->state && 
+        event->time_msec > 0 && last_time > 0 && 
+        abs((int)(event->time_msec - last_time)) < 5) {
         wlr_log(WLR_DEBUG, "Ignoring duplicate key event: keycode=%u", event->keycode);
         return;
     }
-    last_keycode_event_kbd = event->keycode;
-    last_state_event_kbd = event->state;
-    last_time_event_kbd = event->time_msec;
+    last_keycode = event->keycode;
+    last_state = event->state;
+    last_time = event->time_msec;
 
-    // --- Phantom release key detection ---
+    // Phantom release detection
     if (event->state == WL_KEYBOARD_KEY_STATE_RELEASED && !seat->keyboard_state.focused_surface) {
-        xkb_keycode_t xkb_keycode_check = event->keycode + 8;
-        struct xkb_state *state_check = keyboard->wlr_keyboard->xkb_state;
-        if (xkb_state_key_get_level(state_check, xkb_keycode_check, 0) == 0) {
+        xkb_keycode_t xkb_keycode = event->keycode + 8;
+        if (xkb_state_key_get_level(keyboard->wlr_keyboard->xkb_state, xkb_keycode, 0) == 0) {
             wlr_log(WLR_DEBUG, "Ignoring phantom release for keycode=%u", event->keycode);
             return;
         }
@@ -1344,244 +1342,163 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
     uint32_t keycode_xkb = event->keycode + 8;
     const xkb_keysym_t *syms;
     int nsyms = xkb_state_key_get_syms(keyboard->wlr_keyboard->xkb_state, keycode_xkb, &syms);
-
-    bool handled_by_compositor = false;
     uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
-    bool needs_redraw = false;
+    bool handled_by_compositor = false, needs_redraw = false;
 
-    // --- BINDING: Move window to a desktop (Alt + Shift + [1-4]) ---
-    if ((modifiers & (WLR_MODIFIER_ALT | WLR_MODIFIER_SHIFT)) == (WLR_MODIFIER_ALT | WLR_MODIFIER_SHIFT)) {
-        if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-            struct wlr_surface *focused_surface = server->seat->keyboard_state.focused_surface;
-            if (focused_surface) {
-                struct wlr_xdg_toplevel *xdg_toplevel = wlr_xdg_toplevel_try_from_wlr_surface(focused_surface);
-                // Check that we have our toplevel wrapper struct
-                if (xdg_toplevel && xdg_toplevel->base && xdg_toplevel->base->data) {
-                    struct tinywl_toplevel *toplevel = xdg_toplevel->base->data;
-                    int target_desktop = -1;
-
-                    for (int i = 0; i < nsyms; i++) {
-                        if (syms[i] >= XKB_KEY_1 && syms[i] <= XKB_KEY_4) {
-                            target_desktop = syms[i] - XKB_KEY_1;
+    // Move window to desktop (Alt + Shift + [1-4])
+    if ((modifiers & (WLR_MODIFIER_ALT | WLR_MODIFIER_SHIFT)) == (WLR_MODIFIER_ALT | WLR_MODIFIER_SHIFT) && 
+        event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+        
+        struct wlr_surface *focused = seat->keyboard_state.focused_surface;
+        if (focused) {
+            struct wlr_xdg_toplevel *xdg_toplevel = wlr_xdg_toplevel_try_from_wlr_surface(focused);
+            if (xdg_toplevel && xdg_toplevel->base && xdg_toplevel->base->data) {
+                struct tinywl_toplevel *toplevel = xdg_toplevel->base->data;
+                
+                for (int i = 0; i < nsyms; i++) {
+                    if (syms[i] >= XKB_KEY_1 && syms[i] <= XKB_KEY_4) {
+                        int target = syms[i] - XKB_KEY_1;
+                        if (target < server->num_desktops) {
+                            wlr_log(WLR_INFO, "Moving toplevel '%s' to desktop %d", 
+                                    toplevel->xdg_toplevel->title, target);
+                            toplevel->desktop = target;
+                            update_toplevel_visibility(server);
+                            handled_by_compositor = true;
                             break;
                         }
                     }
-
-                    if (target_desktop != -1 && target_desktop < server->num_desktops) {
-                        wlr_log(WLR_INFO, "Moving toplevel '%s' to desktop %d",
-                                toplevel->xdg_toplevel->title, target_desktop);
-                        toplevel->desktop = target_desktop;
-                        update_toplevel_visibility(server); // Hide the window if we are not in expo mode
-                        handled_by_compositor = true;
-                    }
                 }
             }
         }
     }
 
-    
-
-   if (!handled_by_compositor && event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-        if (!(modifiers & (WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT | WLR_MODIFIER_SHIFT | WLR_MODIFIER_LOGO))) {
-            for (int i = 0; i < nsyms; i++) {
-
-                 // <<< START OF NEW CODE >>>
-            // BINDING: Cycle Expo Effect Mode ('A' key)
-            if (syms[i] == XKB_KEY_a || syms[i] == XKB_KEY_A) {
-                // Cycle between mode 0 (Zoom) and 1 (Slide)
-                switch_mode= (switch_mode + 1) % 2;
-                wlr_log(WLR_INFO, "Expo effect mode switched to: %s",
-                        switch_mode == 0 ? "Zoom" : "Slide");
-                handled_by_compositor = true;
-                break; // Key handled, exit loop
-            }
-
-            // BINDING: Toggle Expo Slide Direction ('Q' key)
-            if (syms[i] == XKB_KEY_q || syms[i] == XKB_KEY_Q) {
-                // Toggle between 0 (Horizontal) and 1 (Vertical)
-                switchXY = 1 - switchXY;
-                wlr_log(WLR_INFO, "Expo slide direction switched to: %s",
-                        switchXY== 0 ? "Horizontal" : "Vertical");
-                handled_by_compositor = true;
-                break; // Key handled, exit loop
-            }
-            // <<< END OF NEW CODE >>>
-
-             if (syms[i] == XKB_KEY_w || syms[i] == XKB_KEY_W) {
-                int new_desktop = server->current_desktop - 4;
-                
-                // Only change if the new desktop would be within range
-                if (new_desktop >= 0) {
-                    GLOBAL_vertical_offset -= 1.2;
-                    server->current_desktop = new_desktop;
-                } else {
-                    // Clamp to minimum
-                    server->current_desktop = 0;
-                }
-                
-                update_toplevel_visibility(server);
-                handled_by_compositor = true;
-                break;
-            }
-
-            // --- BINDING: Toggle Cube View ('S' key) ---
-            if (syms[i] == XKB_KEY_S || syms[i] == XKB_KEY_s) {
-                int new_desktop = server->current_desktop + 4;
-                
-                // Only change if the new desktop would be within range
-                if (new_desktop <= 15) {
-                    GLOBAL_vertical_offset += 1.2;
-                    server->current_desktop = new_desktop;
-                } else {
-                    // Clamp to maximum
-                    server->current_desktop = 15;
-                }
-                
-                update_toplevel_visibility(server);
-                handled_by_compositor = true;
-                break;
-            }
-            
-
-   
-
-                // --- BINDING: Toggle Expo View ('P' key) ---
-                if (syms[i] == XKB_KEY_p || syms[i] == XKB_KEY_P) {
-                     if (!server->expo_effect_active && !server->cube_effect_active) {
-                        server->expo_effect_active = true;
-                        wlr_log(WLR_INFO, "Expo Fullscreen Shader Effect ENABLED via 'P'.");
-                        server->effect_is_target_zoomed = true;
-                     
-                        server->effect_anim_start_factor = server->effect_zoom_factor_normal;
-                       
-                        server->effect_anim_target_factor = server->effect_zoom_factor_zoomed;
-                        if (fabs(server->effect_anim_start_factor - server->effect_anim_target_factor) > 1e-4f) {
-                            server->effect_anim_start_time_sec = get_monotonic_time_seconds_as_float();
-                            server->effect_is_animating_zoom = true;
-                        }
-                    } else {
-                        
-                        server->effect_is_target_zoomed = !server->effect_is_target_zoomed;
-                      
-                        server->effect_anim_start_factor = server->effect_anim_current_factor;
-                       
-                        server->effect_anim_target_factor = server->effect_is_target_zoomed ?
-                            server->effect_zoom_factor_zoomed : server->effect_zoom_factor_normal;
-                        if (fabs(server->effect_anim_start_factor - server->effect_anim_target_factor) > 1e-4f) {
-                            server->effect_anim_start_time_sec = get_monotonic_time_seconds_as_float();
-                            server->effect_is_animating_zoom = true;
-                        }
-                    }
-                    update_toplevel_visibility(server);
-                    handled_by_compositor = true;
-                    break;
-                }
-
-                // --- BINDING: Toggle Cube View ('L' key) ---
-                if (syms[i] == XKB_KEY_l || syms[i] == XKB_KEY_L) {
-                     if (!server->cube_effect_active) {
-                        server->cube_effect_active = true;
-                        wlr_log(WLR_INFO, "Cube Fullscreen Shader Effect ENABLED via 'L'.");
-                        // FIX: Ensure we start by animating towards the zoomed-in state
-                        server->cube_is_target_zoomed = true; 
-                        server->cube_anim_start_factor = server->cube_zoom_factor_normal;
-                        server->cube_anim_target_factor = server->cube_zoom_factor_zoomed;
-                        if (fabs(server->cube_anim_start_factor - server->cube_anim_target_factor) > 1e-4f) {
-                            server->cube_anim_start_time_sec = get_monotonic_time_seconds_as_float();
-                            server->cube_is_animating_zoom = true;
-                        }
-                    } else {
-                        server->cube_is_target_zoomed = !server->cube_is_target_zoomed;
-                        server->cube_anim_start_factor = server->cube_anim_current_factor;
-                        server->cube_anim_target_factor = server->cube_is_target_zoomed ?
-                            server->cube_zoom_factor_zoomed : server->cube_zoom_factor_normal;
-                        if (fabs(server->cube_anim_start_factor - server->cube_anim_target_factor) > 1e-4f) {
-                            server->cube_anim_start_time_sec = get_monotonic_time_seconds_as_float();
-                            server->cube_is_animating_zoom = true;
-                        }
-                    }
-                    update_toplevel_visibility(server);
-                    handled_by_compositor = true;
-                    break;
-                }
-            }
-        }
-    
-
-        // --- BINDING: Switch Desktop ('O' key) ---
-        if (!handled_by_compositor && !(modifiers & (WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT | WLR_MODIFIER_SHIFT | WLR_MODIFIER_LOGO))) {
-    for (int i = 0; i < nsyms; i++) {
-        if (syms[i] == XKB_KEY_O || syms[i] == XKB_KEY_o){
-            // Calculate which group of 4 the current desktop is in
-            int group_start = (server->current_desktop / 4) * 4;
-            int group_end = group_start + 3;
-            
-            // Ensure group_end doesn't exceed available desktops
-            if (group_end >= server->num_desktops) {
-                group_end = server->num_desktops - 1;
-            }
-            
-            // Calculate next desktop within the group
-            int target_desktop;
-            if (server->current_desktop >= group_end) {
-                target_desktop = group_start; // Wrap to start of group
-            } else {
-                target_desktop = server->current_desktop + 1; // Next in group
-            }
-            
-            if (server->expo_effect_active) {
-               if (switch_mode == 0) {
-                server->pending_desktop_switch = target_desktop;
-               }
-                wlr_log(WLR_INFO, "Desktop switch to %d deferred.", target_desktop);
-            } else {
-                server->current_desktop = target_desktop;
-                server->pending_desktop_switch = -1;
-                wlr_log(WLR_INFO, "Switched to desktop %d", server->current_desktop);
-                update_toplevel_visibility(server); // Update which windows are visible
-            }
-            handled_by_compositor = true;
-            break;
-        }
-    }
-}
-    }
-
- 
-
-
-    // <<< ADD THIS NEW BINDING FOR 'K' >>>
-      if (!handled_by_compositor && !(modifiers & (WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT | WLR_MODIFIER_SHIFT | WLR_MODIFIER_LOGO))) {
+    // Handle key press bindings (no modifiers) - Your new consolidated logic
+    if (!handled_by_compositor && event->state == WL_KEYBOARD_KEY_STATE_PRESSED && modifiers == 0) {
+        int target_desktop = -1;
+        int current_desktop = server->current_desktop;
+        
         for (int i = 0; i < nsyms; i++) {
-            if (syms[i] == XKB_KEY_k || syms[i] == XKB_KEY_K) {
-                
-                // --- THE FIX ---
-                // Only trigger if the key is PRESSED and an animation is NOT already running.
-                if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED && !server->tv_effect_animating) {
-                    wlr_log(WLR_INFO, "TV Animation Triggered by K press.");
-                    
-                    // Start the animation
-                    server->tv_effect_animating = true;
-                    server->tv_effect_start_time = get_monotonic_time_seconds_as_float();
-                    
-                    // Schedule a frame on all outputs to make the animation start
-                    struct tinywl_output *output;
-                    wl_list_for_each(output, &server->outputs, link) {
-                        if (output->wlr_output && output->wlr_output->enabled) {
-                            wlr_output_schedule_frame(output->wlr_output);
-                        }
-                    }
+            if (syms[i] == XKB_KEY_O || syms[i] == XKB_KEY_o) {
+                int group_start = (current_desktop / 4) * 4;
+                target_desktop = current_desktop + 1;
+                if (target_desktop >= group_start + 4 || target_desktop >= server->num_desktops) {
+                    target_desktop = group_start;
                 }
-                // --- END OF FIX ---
-                
-                // We handle the key regardless of state to prevent it from going to a client.
-                handled_by_compositor = true;
+                break;
+            }
+            if (syms[i] == XKB_KEY_I || syms[i] == XKB_KEY_i) {
+                int group_start = (current_desktop / 4) * 4;
+                target_desktop = current_desktop - 1;
+                if (target_desktop < group_start) {
+                    target_desktop = group_start + 3;
+                }
+                break;
+            }
+            if (syms[i] == XKB_KEY_w || syms[i] == XKB_KEY_W) {
+                target_desktop = current_desktop - DestopGridSize;
+                if (target_desktop >= 0) 
+                    GLOBAL_vertical_offset -= 1.2;
+                break;
+            }
+            if (syms[i] == XKB_KEY_S || syms[i] == XKB_KEY_s) {
+                target_desktop = current_desktop + DestopGridSize;
+                if (target_desktop < server->num_desktops) 
+                    GLOBAL_vertical_offset += 1.2;
                 break;
             }
         }
+        
+        // If a valid desktop switch was triggered...
+        if (target_desktop != -1 && target_desktop >= 0 && target_desktop < server->num_desktops) {
+            wlr_log(WLR_INFO, "Switching from desktop %d to %d", server->current_desktop, target_desktop);
+            server->current_desktop = target_desktop;
+            server->pending_desktop_switch = target_desktop; // For animations
+            // Call the one true function to fix everything.
+            update_compositor_state(server);
+            handled_by_compositor = true;
+        }
+        
+        // Handle other key bindings that don't involve desktop switching
+        if (!handled_by_compositor) {
+            for (int i = 0; i < nsyms && !handled_by_compositor; i++) {
+                switch (syms[i]) {
+                    case XKB_KEY_a: case XKB_KEY_A:
+                        switch_mode = (switch_mode + 1) % 2;
+                        wlr_log(WLR_INFO, "Expo effect mode: %s", switch_mode == 0 ? "Zoom" : "Slide");
+                        handled_by_compositor = true;
+                        break;
+                        
+                    case XKB_KEY_q: case XKB_KEY_Q:
+                        switchXY = 1 - switchXY;
+                        wlr_log(WLR_INFO, "Expo slide direction: %s", switchXY == 0 ? "Horizontal" : "Vertical");
+                        handled_by_compositor = true;
+                        break;
+                        
+                    case XKB_KEY_p: case XKB_KEY_P:
+                        if (!server->expo_effect_active && !server->cube_effect_active) {
+                            server->expo_effect_active = true;
+                            wlr_log(WLR_INFO, "Expo effect ENABLED");
+                            server->effect_is_target_zoomed = true;
+                            server->effect_anim_start_factor = server->effect_zoom_factor_normal;
+                            server->effect_anim_target_factor = server->effect_zoom_factor_zoomed;
+                        } else {
+                            server->effect_is_target_zoomed = !server->effect_is_target_zoomed;
+                            server->effect_anim_start_factor = server->effect_anim_current_factor;
+                            server->effect_anim_target_factor = server->effect_is_target_zoomed ?
+                                server->effect_zoom_factor_zoomed : server->effect_zoom_factor_normal;
+                        }
+                        
+                        if (fabs(server->effect_anim_start_factor - server->effect_anim_target_factor) > 1e-4f) {
+                            server->effect_anim_start_time_sec = get_monotonic_time_seconds_as_float();
+                            server->effect_is_animating_zoom = true;
+                        }
+                        update_toplevel_visibility(server);
+                        handled_by_compositor = true;
+                        break;
+                        
+                    case XKB_KEY_l: case XKB_KEY_L:
+                        if (!server->cube_effect_active) {
+                            server->cube_effect_active = true;
+                            wlr_log(WLR_INFO, "Cube effect ENABLED");
+                            server->cube_is_target_zoomed = true;
+                            server->cube_anim_start_factor = server->cube_zoom_factor_normal;
+                            server->cube_anim_target_factor = server->cube_zoom_factor_zoomed;
+                        } else {
+                            server->cube_is_target_zoomed = !server->cube_is_target_zoomed;
+                            server->cube_anim_start_factor = server->cube_anim_current_factor;
+                            server->cube_anim_target_factor = server->cube_is_target_zoomed ?
+                                server->cube_zoom_factor_zoomed : server->cube_zoom_factor_normal;
+                        }
+                        
+                        if (fabs(server->cube_anim_start_factor - server->cube_anim_target_factor) > 1e-4f) {
+                            server->cube_anim_start_time_sec = get_monotonic_time_seconds_as_float();
+                            server->cube_is_animating_zoom = true;
+                        }
+                        update_toplevel_visibility(server);
+                        handled_by_compositor = true;
+                        break;
+                        
+                    case XKB_KEY_k: case XKB_KEY_K:
+                        if (!server->tv_effect_animating) {
+                            wlr_log(WLR_INFO, "TV Animation triggered");
+                            server->tv_effect_animating = true;
+                            server->tv_effect_start_time = get_monotonic_time_seconds_as_float();
+                            
+                            struct tinywl_output *output;
+                            wl_list_for_each(output, &server->outputs, link) {
+                                if (output->wlr_output && output->wlr_output->enabled) {
+                                    wlr_output_schedule_frame(output->wlr_output);
+                                }
+                            }
+                        }
+                        handled_by_compositor = true;
+                        break;
+                }
+            }
+        }
     }
-    // --- BINDING: Compositor shortcuts (Alt + [Key]) ---
-    // Make sure Shift isn't pressed to avoid conflict with "move window" binding
+
+    // Alt + key bindings (no Shift)
     if (!handled_by_compositor && (modifiers & WLR_MODIFIER_ALT) && !(modifiers & WLR_MODIFIER_SHIFT)) {
         for (int i = 0; i < nsyms; i++) {
             if (handle_keybinding(server, syms[i])) {
@@ -1593,20 +1510,20 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
     }
 
     if (needs_redraw) {
-        struct tinywl_output *output_iter;
-        wl_list_for_each(output_iter, &server->outputs, link) {
-            if (output_iter->wlr_output && output_iter->wlr_output->enabled) {
-                wlr_output_schedule_frame(output_iter->wlr_output);
+        struct tinywl_output *output;
+        wl_list_for_each(output, &server->outputs, link) {
+            if (output->wlr_output && output->wlr_output->enabled) {
+                wlr_output_schedule_frame(output->wlr_output);
             }
         }
     }
 
-    // --- Forward key event to the client if not handled by us ---
+    // Forward to client if not handled
     if (!handled_by_compositor) {
-        static struct wlr_keyboard *last_keyboard_set_on_seat = NULL;
-        if (last_keyboard_set_on_seat != keyboard->wlr_keyboard) {
+        static struct wlr_keyboard *last_keyboard = NULL;
+        if (last_keyboard != keyboard->wlr_keyboard) {
             wlr_seat_set_keyboard(seat, keyboard->wlr_keyboard);
-            last_keyboard_set_on_seat = keyboard->wlr_keyboard;
+            last_keyboard = keyboard->wlr_keyboard;
         }
         if (seat->keyboard_state.focused_surface) {
             wlr_seat_keyboard_notify_key(seat, event->time_msec, event->keycode, event->state);
@@ -1773,6 +1690,77 @@ static void seat_request_set_selection(struct wl_listener *listener, void *data)
     wlr_seat_set_selection(server->seat, event->source, event->serial);
 }
 
+static struct tinywl_toplevel *find_toplevel_at(struct tinywl_server *server,
+        double lx, double ly, struct wlr_surface **surface, double *sx, double *sy) {
+    
+    // Iterate through our toplevels list FROM TOP TO BOTTOM (front of the list).
+    struct tinywl_toplevel *toplevel;
+    wl_list_for_each(toplevel, &server->toplevels, link) {
+        // Condition 1: Must be an XDG toplevel with a valid scene tree.
+        if (toplevel->type != TINYWL_TOPLEVEL_XDG || !toplevel->scene_tree) {
+            continue;
+        }
+
+        // Condition 2: The scene node must be enabled.
+        if (!toplevel->scene_tree->node.enabled) {
+            continue;
+        }
+        
+        // Condition 3: Must be on the currently active desktop.
+        // This is the key logic that makes windows on other desktops non-interactive.
+        if (toplevel->desktop != server->current_desktop) {
+            continue;
+        }
+
+        // Condition 4: The cursor must be within the toplevel's bounding box.
+        struct wlr_box toplevel_box = {
+            .x = toplevel->scene_tree->node.x,
+            .y = toplevel->scene_tree->node.y,
+        };
+
+        // --- FIX 1: Use direct struct access instead of the old function ---
+        struct wlr_box content_geo = {0};
+        if (toplevel->xdg_toplevel && toplevel->xdg_toplevel->base) {
+             content_geo = toplevel->xdg_toplevel->base->geometry;
+        }
+        
+        if (toplevel->ssd.enabled) {
+            toplevel_box.width = content_geo.width + 2 * BORDER_WIDTH;
+            toplevel_box.height = content_geo.height + TITLE_BAR_HEIGHT + BORDER_WIDTH;
+        } else {
+            toplevel_box.width = content_geo.width;
+            toplevel_box.height = content_geo.height;
+        }
+        
+        if (wlr_box_contains_point(&toplevel_box, lx, ly)) {
+            // It's a match! Now, find the specific surface and local coords.
+            
+            // --- FIX 2 & 3: Correct the variable declaration and typo ---
+            // Now that we know we are inside this toplevel's box, we can use
+            // wlr_scene_node_at to find the specific component under the cursor.
+            struct wlr_scene_node *node_at = wlr_scene_node_at(
+                &toplevel->scene_tree->node, lx, ly, sx, sy);
+            
+            if (node_at && node_at->type == WLR_SCENE_NODE_BUFFER) {
+                // We are over a client surface.
+                struct wlr_scene_buffer *sbuf = wlr_scene_buffer_from_node(node_at);
+                struct wlr_scene_surface *ssurf = wlr_scene_surface_try_from_buffer(sbuf);
+                if (ssurf) {
+                    *surface = ssurf->surface;
+                    return toplevel; // Return the toplevel and the surface.
+                }
+            }
+            
+            // We are over a decoration or empty space within the toplevel's frame.
+            // Return the toplevel, but indicate no specific surface was hit.
+            *surface = NULL;
+            return toplevel;
+        }
+    }
+
+    // No interactive window was found at these coordinates.
+    return NULL;
+}
 
 // You can replace or augment desktop_toplevel_at.
 // This new function tries to find the toplevel owner of any scene node.
@@ -1803,35 +1791,75 @@ static struct tinywl_toplevel *get_toplevel_from_scene_node(struct wlr_scene_nod
     return NULL;
 }
 
-
 static struct tinywl_toplevel *desktop_toplevel_at(
         struct tinywl_server *server, double lx, double ly,
         struct wlr_surface **surface, double *sx, double *sy) {
-    /* This returns the topmost node in the scene at the given layout coords.
-     * We only care about surface nodes as we are specifically looking for a
-     * surface in the surface tree of a tinywl_toplevel. */
-    struct wlr_scene_node *node = wlr_scene_node_at(
-        &server->scene->tree.node, lx, ly, sx, sy);
-    if (node == NULL || node->type != WLR_SCENE_NODE_BUFFER) {
-        return NULL;
-    }
-    struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
-    struct wlr_scene_surface *scene_surface =
-        wlr_scene_surface_try_from_buffer(scene_buffer);
-    if (!scene_surface) {
-        return NULL;
+
+    // Iterate through our toplevels list FROM TOP TO BOTTOM.
+    // The first one we hit that is on the correct desktop and under the
+    // cursor is the one we want.
+    struct tinywl_toplevel *toplevel;
+    wl_list_for_each(toplevel, &server->toplevels, link) {
+        // Condition 1: Must be an XDG toplevel with a valid scene tree.
+        if (toplevel->type != TINYWL_TOPLEVEL_XDG || !toplevel->scene_tree) {
+            continue;
+        }
+
+        // Condition 2: The scene node must be enabled.
+        if (!toplevel->scene_tree->node.enabled) {
+            continue;
+        }
+
+        // Condition 3: Must be on the currently active desktop,
+        // unless an overview effect is active.
+        if (!server->expo_effect_active && !server->cube_effect_active &&
+            toplevel->desktop != server->current_desktop) {
+            continue;
+        }
+
+        // Condition 4: The cursor must be within the node's bounding box.
+        // We get the node's position and size to check this.
+        int node_x = toplevel->scene_tree->node.x;
+        int node_y = toplevel->scene_tree->node.y;
+        
+        // --- THIS IS THE FIX ---
+        // Get the geometry directly from the struct member.
+        struct wlr_box geo = {0};
+        if (toplevel->xdg_toplevel && toplevel->xdg_toplevel->base) {
+            geo = toplevel->xdg_toplevel->base->geometry;
+        }
+
+        struct wlr_box toplevel_box = {
+            .x = node_x,
+            .y = node_y,
+            .width = geo.width,
+            .height = geo.height,
+        };
+        
+        if (wlr_box_contains_point(&toplevel_box, lx, ly)) {
+            // It's a match! Now, find the specific surface and local coords.
+            // We can now safely use wlr_scene_node_at on this specific tree.
+            struct wlr_scene_node *node_inside = wlr_scene_node_at(
+                &toplevel->scene_tree->node, lx, ly, sx, sy);
+            
+            if (node_inside && node_inside->type == WLR_SCENE_NODE_BUFFER) {
+                struct wlr_scene_buffer *sbuf = wlr_scene_buffer_from_node(node_inside);
+                struct wlr_scene_surface *ssurf = wlr_scene_surface_try_from_buffer(sbuf);
+                if (ssurf) {
+                    *surface = ssurf->surface;
+                    return toplevel; // Success!
+                }
+            }
+            // If we are inside the box but not over a buffer (e.g., on the SSD border),
+            // we still found our target toplevel, even if the surface is null.
+            *surface = NULL;
+            return toplevel;
+        }
     }
 
-    *surface = scene_surface->surface;
-    /* Find the node corresponding to the tinywl_toplevel at the root of this
-     * surface tree, it is the only one for which we set the data field. */
-    struct wlr_scene_tree *tree = node->parent;
-    while (tree != NULL && tree->node.data == NULL) {
-        tree = tree->node.parent;
-    }
-    return tree->node.data;
+    // If we get here, no interactive window was found.
+    return NULL;
 }
-
 ///////////////////////////////////////////////////
 
 
@@ -1936,6 +1964,7 @@ static void ensure_popup_responsiveness(struct tinywl_server *server, struct wlr
     }
 }
 /////////////////////////////////////////////////////////////
+// Replace this function
 static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
     if (server->cursor_mode == TINYWL_CURSOR_MOVE) {
         process_cursor_move(server);
@@ -1944,31 +1973,24 @@ static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
         process_cursor_resize(server);
         return;
     }
-    
+
     double sx, sy;
     struct wlr_seat *seat = server->seat;
     struct wlr_surface *surface = NULL;
-    wlr_log(WLR_DEBUG, "[PROCESS_CURSOR_MOTION] Cursor at: (%.2f, %.2f)", server->cursor->x, server->cursor->y);
     
-    struct tinywl_toplevel *toplevel = desktop_toplevel_at(server,
+    // Use our NEW, reliable function
+    struct tinywl_toplevel *toplevel = find_toplevel_at(server,
             server->cursor->x, server->cursor->y, &surface, &sx, &sy);
-    
-    wlr_log(WLR_DEBUG, "[PROCESS_CURSOR_MOTION] Surface: %p, Surface coords: (%.2f, %.2f), Toplevel: %p",
-            surface, sx, sy, toplevel);
-    
-    if (!toplevel) {
-        wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
-    }
-    
-    if (surface) {
-        ensure_popup_responsiveness(server, surface);
-        wlr_seat_pointer_notify_enter(seat, surface, sx, sy);
-        wlr_seat_pointer_notify_motion(seat, time, sx, sy);
-    } else {
-        wlr_seat_pointer_clear_focus(seat);
-    }
-}
 
+    if (!surface) {
+        wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
+        wlr_seat_pointer_clear_focus(seat);
+        return;
+    }
+
+    wlr_seat_pointer_notify_enter(seat, surface, sx, sy);
+    wlr_seat_pointer_notify_motion(seat, time, sx, sy);
+}
 
 static void server_cursor_motion(struct wl_listener *listener, void *data) {
     // THIS listener *IS* server.cursor_motion from the struct tinywl_server
@@ -1998,137 +2020,70 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
     struct wlr_pointer_button_event *event = data;
     struct wlr_seat *seat = server->seat;
 
-    wlr_log(WLR_DEBUG, "Button: button=%u, state=%s, time=%u, cursor_mode=%d",
-            event->button, event->state == WL_POINTER_BUTTON_STATE_PRESSED ? "pressed" : "released",
-            event->time_msec, server->cursor_mode);
-
-    double sx_at_node, sy_at_node; // Renamed to avoid conflict with sx, sy for surface
-    struct wlr_scene_node *scene_node_at_cursor = wlr_scene_node_at(
-        &server->scene->tree.node, server->cursor->x, server->cursor->y, &sx_at_node, &sy_at_node);
-
-    struct tinywl_toplevel *toplevel = NULL;
-    if (scene_node_at_cursor) {
-        toplevel = get_toplevel_from_scene_node(scene_node_at_cursor);
-    }
+    // Use our new, reliable function to find what's under the cursor.
+    struct wlr_surface *surface_at_cursor = NULL;
+    double sx, sy;
+    struct tinywl_toplevel *toplevel = find_toplevel_at(server,
+        server->cursor->x, server->cursor->y, &surface_at_cursor, &sx, &sy);
 
     if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
-        if (server->cursor_mode == TINYWL_CURSOR_MOVE || server->cursor_mode == TINYWL_CURSOR_RESIZE) {
+        // If an interactive grab was in progress, end it.
+        if (server->cursor_mode != TINYWL_CURSOR_PASSTHROUGH) {
             server->cursor_mode = TINYWL_CURSOR_PASSTHROUGH;
             server->grabbed_toplevel = NULL;
-            wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
-            wlr_log(WLR_DEBUG, "Ended interactive move/resize.");
+            // The cursor icon will be reset on the next motion event.
         }
-        wlr_seat_pointer_notify_button(seat, event->time_msec, event->button, event->state);
-    } else if (event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
-        bool button_handled_by_compositor = false;
+    } else { // Button pressed
+        bool handled_by_compositor = false;
 
-        if (toplevel && toplevel->type == TINYWL_TOPLEVEL_XDG && toplevel->xdg_toplevel && toplevel->ssd.enabled && event->button == BTN_LEFT) {
-            uint32_t current_resize_edges = 0;
-            const char *cursor_to_set = NULL;
+        // If we clicked on a toplevel on the current desktop...
+        if (toplevel) {
+            // Immediately focus the toplevel we clicked on ("click-to-focus").
+            focus_toplevel(toplevel);
 
-            if (scene_node_at_cursor == &toplevel->ssd.title_bar->node) {
-                focus_toplevel(toplevel);
-                server->cursor_mode = TINYWL_CURSOR_MOVE;
-                server->grabbed_toplevel = toplevel;
-                server->grab_x = server->cursor->x - toplevel->scene_tree->node.x;
-                server->grab_y = server->cursor->y - toplevel->scene_tree->node.y;
-                wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "grabbing");
-                button_handled_by_compositor = true;
-            } else if (toplevel->ssd.border_left && scene_node_at_cursor == &toplevel->ssd.border_left->node) {
-                current_resize_edges = WLR_EDGE_LEFT;
-                cursor_to_set = "left_side";
-            } else if (toplevel->ssd.border_right && scene_node_at_cursor == &toplevel->ssd.border_right->node) {
-                current_resize_edges = WLR_EDGE_RIGHT;
-                cursor_to_set = "right_side";
-            } else if (toplevel->ssd.border_bottom && scene_node_at_cursor == &toplevel->ssd.border_bottom->node) {
-                current_resize_edges = WLR_EDGE_BOTTOM;
-                cursor_to_set = "bottom_side";
+            // Now, check if we clicked on a server-side decoration to start a move/resize.
+            if (toplevel->ssd.enabled && event->button == BTN_LEFT) {
+                // Find the specific decoration node under the cursor.
+                double dummy_sx, dummy_sy;
+                struct wlr_scene_node *node_at = wlr_scene_node_at(
+                    &toplevel->scene_tree->node, server->cursor->x, server->cursor->y, &dummy_sx, &dummy_sy);
+
+                if (node_at == &toplevel->ssd.title_bar->node) {
+                    begin_interactive(toplevel, TINYWL_CURSOR_MOVE, 0);
+                    handled_by_compositor = true;
+                } else {
+                    uint32_t resize_edges = 0;
+                    if (node_at == &toplevel->ssd.border_left->node) {
+                        resize_edges = WLR_EDGE_LEFT;
+                    } else if (node_at == &toplevel->ssd.border_right->node) {
+                        resize_edges = WLR_EDGE_RIGHT;
+                    } else if (node_at == &toplevel->ssd.border_bottom->node) {
+                        resize_edges = WLR_EDGE_BOTTOM;
+                    }
+                    // NOTE: You can add corner checks here if you want diagonal resizing.
+                    
+                    if (resize_edges != 0) {
+                        begin_interactive(toplevel, TINYWL_CURSOR_RESIZE, resize_edges);
+                        handled_by_compositor = true;
+                    }
+                }
             }
-            // TODO: Add corner checks if desired, e.g.:
-            // else if (cursor near bottom-left corner of SSD) {
-            //    current_resize_edges = WLR_EDGE_BOTTOM | WLR_EDGE_LEFT;
-            //    cursor_to_set = "bottom_left_corner";
-            // }
-
-            if (current_resize_edges != 0) {
-                focus_toplevel(toplevel);
-                server->cursor_mode = TINYWL_CURSOR_RESIZE;
-                server->grabbed_toplevel = toplevel;
-                server->resize_edges = current_resize_edges;
-
-                // Store grab_geobox as the current *content* geometry in screen coordinates
-                struct wlr_box *client_geo = &toplevel->xdg_toplevel->base->geometry; // Usually 0,0 relative to its own surface
-                // Get scene_tree position (top-left of whole decorated window)
-                int scene_tree_x = toplevel->scene_tree->node.x;
-                int scene_tree_y = toplevel->scene_tree->node.y;
-
-                // Calculate content top-left in screen coordinates
-                server->grab_geobox.x = scene_tree_x + BORDER_WIDTH;
-                server->grab_geobox.y = scene_tree_y + TITLE_BAR_HEIGHT;
-                server->grab_geobox.width = toplevel->xdg_toplevel->current.width;  // Use current size
-                server->grab_geobox.height = toplevel->xdg_toplevel->current.height; // Use current size
-
-                // Store grab_x/y as offset from cursor to the *corresponding content edge*
-                if (current_resize_edges & WLR_EDGE_LEFT) {
-                    server->grab_x = server->cursor->x - server->grab_geobox.x;
-                }
-                if (current_resize_edges & WLR_EDGE_RIGHT) {
-                    server->grab_x = server->cursor->x - (server->grab_geobox.x + server->grab_geobox.width);
-                }
-                // No top edge SSD resize for now
-                if (current_resize_edges & WLR_EDGE_BOTTOM) {
-                    server->grab_y = server->cursor->y - (server->grab_geobox.y + server->grab_geobox.height);
-                }
-                
-                if (cursor_to_set) {
-                    wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, cursor_to_set);
-                }
-                wlr_log(WLR_INFO, "Grabbed toplevel '%s' for RESIZE (edges: %u). Grab box (content screen): %d,%d %dx%d. Grab offset x:%.1f y:%.1f",
-                    toplevel->xdg_toplevel->title ? toplevel->xdg_toplevel->title : "N/A",
-                    current_resize_edges, server->grab_geobox.x, server->grab_geobox.y,
-                    server->grab_geobox.width, server->grab_geobox.height, server->grab_x, server->grab_y);
-                button_handled_by_compositor = true;
-            }
+        } else {
+            // Click was not on any of our toplevels. Clear keyboard focus.
+            wlr_seat_keyboard_clear_focus(seat);
         }
 
-
-        if (!button_handled_by_compositor) {
-            struct wlr_surface *surface_under_cursor = NULL;
-            double sx_surf, sy_surf; // For surface-local coordinates
-            if (scene_node_at_cursor && scene_node_at_cursor->type == WLR_SCENE_NODE_BUFFER) {
-                struct wlr_scene_buffer *sbuf = wlr_scene_buffer_from_node(scene_node_at_cursor);
-                struct wlr_scene_surface *ssurf = wlr_scene_surface_try_from_buffer(sbuf);
-                if (ssurf) {
-                    surface_under_cursor = ssurf->surface;
-                    // sx_at_node, sy_at_node are already surface-local from wlr_scene_node_at
-                    sx_surf = sx_at_node;
-                    sy_surf = sy_at_node;
-                }
-            }
-
-            if (surface_under_cursor) {
-                if (toplevel) {
-                    focus_toplevel(toplevel);
-                }
-                wlr_seat_pointer_notify_enter(seat, surface_under_cursor, sx_surf, sy_surf);
-                wlr_seat_pointer_notify_button(seat, event->time_msec, event->button, event->state);
-            } else {
-                wlr_seat_pointer_clear_focus(seat);
-                 if (seat->keyboard_state.focused_surface) {
-                     wlr_seat_keyboard_clear_focus(seat);
-                 }
-            }
+        // If the compositor didn't handle the click for a move/resize,
+        // it should be passed to the client.
+        if (!handled_by_compositor) {
+            wlr_seat_set_keyboard(seat, wlr_seat_get_keyboard(seat));
         }
     }
-
-    struct tinywl_output *output_iter;
-    wl_list_for_each(output_iter, &server->outputs, link) {
-        if (output_iter->wlr_output && output_iter->wlr_output->enabled) {
-            wlr_output_schedule_frame(output_iter->wlr_output);
-        }
-    }
+    
+    // Always notify the seat of the button event. The seat will forward it
+    // to the client with current keyboard focus if appropriate.
+    wlr_seat_pointer_notify_button(seat, event->time_msec, event->button, event->state);
 }
-
 static void server_cursor_axis(struct wl_listener *listener, void *data) {
     struct tinywl_server *server = wl_container_of(listener, server, cursor_axis);
     struct wlr_pointer_axis_event *event = data;
@@ -3790,31 +3745,7 @@ server->effect_is_target_zoomed=false;
                         server->pending_desktop_switch = -1;
                     }
 
-                    // 2. Update visibility now that the effect is off.
-                    update_toplevel_visibility(server);
-
-                    // 3. Find the topmost window on the new desktop to make it active.
-                    //    This fixes the "many clicks" problem.
-                    struct tinywl_toplevel *toplevel_to_focus = NULL;
-                    struct tinywl_toplevel *toplevel_iter;
-                    wl_list_for_each(toplevel_iter, &server->toplevels, link) {
-                        if (toplevel_iter->desktop == server->current_desktop && toplevel_iter->mapped) {
-                            toplevel_to_focus = toplevel_iter;
-                            break;
-                        }
-                    }
-
-                    if (toplevel_to_focus) {
-                        focus_toplevel(toplevel_to_focus);
-                    } else {
-                        if (server->seat->keyboard_state.focused_surface) {
-                            wlr_seat_keyboard_clear_focus(server->seat);
-                        }
-                    }
-
-                    // 4. Update the mouse pointer's focus to restore hover effects.
-                    uint32_t time_msec = now.tv_sec * 1000 + now.tv_nsec / 1000000;
-                    process_cursor_motion(server, time_msec);
+                   update_compositor_state(server); // <-- THE FIX
                 }
             } else {
                 server->cube_anim_current_factor = server->cube_anim_start_factor + (server->cube_anim_target_factor - server->cube_anim_start_factor) * t;
@@ -3844,40 +3775,7 @@ server->effect_is_target_zoomed=false;
                     server->expo_effect_active = false;
                     wlr_log(WLR_INFO, "[%s] Expo Effect OFF.", wlr_output->name);
 
-                    // --- THIS IS THE "REFRESH" LOGIC ---
-                    // It does exactly what a direct 'o' press would do.
-
-                    // 1. Apply the deferred desktop switch if there is one.
-                    if (server->pending_desktop_switch != -1) {
-                        server->current_desktop = server->pending_desktop_switch;
-                        server->pending_desktop_switch = -1;
-                    }
-
-                    // 2. Update visibility now that the effect is off.
-                    update_toplevel_visibility(server);
-
-                    // 3. Find the topmost window on the new desktop to make it active.
-                    //    This fixes the "many clicks" problem.
-                    struct tinywl_toplevel *toplevel_to_focus = NULL;
-                    struct tinywl_toplevel *toplevel_iter;
-                    wl_list_for_each(toplevel_iter, &server->toplevels, link) {
-                        if (toplevel_iter->desktop == server->current_desktop && toplevel_iter->mapped) {
-                            toplevel_to_focus = toplevel_iter;
-                            break;
-                        }
-                    }
-
-                    if (toplevel_to_focus) {
-                        focus_toplevel(toplevel_to_focus);
-                    } else {
-                        if (server->seat->keyboard_state.focused_surface) {
-                            wlr_seat_keyboard_clear_focus(server->seat);
-                        }
-                    }
-
-                    // 4. Update the mouse pointer's focus to restore hover effects.
-                    uint32_t time_msec = now.tv_sec * 1000 + now.tv_nsec / 1000000;
-                    process_cursor_motion(server, time_msec);
+                    update_compositor_state(server); // <-- THE FIX
                     
                 }
             } else {
@@ -3928,61 +3826,22 @@ if (server->tv_effect_animating) {
     time_for_shader = server->tv_effect_duration / 2.0f;
 }
 
-     if (!server->expo_effect_active & !server->cube_effect_active) {
-   
-            float now_sec = get_monotonic_time_seconds_as_float();
-            float elapsed_sec = now_sec - server->effect_anim_start_time_sec;
-            float t = (server->effect_anim_duration_sec > 1e-5f) ? (elapsed_sec / server->effect_anim_duration_sec) : 1.0f;
+     if (server->cube_effect_active) {
+        // If the cube is on, the expo MUST be off.
+        if (server->expo_effect_active) {
+            server->expo_effect_active = false;
+            // No need to handle focus here; the cube logic does that when it deactivates.
+        }
+    } else {
+        // If the cube is off, the expo MUST be on (our default state).
+        if (!server->expo_effect_active) {
+            server->expo_effect_active = true;
 
-          //    if (t >= 1.0f) {
-              //  server->effect_anim_current_factor = server->effect_anim_target_factor;
-            //    server->effect_is_animating_zoom = false;
+            
+        }
+    }
 
-                // This code block runs ONLY when the zoom-out animation finishes.
-              //  if (server->effect_is_target_zoomed) {
-                   if (!server->cube_effect_active)
-                   {
-                   server->expo_effect_active = true;
-                   }else {
-                   server->expo_effect_active = false;
-                   }
-                   wlr_log(WLR_INFO, "[%s] Expo Effect OFF.", wlr_output->name);
-
-                    // --- THIS IS THE "REFRESH" LOGIC ---
-                    // It does exactly what a direct 'o' press would do.
-
-                    
-
-                    // 2. Update visibility now that the effect is off.
-                    update_toplevel_visibility(server);
-
-                    // 3. Find the topmost window on the new desktop to make it active.
-                    //    This fixes the "many clicks" problem.
-                    struct tinywl_toplevel *toplevel_to_focus = NULL;
-                    struct tinywl_toplevel *toplevel_iter;
-                    wl_list_for_each(toplevel_iter, &server->toplevels, link) {
-                        if (toplevel_iter->desktop == server->current_desktop && toplevel_iter->mapped) {
-                            toplevel_to_focus = toplevel_iter;
-                            break;
-                        }
-                    }
-
-                    if (toplevel_to_focus) {
-                        focus_toplevel(toplevel_to_focus);
-                    } else {
-                        if (server->seat->keyboard_state.focused_surface) {
-                            wlr_seat_keyboard_clear_focus(server->seat);
-                        }
-                    }
-
-                    // 4. Update the mouse pointer's focus to restore hover effects.
-                    uint32_t time_msec = now.tv_sec * 1000 + now.tv_nsec / 1000000;
-                    process_cursor_motion(server, time_msec);
-                    
-             //   }
-            } 
-
-
+ 
 
     // =========================================================================================
     // --- STAGE 1 (Conditional): Prepare Textures for Multi-Desktop Effects ---
@@ -4054,6 +3913,8 @@ if (server->tv_effect_animating) {
     render_desktop_content(server, wlr_output, &rdata, target_quadrant);
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    
 }
 
 
@@ -5047,6 +4908,39 @@ void update_toplevel_visibility(struct tinywl_server *server) {
     }
 }
 
+
+// NEW: Centralized function to manage all state changes.
+/**
+ * The single source of truth for updating the compositor's state after a
+ * major change, like switching desktops.
+ */
+void update_compositor_state(struct tinywl_server *server) {
+    wlr_log(WLR_INFO, "--- Updating compositor state for desktop %d ---", server->current_desktop);
+
+    // 1. Update which toplevels are visible in the scene graph.
+    update_toplevel_visibility(server);
+
+    // 2. Clear all focus from the seat. This is the crucial reset step.
+    if (server->seat->keyboard_state.focused_surface) {
+        wlr_seat_keyboard_clear_focus(server->seat);
+    }
+    wlr_seat_pointer_clear_focus(server->seat);
+
+    // 3. Re-evaluate what the pointer is over. This function will now find
+    // the correct topmost window on the new desktop and grant it pointer focus.
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    uint32_t time_msec = now.tv_sec * 1000 + now.tv_nsec / 1000000;
+    process_cursor_motion(server, time_msec);
+
+    // 4. Schedule a frame on all outputs to render the changes.
+    struct tinywl_output *output;
+    wl_list_for_each(output, &server->outputs, link) {
+        if (output->wlr_output && output->wlr_output->enabled) {
+            wlr_output_schedule_frame(output->wlr_output);
+        }
+    }
+}
 
 static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
     if (!listener || !data) {
