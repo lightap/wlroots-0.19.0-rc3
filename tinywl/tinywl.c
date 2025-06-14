@@ -607,7 +607,11 @@ GLuint intermediate_rbo[16];
    
     GLint genie_shader_bend_factor_loc;
     
-
+// NEW: Tessellated mesh for Genie Effect
+    GLuint genie_vao;
+    GLuint genie_vbo;
+    GLuint genie_ibo;
+    int genie_index_count;
 };
 
 static float current_rotation = 0.0f;
@@ -1172,6 +1176,17 @@ static void server_destroy(struct tinywl_server *server) {
         if (server->quad_vao) glDeleteVertexArrays(1, &server->quad_vao);
         if (server->quad_vbo) glDeleteBuffers(1, &server->quad_vbo);
         if (server->quad_ibo) glDeleteBuffers(1, &server->quad_ibo);
+        if (server->genie_shader_program) glDeleteProgram(server->genie_shader_program);
+        if (server->genie_vao) glDeleteVertexArrays(1, &server->genie_vao);
+        if (server->genie_vbo) glDeleteBuffers(1, &server->genie_vbo);
+        if (server->genie_ibo) glDeleteBuffers(1, &server->genie_ibo);
+        // ...
+
+        // Also add the new members to the zero-out list:
+        server->genie_shader_program = 0;
+        server->genie_vao = 0;
+        server->genie_vbo = 0;
+        server->genie_ibo = 0;
         
         server->shader_program = 0;
         server->rect_shader_program = 0;
@@ -2490,8 +2505,8 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
     // --- DECISION: Which rendering path to take? ---
     // ====================================================================
 
-  if (toplevel && toplevel->is_minimizing) {
-    // --- PATH 1: MODIFIED Genie Minimize/Restore Animation with Passthrough Shader ---
+ if (toplevel && toplevel->is_minimizing) {
+    // --- PATH 1: MODIFIED Genie Minimize/Restore Animation with Passthrough Shader and Tessellated Mesh ---
 
     // Use cached texture for minimize animation.
     struct wlr_texture *anim_texture = toplevel->cached_texture;
@@ -2512,14 +2527,14 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
                    ? fminf(1.0f, elapsed / toplevel->minimize_duration)
                    : 1.0f;
 
-    if (progress < 1.0f) {
-        wlr_output_schedule_frame(output);
-    } else {
+    if (progress >= 1.0f) {
         toplevel->is_minimizing = false;
         if (toplevel->minimizing_to_dock) {
             toplevel->minimized = true;
             wlr_scene_node_set_enabled(&toplevel->scene_tree->node, false);
         }
+    } else {
+        wlr_output_schedule_frame(output);
     }
 
     struct wlr_box start_box = toplevel->minimize_start_geom;
@@ -2684,7 +2699,7 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
         glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
         
         // ====================================================================
-        // PASS 2: RENDER GENIE SHADER USING INTERMEDIATE TEXTURE
+        // PASS 2: RENDER GENIE SHADER WITH TESSELLATED MESH USING INTERMEDIATE TEXTURE
         // ====================================================================
         
         // Switch back to original framebuffer
@@ -2693,10 +2708,11 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
         // Reset viewport to output dimensions
         glViewport(0, 0, output->width, output->height);
         
-        // Use genie shader program
+        // Use genie shader program with tessellated mesh
         glUseProgram(server->genie_shader_program);
+        glBindVertexArray(server->genie_vao);
 
-        // --- MVP Matrix Calculation for the render_box (same as paste-1) ---
+        // --- MVP Matrix Calculation for the render_box ---
         float main_mvp[9];
         float box_scale_x = (float)render_box.width * (2.0f / output->width);
         float box_scale_y = (float)render_box.height * (-2.0f / output->height);
@@ -2707,15 +2723,20 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
 
         // Apply output and buffer transforms
         if (output->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
-            float temp_mvp[9]; memcpy(temp_mvp, main_mvp, sizeof(main_mvp));
-            float transform_matrix[9]; wlr_matrix_transform(transform_matrix, output->transform);
+            float temp_mvp[9]; 
+            memcpy(temp_mvp, main_mvp, sizeof(main_mvp));
+            float transform_matrix[9]; 
+            wlr_matrix_transform(transform_matrix, output->transform);
             wlr_matrix_multiply(main_mvp, transform_matrix, temp_mvp);
         }
         if (scene_buffer->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
-            float temp_mvp_buffer[9]; memcpy(temp_mvp_buffer, main_mvp, sizeof(main_mvp));
-            float buffer_matrix[9]; wlr_matrix_transform(buffer_matrix, scene_buffer->transform);
+            float temp_mvp_buffer[9]; 
+            memcpy(temp_mvp_buffer, main_mvp, sizeof(main_mvp));
+            float buffer_matrix[9]; 
+            wlr_matrix_transform(buffer_matrix, scene_buffer->transform);
             wlr_matrix_multiply(main_mvp, temp_mvp_buffer, buffer_matrix);
         }
+        
         glUniformMatrix3fv(server->genie_shader_mvp_loc, 1, GL_FALSE, main_mvp);
         
         // --- Set Genie Shader Uniforms ---
@@ -2728,12 +2749,14 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
 
         float anim_progress = toplevel->minimizing_to_dock ? progress : 1.0 - progress;
         glUniform1f(server->genie_shader_progress_loc, anim_progress);
-        glUniform1f(server->genie_shader_bend_factor_loc, 2.5f);
+        glUniform1f(server->genie_shader_bend_factor_loc, 0.2f);
 
-        // --- Draw the genie effect with passthrough shader result ---
-        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+        // --- Draw the genie effect with tessellated mesh using passthrough shader result ---
+        glDrawElements(GL_TRIANGLES, server->genie_index_count, GL_UNSIGNED_INT, 0);
         
         // Clean up OpenGL state
+        glBindVertexArray(0);
+        glUseProgram(0);
         glBindTexture(GL_TEXTURE_2D, 0);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glDisable(GL_BLEND);
@@ -10240,88 +10263,108 @@ static const char *passthrough_fragment_shader_src =
     "}\n";
 
 
-  // MODIFIED: Corrected Genie Effect Vertex Shader (simpler, only does positioning)
+  
+// Proper Classic Genie Effect Vertex Shader - Tapers to thin bottom
+// Proper Classic Genie Effect Vertex Shader - Tapers to thin bottom
 static const char *genie_vertex_shader_src =
     "#version 300 es\n"
     "precision highp float;\n"
     "\n"
-    "layout(location = 0) in vec2 position;\n" // Quad vertices (0,0 to 1,1)
-    "layout(location = 1) in vec2 texcoord;\n" // Texture coordinates
+    "layout(location = 0) in vec2 position; // Grid vertices (0,0 to 1,1)\n"
+    "layout(location = 1) in vec2 texcoord;\n"
     "\n"
-    "// Uniforms\n"
     "uniform mat3 mvp;\n"
+    "uniform float progress; // Animation progress: 0.0 (start) to 1.0 (end)\n"
+    "uniform float u_bend_factor; // Controls how much the effect bends\n"
+    "uniform vec2 u_target_pos; // Target position (dock icon position)\n"
     "\n"
     "out vec2 v_texcoord;\n"
     "\n"
-    "void main() {\n"
-    "    // The C code will calculate the exact position and size of the quad for this frame.\n"
-    "    // The vertex shader's only job is to project these vertices to the screen.\n"
-    "    vec3 pos_transformed = mvp * vec3(position, 1.0);\n"
-    "    gl_Position = vec4(pos_transformed.xy, 0.0, 1.0);\n"
-    "\n"
-    "    // Pass the original, unmodified texture coordinate to the fragment shader.\n"
-    "    // The fragment shader will do all the heavy lifting.\n"
-    "    v_texcoord = texcoord;\n"
-    "}\n";
-
-// MODIFIED: Corrected Genie Effect Fragment Shader (does all the warping)
-static const char *genie_fragment_shader_src =
-    "#version 300 es\n"
-    "precision highp float;\n"
-    "in vec2 v_texcoord;\n"
-    "out vec4 frag_color;\n"
-    "\n"
-    "uniform sampler2D u_texture;\n"
-    "uniform float progress; // Animation progress: 0.0 (start) to 1.0 (end)\n"
-    "uniform float u_bend_factor;\n"
-    "\n"
-    "// Easing function for smooth animation\n"
+    "// Smooth easing function\n"
     "float easeInOutCubic(float t) {\n"
     "    return t < 0.5 ? 4.0 * t * t * t : 1.0 - pow(-2.0 * t + 2.0, 3.0) / 2.0;\n"
     "}\n"
     "\n"
     "void main() {\n"
     "    float t = easeInOutCubic(progress);\n"
+    "    vec2 transformed_pos = position;\n"
+    "\n"
+    "    // Vertical influence: stronger effect toward bottom (higher Y values)\n"
+    "    float vertical_influence = pow(position.y, 1.5); // More dramatic curve\n"
     "    \n"
-    "    // Increased height compression for stronger sucking effect\n"
-    "    float height_factor = 1.0 - t * 0.85; // Strong compression\n"
+    "    // Target position (dock icon location)\n"
+    "    vec2 target = u_target_pos;\n"
     "    \n"
-    "    // Use y to control narrowing at middle (y around 0.5)\n"
-    "    float y = v_texcoord.y;\n"
+    "    // TAPERING EFFECT: Pull all bottom vertices toward the target X position\n"
+    "    // This makes the bottom narrow down to a point\n"
+    "    float taper_strength = t * vertical_influence * u_bend_factor;\n"
     "    \n"
-    "    // Create hourglass shape - narrow at middle, wider at top and bottom\n"
-    "    float squeeze_power = 5.0; // Controls taper intensity\n"
-    "    float y_mid = abs(y - 0.5) * 2.0; // Distance from middle (0 at y=0.5, 1 at edges)\n"
-    "    float width_scale = 1.0 - t * (1.0 - pow(y_mid, squeeze_power)) * 0.95; // Pinch at middle\n"
+    "    // Pull horizontally toward target - this narrows the bottom\n"
+    "    float horizontal_pull = (target.x - position.x) * taper_strength;\n"
+    "    transformed_pos.x += horizontal_pull;\n"
     "    \n"
-    "    // Enhanced horizontal bending for curved hourglass sides\n"
-    "    float bend_strength = t * u_bend_factor * 0.5; // Adjusted bend strength\n"
-    "    float x_offset = (v_texcoord.x - 0.5);\n"
+    "    // ADDITIONAL NARROWING: Compress width more at bottom\n"
+    "    // Move vertices toward center line, creating taper effect\n"
+    "    float center_x = 0.5;\n"
+    "    float width_compression = t * vertical_influence * 0.8; // How much to narrow\n"
+    "    float distance_from_center = position.x - center_x;\n"
     "    \n"
-    "    // Bottom stretch effect - texture gets wider as it goes down\n"
-    "    float bottom_stretch_factor = 1.0 + t * (100.0 - y) * 0.002; // More stretch at bottom (y=0)\n"
+    "    // Compress the width - bottom gets much narrower\n"
+    "    transformed_pos.x = center_x + distance_from_center * (1.0 - width_compression);\n"
     "    \n"
-    "    // Apply transformations\n"
-    "    vec2 warped_uv = v_texcoord;\n"
+    "    // Then apply the pull toward target after width compression\n"
+    "    transformed_pos.x += (target.x - center_x) * taper_strength;\n"
     "    \n"
-    "    // Apply width scaling (pinched middle, wider top/bottom)\n"
-    "    warped_uv.x = 0.5 + (v_texcoord.x - 0.5) / max(width_scale, 0.05); // Prevent division by zero\n"
-    "    \n"
-    "    // Apply bottom stretch - make texture coordinates expand at bottom\n"
-    "    warped_uv.x = 0.5 + (warped_uv.x - 0.5) * bottom_stretch_factor;\n"
-    "    \n"
-    "    // Apply height compression for sucking effect\n"
-    "    warped_uv.y = v_texcoord.y / height_factor;\n"
-    "    \n"
-    "    // Bounds check\n"
-    "    if (warped_uv.x < 0.0 || warped_uv.x > 1.0 || warped_uv.y < 0.0 || warped_uv.y > 1.0) {\n"
-    "        discard;\n"
+    "    // Vertical stretching/compression\n"
+    "    // Keep top relatively unchanged, stretch middle, compress bottom\n"
+    "    float vertical_scale;\n"
+    "    if (position.y < 0.3) {\n"
+    "        // Top area - minimal change\n"
+    "        vertical_scale = 1.0 - t * 0.1;\n"
+    "    } else if (position.y < 0.7) {\n"
+    "        // Middle area - stretch it out\n"
+    "        float middle_factor = (position.y - 0.3) / 0.4; // 0 to 1 in middle region\n"
+    "        vertical_scale = 1.0 + t * middle_factor * 0.3; // Stretch\n"
+    "    } else {\n"
+    "        // Bottom area - compress toward target\n"
+    "        float bottom_factor = (position.y - 0.7) / 0.3; // 0 to 1 in bottom region\n"
+    "        vertical_scale = 1.0 - t * bottom_factor * 0.6; // Heavy compression\n"
     "    }\n"
     "    \n"
-    "    // Sample texture\n"
-    "    frag_color = texture(u_texture, vec2(warped_uv.x, 1.0 - warped_uv.y));\n"
+    "   // transformed_pos.y *= vertical_scale;\n"
+    "    \n"
+    "    // Subtle curved bending for organic look\n"
+    "    // Create gentle S-curve as it tapers\n"
+    "    float curve_factor = sin(vertical_influence * 3.14159 / 2.0);\n"
+    "    float horizontal_offset = position.x - 0.5; // Distance from center\n"
+    "    float curve_bend = curve_factor * t * horizontal_offset * 1.15;\n"
+    "    \n"
+    "   // transformed_pos.x += curve_bend;\n"
+    "    \n"
+    "    // Final pull toward target Y position for bottom vertices\n"
+    "    float y_pull = (target.y - position.y) * taper_strength * 0.3;\n"
+    "  //  transformed_pos.y += y_pull;\n"
+    "\n"
+    "    // Transform to screen coordinates\n"
+    "    gl_Position = vec4((mvp * vec3(transformed_pos, 1.0)).xy, 0.0, 1.0);\n"
+    "\n"
+    "    // Pass through texture coordinates\n"
+    "    v_texcoord = texcoord;\n"
     "}\n";
-
+    
+    static const char *genie_fragment_shader_src =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "\n"
+    "uniform sampler2D u_texture;\n"
+    "\n"
+    "void main() {\n"
+    "    // The vertex shader did all the hard work. We just sample the texture.\n"
+    "    // Flip the Y-coordinate as texture origin is often top-left.\n"
+    "    frag_color = texture(u_texture, vec2(v_texcoord.x, 1.0 - v_texcoord.y));\n"
+    "}\n";
     setenv("MESA_VK_VERSION_OVERRIDE", "1.2", 1);
     setenv("MESA_LOADER_DRIVER_OVERRIDE", "zink", 1);
    // setenv("GALLIUM_DRIVER", "zink", 1);
@@ -10748,7 +10791,7 @@ for (int i = 0; i < 16; ++i) {
     // --- Create Genie/Minimize Shader ---
     struct shader_uniform_spec genie_uniforms[] = {
         {"mvp", &server.genie_shader_mvp_loc},
-        {"u_texture", &server.genie_shader_tex_loc}, // Corrected name
+        {"u_texture", &server.genie_shader_tex_loc},
         {"progress", &server.genie_shader_progress_loc},
         {"u_bend_factor", &server.genie_shader_bend_factor_loc}
     };
@@ -10837,6 +10880,60 @@ wlr_log(WLR_INFO, "SSDColorShader created (ID: %u). MVP@%d, Color@%d",
 if (wlr_egl_make_current(egl_main, NULL)) {
     GLenum gl_error;
     while ((gl_error = glGetError()) != GL_NO_ERROR) { wlr_log(WLR_ERROR, "GL Error main A (after make_current): 0x%x", gl_error); }
+
+
+ // --- NEW: SETUP TESSELLATED MESH FOR GENIE EFFECT ---
+        const int TESSELLATION_X = 20;
+        const int TESSELLATION_Y = 20;
+        const int VERTEX_COUNT = (TESSELLATION_X + 1) * (TESSELLATION_Y + 1);
+        server.genie_index_count = TESSELLATION_X * TESSELLATION_Y * 6;
+
+        GLfloat genie_vertices[VERTEX_COUNT * 4]; // 2 for pos, 2 for texcoord
+        GLuint genie_indices[server.genie_index_count];
+
+        for (int y = 0; y <= TESSELLATION_Y; ++y) {
+            for (int x = 0; x <= TESSELLATION_X; ++x) {
+                int idx = (y * (TESSELLATION_X + 1) + x) * 4;
+                genie_vertices[idx + 0] = (float)x / TESSELLATION_X; // pos.x
+                genie_vertices[idx + 1] = (float)y / TESSELLATION_Y; // pos.y
+                genie_vertices[idx + 2] = (float)x / TESSELLATION_X; // tex.u
+                genie_vertices[idx + 3] = (float)y / TESSELLATION_Y; // tex.v
+            }
+        }
+
+        int i = 0;
+        for (int y = 0; y < TESSELLATION_Y; ++y) {
+            for (int x = 0; x < TESSELLATION_X; ++x) {
+                int top_left = y * (TESSELLATION_X + 1) + x;
+                genie_indices[i++] = top_left;
+                genie_indices[i++] = top_left + 1;
+                genie_indices[i++] = top_left + TESSELLATION_X + 1;
+                genie_indices[i++] = top_left + 1;
+                genie_indices[i++] = top_left + TESSELLATION_X + 2;
+                genie_indices[i++] = top_left + TESSELLATION_X + 1;
+            }
+        }
+
+        glGenVertexArrays(1, &server.genie_vao);
+        glBindVertexArray(server.genie_vao);
+        
+        glGenBuffers(1, &server.genie_vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, server.genie_vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(genie_vertices), genie_vertices, GL_STATIC_DRAW);
+
+        glGenBuffers(1, &server.genie_ibo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, server.genie_ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(genie_indices), genie_indices, GL_STATIC_DRAW);
+
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)0);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)(2 * sizeof(GLfloat)));
+        
+        glBindVertexArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        wlr_log(WLR_INFO, "Created tessellated genie mesh with %d indices.", server.genie_index_count);
 
     // EXISTING 2D QUAD DATA (keep this for your other effects)
     const GLfloat verts[] = {
