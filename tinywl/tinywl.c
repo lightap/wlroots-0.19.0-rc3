@@ -598,6 +598,14 @@ GLuint intermediate_rbo[16];
     GLint passthrough_shader_cornerRadius_loc;
     GLint passthrough_shader_bevelColor_loc;
     GLint passthrough_shader_time_loc;
+
+    // NEW: Genie/Minimize Effect Shader
+    GLuint genie_shader_program;
+    GLint genie_shader_mvp_loc;
+    GLint genie_shader_tex_loc;
+    GLint genie_shader_progress_loc;
+   
+    GLint genie_shader_bend_factor_loc;
     
 
 };
@@ -698,6 +706,22 @@ struct wlr_xdg_toplevel_decoration_v1 *decoration;
      bool ssd_pending_enable;
 
      int desktop;
+
+     struct wlr_box restored_geom; // Last known geometry when not minimized
+
+     // NEW: Fields for minimizing via taskbar
+  
+    bool is_minimizing; // True during the genie animation
+    bool minimizing_to_dock; // True if minimizing, false if restoring
+    float minimize_start_time;
+    float minimize_duration;
+    struct wlr_box minimize_start_geom;
+    struct wlr_box minimize_target_geom;
+    
+
+     // NEW: Fields for minimizing via taskbar
+    bool minimized;
+    struct wlr_box panel_preview_box;
     
 };
 
@@ -1271,6 +1295,47 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel) {
         // Consider if wlr_seat_keyboard_clear_focus(seat); is appropriate if keyboard becomes NULL
         // or if focus should only be set if a keyboard is present.
         // For now, just logging is fine to confirm if this is the path.
+    }
+}
+
+static void toggle_minimize_toplevel(struct tinywl_toplevel *toplevel, bool minimized) {
+    if (toplevel->minimized == minimized) {
+        if (!minimized) focus_toplevel(toplevel);
+        return;
+    }
+
+    wlr_log(WLR_INFO, "Toggling minimize for '%s' to %d",
+            toplevel->xdg_toplevel->title, minimized);
+    
+    toplevel->minimized = minimized;
+    
+    // Set up animation parameters
+    toplevel->is_minimizing = true;
+    toplevel->minimizing_to_dock = minimized; // Direction of animation
+    toplevel->minimize_start_time = get_monotonic_time_seconds_as_float();
+    toplevel->minimize_duration = 0.8f; // 400ms animation
+    
+    if (minimized) { // We are minimizing TO the dock
+        toplevel->minimize_start_geom = toplevel->restored_geom;
+        toplevel->minimize_target_geom = toplevel->panel_preview_box;
+        
+        // Hide the main node *after* the animation finishes
+        wlr_scene_node_set_enabled(&toplevel->scene_tree->node, true);
+        
+        if (toplevel->server->seat->keyboard_state.focused_surface == toplevel->xdg_toplevel->base->surface) {
+            wlr_seat_keyboard_clear_focus(toplevel->server->seat);
+        }
+    } else { // We are restoring FROM the dock
+        toplevel->minimize_start_geom = toplevel->panel_preview_box;
+        toplevel->minimize_target_geom = toplevel->restored_geom;
+        wlr_scene_node_set_enabled(&toplevel->scene_tree->node, true);
+        focus_toplevel(toplevel);
+    }
+
+    // A redraw is needed to start the animation.
+    struct tinywl_output *output;
+    wl_list_for_each(output, &toplevel->server->outputs, link) {
+        wlr_output_schedule_frame(output->wlr_output);
     }
 }
 
@@ -2015,53 +2080,71 @@ static void server_cursor_motion_absolute(struct wl_listener *listener, void *da
 
 
 // --- Modified server_cursor_button ---
+// MODIFIED: server_cursor_button to handle clicks on the panel previews
 static void server_cursor_button(struct wl_listener *listener, void *data) {
     struct tinywl_server *server = wl_container_of(listener, server, cursor_button);
     struct wlr_pointer_button_event *event = data;
     struct wlr_seat *seat = server->seat;
 
-    // Use our new, reliable function to find what's under the cursor.
+    // Check if the click occurred within the panel's area first.
+    if (server->top_panel_node && server->top_panel_node->enabled) {
+        struct wlr_scene_rect *panel_srect = wlr_scene_rect_from_node(server->top_panel_node);
+        struct wlr_box panel_box = {
+            .x = server->top_panel_node->x,
+            .y = server->top_panel_node->y,
+            .width = panel_srect->width,
+            .height = panel_srect->height,
+        };
+
+        if (event->button == BTN_LEFT && event->state == WL_POINTER_BUTTON_STATE_PRESSED &&
+            wlr_box_contains_point(&panel_box, server->cursor->x, server->cursor->y)) {
+            
+            // The click was inside the panel. Check if it hit a toplevel preview.
+            struct tinywl_toplevel *toplevel_iter;
+            wl_list_for_each(toplevel_iter, &server->toplevels, link) {
+                // We only care about previews on the current desktop.
+                if (toplevel_iter->desktop == server->current_desktop &&
+                    wlr_box_contains_point(&toplevel_iter->panel_preview_box, server->cursor->x, server->cursor->y)) {
+                    
+                    // Clicked on this toplevel's preview icon.
+                    // Toggle its minimized state.
+                    toggle_minimize_toplevel(toplevel_iter, !toplevel_iter->minimized);
+                    
+                    // The event is handled, notify the seat and return.
+                    wlr_seat_pointer_notify_button(seat, event->time_msec, event->button, event->state);
+                    return;
+                }
+            }
+        }
+    }
+
+    // --- Original logic for window interaction (move, resize, focus) ---
     struct wlr_surface *surface_at_cursor = NULL;
     double sx, sy;
     struct tinywl_toplevel *toplevel = find_toplevel_at(server,
         server->cursor->x, server->cursor->y, &surface_at_cursor, &sx, &sy);
 
     if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
-        // If an interactive grab was in progress, end it.
         if (server->cursor_mode != TINYWL_CURSOR_PASSTHROUGH) {
             server->cursor_mode = TINYWL_CURSOR_PASSTHROUGH;
             server->grabbed_toplevel = NULL;
-            // The cursor icon will be reset on the next motion event.
         }
     } else { // Button pressed
         bool handled_by_compositor = false;
-
-        // If we clicked on a toplevel on the current desktop...
-        if (toplevel) {
-            // Immediately focus the toplevel we clicked on ("click-to-focus").
+        if (toplevel && !toplevel->minimized) { // Don't interact with minimized windows
             focus_toplevel(toplevel);
-
-            // Now, check if we clicked on a server-side decoration to start a move/resize.
             if (toplevel->ssd.enabled && event->button == BTN_LEFT) {
-                // Find the specific decoration node under the cursor.
                 double dummy_sx, dummy_sy;
                 struct wlr_scene_node *node_at = wlr_scene_node_at(
                     &toplevel->scene_tree->node, server->cursor->x, server->cursor->y, &dummy_sx, &dummy_sy);
-
                 if (node_at == &toplevel->ssd.title_bar->node) {
                     begin_interactive(toplevel, TINYWL_CURSOR_MOVE, 0);
                     handled_by_compositor = true;
                 } else {
                     uint32_t resize_edges = 0;
-                    if (node_at == &toplevel->ssd.border_left->node) {
-                        resize_edges = WLR_EDGE_LEFT;
-                    } else if (node_at == &toplevel->ssd.border_right->node) {
-                        resize_edges = WLR_EDGE_RIGHT;
-                    } else if (node_at == &toplevel->ssd.border_bottom->node) {
-                        resize_edges = WLR_EDGE_BOTTOM;
-                    }
-                    // NOTE: You can add corner checks here if you want diagonal resizing.
-                    
+                    if (node_at == &toplevel->ssd.border_left->node) resize_edges = WLR_EDGE_LEFT;
+                    else if (node_at == &toplevel->ssd.border_right->node) resize_edges = WLR_EDGE_RIGHT;
+                    else if (node_at == &toplevel->ssd.border_bottom->node) resize_edges = WLR_EDGE_BOTTOM;
                     if (resize_edges != 0) {
                         begin_interactive(toplevel, TINYWL_CURSOR_RESIZE, resize_edges);
                         handled_by_compositor = true;
@@ -2069,19 +2152,13 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
                 }
             }
         } else {
-            // Click was not on any of our toplevels. Clear keyboard focus.
             wlr_seat_keyboard_clear_focus(seat);
         }
-
-        // If the compositor didn't handle the click for a move/resize,
-        // it should be passed to the client.
         if (!handled_by_compositor) {
             wlr_seat_set_keyboard(seat, wlr_seat_get_keyboard(seat));
         }
     }
     
-    // Always notify the seat of the button event. The seat will forward it
-    // to the client with current keyboard focus if appropriate.
     wlr_seat_pointer_notify_button(seat, event->time_msec, event->button, event->state);
 }
 static void server_cursor_axis(struct wl_listener *listener, void *data) {
@@ -2339,7 +2416,7 @@ void debug_scene_tree(struct wlr_scene *scene, struct wlr_output *output) {
     wlr_log(WLR_INFO, "[DEBUG] Total nodes: %d", node_count);
 }
 
-// Modified scene_buffer_iterator with proper preview alignment
+
 // Modified scene_buffer_iterator with proper preview alignment
 static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
                                  int sx, int sy,
@@ -2373,7 +2450,7 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
         return;
     }
 
-    // --- Toplevel identification (simplified like second version) ---
+    // --- Toplevel identification ---
     struct tinywl_toplevel *toplevel = NULL;
     struct wlr_scene_node *node_iter = &scene_buffer->node;
     while (node_iter) {
@@ -2388,37 +2465,334 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
         node_iter = &node_iter->parent->node;
     }
 
-    float anim_scale_factor = 1.0f;
-    char title_buffer[128] = "NO_TL_ITER";
-    const char* tl_title_for_log = "UNKNOWN_OR_NOT_TOPLEVEL_CONTENT";
+    // If this buffer isn't part of a toplevel we manage, handle it gracefully
+    if (!toplevel) {
+        struct wlr_texture *texture = wlr_texture_from_buffer(renderer, scene_buffer->buffer);
+        if (texture) {
+            // Default rendering for non-toplevel buffers - you might want to add this logic
+            wlr_texture_destroy(texture);
+        }
+        return;
+    }
 
-    // Surface validation like second version
-    struct wlr_scene_surface *current_scene_surface = wlr_scene_surface_try_from_buffer(scene_buffer);
-    struct wlr_surface *surface_to_render = current_scene_surface ? current_scene_surface->surface : NULL;
-    if (!surface_to_render) return;
+    // --- Manual Projection Matrix Calculation for the entire output ---
+    float projection[9];
+    enum wl_output_transform transform = wlr_output_transform_invert(output->transform);
+    wlr_matrix_identity(projection);
+    wlr_matrix_scale(projection, 2.0f / output->width, 2.0f / output->height);
+    wlr_matrix_translate(projection, -1.0f, -1.0f);
+    float transform_matrix[9];
+    wlr_matrix_identity(transform_matrix);
+    wlr_matrix_transform(transform_matrix, transform);
+    wlr_matrix_multiply(projection, transform_matrix, projection);
 
-    // --- Animation Scaling (same logic but with debugging like second version) ---
-    if (toplevel) {
-        if (toplevel->xdg_toplevel && toplevel->xdg_toplevel->title) {
-            snprintf(title_buffer, sizeof(title_buffer), "%s", toplevel->xdg_toplevel->title);
-            tl_title_for_log = title_buffer;
-        } else {
-            snprintf(title_buffer, sizeof(title_buffer), "Ptr:%p (XDG maybe NULL)", toplevel);
-            tl_title_for_log = "TOPLEVEL_NO_TITLE";
+    // ====================================================================
+    // --- DECISION: Which rendering path to take? ---
+    // ====================================================================
+
+  if (toplevel && toplevel->is_minimizing) {
+    // --- PATH 1: MODIFIED Genie Minimize/Restore Animation with Passthrough Shader ---
+
+    // Use cached texture for minimize animation.
+    struct wlr_texture *anim_texture = toplevel->cached_texture;
+    bool created_temp_texture = false;
+    if (!anim_texture) {
+        anim_texture = wlr_texture_from_buffer(renderer, scene_buffer->buffer);
+        if (!anim_texture) {
+            wlr_log(WLR_ERROR, "[GENIE_ANIM:%s] Failed to create texture for genie animation", output_name_log);
+            return;
+        }
+        created_temp_texture = true;
+    }
+
+    wlr_gles2_texture_get_attribs(anim_texture, &tex_attribs);
+
+    float elapsed = get_monotonic_time_seconds_as_float() - toplevel->minimize_start_time;
+    float progress = (toplevel->minimize_duration > 1e-5f)
+                   ? fminf(1.0f, elapsed / toplevel->minimize_duration)
+                   : 1.0f;
+
+    if (progress < 1.0f) {
+        wlr_output_schedule_frame(output);
+    } else {
+        toplevel->is_minimizing = false;
+        if (toplevel->minimizing_to_dock) {
+            toplevel->minimized = true;
+            wlr_scene_node_set_enabled(&toplevel->scene_tree->node, false);
+        }
+    }
+
+    struct wlr_box start_box = toplevel->minimize_start_geom;
+    struct wlr_box target_box = toplevel->minimize_target_geom;
+
+    // This box represents the quad on the screen, which will contain the entire effect.
+    // By interpolating its size, we ensure it's large enough to prevent clipping.
+    struct wlr_box render_box;
+    render_box.x = round((double)start_box.x * (1.0 - progress) + (double)target_box.x * progress);
+    render_box.y = round((double)start_box.y * (1.0 - progress) + (double)target_box.y * progress);
+    render_box.width = round((double)start_box.width * (1.0 - progress) + (double)target_box.width * progress);
+    render_box.height = round((double)start_box.height * (1.0 - progress) + (double)target_box.height * progress);
+    
+    // Fallback for minimized windows that might not have a valid target geom yet.
+    if (render_box.width < 1) render_box.width = 1;
+    if (render_box.height < 1) render_box.height = 1;
+    
+    if (render_box.width > 0 && render_box.height > 0) {
+        // Store the original framebuffer binding
+        GLint original_fbo;
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &original_fbo);
+        
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        
+        // ====================================================================
+        // PASS 1: RENDER PASSTHROUGH SHADER TO TEXTURE (FBO)
+        // ====================================================================
+        
+        // Create intermediate texture for passthrough shader result
+        GLuint intermediate_fbo, intermediate_texture;
+        glGenTextures(1, &intermediate_texture);
+        glBindTexture(GL_TEXTURE_2D, intermediate_texture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, render_box.width, render_box.height, 
+                     0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        
+        // Create FBO
+        glGenFramebuffers(1, &intermediate_fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, intermediate_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, intermediate_texture, 0);
+        
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            wlr_log(WLR_ERROR, "Framebuffer not complete! Status: %d", glCheckFramebufferStatus(GL_FRAMEBUFFER));
+            glBindFramebuffer(GL_FRAMEBUFFER, original_fbo);
+            glDeleteTextures(1, &intermediate_texture);
+            glDeleteFramebuffers(1, &intermediate_fbo);
+            return;
+        }
+        
+        // Set viewport for intermediate render
+        glViewport(0, 0, render_box.width, render_box.height);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);  // Clear to transparent
+        glClear(GL_COLOR_BUFFER_BIT);
+        
+        // Calculate MVP matrix for passthrough shader (render full quad to texture)
+        float passthrough_mvp[9] = {
+            2.0f, 0.0f, 0.0f,   // Scale X by 2 (from -1 to 1)
+            0.0f, -2.0f, 0.0f,  // Scale Y by -2 (flip Y and scale)
+            -1.0f, 1.0f, 1.0f   // Translate to fill texture
+        };
+
+        // Apply output and buffer transforms to passthrough MVP
+        if (output->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+            float temp_mvp[9];
+            memcpy(temp_mvp, passthrough_mvp, sizeof(passthrough_mvp));
+            float transform_matrix[9];
+            wlr_matrix_transform(transform_matrix, output->transform);
+            wlr_matrix_multiply(passthrough_mvp, transform_matrix, temp_mvp);
+        }
+        if (scene_buffer->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+            float temp_mvp_buffer[9];
+            memcpy(temp_mvp_buffer, passthrough_mvp, sizeof(passthrough_mvp));
+            float buffer_matrix[9];
+            wlr_matrix_transform(buffer_matrix, scene_buffer->transform);
+            wlr_matrix_multiply(passthrough_mvp, temp_mvp_buffer, buffer_matrix);
+        }
+        
+        // Render passthrough shader to intermediate texture
+        glUseProgram(server->passthrough_shader_program);
+        
+        // Set MVP uniform for passthrough
+        GLint mvp_loc_pass = glGetUniformLocation(server->passthrough_shader_program, "mvp");
+        if (mvp_loc_pass != -1) {
+            glUniformMatrix3fv(mvp_loc_pass, 1, GL_FALSE, passthrough_mvp);
         }
 
-        wlr_log(WLR_ERROR, "[ITERATOR DEBUG:%s] Processing TL ('%s' Ptr:%p). Anim:%d, Scale:%.3f, Target:%.3f, StartT:%.3f, PendingD:%d, NodeEn:%d",
-               output_name_log, title_buffer, toplevel,
-               toplevel->is_animating, toplevel->scale, toplevel->target_scale,
-               toplevel->animation_start, toplevel->pending_destroy,
-               (toplevel->scene_tree ? toplevel->scene_tree->node.enabled : -1));
+        // Set up original texture binding for passthrough shader
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(tex_attribs.target, tex_attribs.tex);
+        glTexParameteri(tex_attribs.target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(tex_attribs.target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(tex_attribs.target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(tex_attribs.target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        
+        GLint tex_loc_pass = glGetUniformLocation(server->passthrough_shader_program, "texture_sampler_uniform");
+        if (tex_loc_pass != -1) {
+            glUniform1i(tex_loc_pass, 0);
+        }
 
-        if (toplevel->is_animating) {
-            struct timespec now_anim;
-            clock_gettime(CLOCK_MONOTONIC, &now_anim);
-            float current_time_anim = now_anim.tv_sec + now_anim.tv_nsec / 1e9f;
-            float elapsed = current_time_anim - toplevel->animation_start;
+        // Set passthrough shader uniforms
+        GLint time_loc_pass = glGetUniformLocation(server->passthrough_shader_program, "time");
+        if (time_loc_pass != -1) glUniform1f(time_loc_pass, get_monotonic_time_seconds_as_float());
+
+        GLint resolution_loc_pass = glGetUniformLocation(server->passthrough_shader_program, "iResolution");
+        if (resolution_loc_pass != -1) {
+            float resolution_pass[2] = {(float)render_box.width, (float)render_box.height};
+            glUniform2fv(resolution_loc_pass, 1, resolution_pass);
+        }
+
+        // Pass the dimensions of the final rendered box
+        if (server->passthrough_shader_res_loc != -1) {
+            glUniform2f(server->passthrough_shader_res_loc, (float)render_box.width, (float)render_box.height);
+        }
+
+        // Set the corner radius
+        if (server->passthrough_shader_cornerRadius_loc != -1) {
+            glUniform1f(server->passthrough_shader_cornerRadius_loc, 12.0f);
+        }
+
+        // Calculate cycling bevel color
+        static const float color_palette[][4] = {
+            {1.0f, 0.2f, 0.2f, 0.7f}, // Red
+            {1.0f, 1.0f, 0.2f, 0.7f}, // Yellow
+            {0.2f, 1.0f, 0.2f, 0.7f}, // Green
+            {0.2f, 1.0f, 1.0f, 0.7f}, // Cyan
+            {0.2f, 0.2f, 1.0f, 0.7f}, // Blue
+            {1.0f, 0.2f, 1.0f, 0.7f}  // Magenta
+        };
+        const int num_colors = sizeof(color_palette) / sizeof(color_palette[0]);
+        
+        float time_sec = get_monotonic_time_seconds_as_float();
+        float time_per_color = 2.0f;
+        float total_cycle_duration = (float)num_colors * time_per_color;
+        float time_in_cycle = fmod(time_sec, total_cycle_duration);
+
+        int current_color_idx = (int)floor(time_in_cycle / time_per_color);
+        int next_color_idx = (current_color_idx + 1) % num_colors;
+
+        float time_in_transition = fmod(time_in_cycle, time_per_color);
+        float mix_factor = time_in_transition / time_per_color;
+        float eased_mix_factor = mix_factor * mix_factor * (3.0f - 2.0f * mix_factor);
+
+        float final_bevel_color[4];
+        for (int i = 0; i < 4; ++i) {
+            final_bevel_color[i] = 
+                color_palette[current_color_idx][i] * (1.0f - eased_mix_factor) +
+                color_palette[next_color_idx][i] * eased_mix_factor;
+        }
+
+        if (server->passthrough_shader_bevelColor_loc != -1) {
+            glUniform4fv(server->passthrough_shader_bevelColor_loc, 1, final_bevel_color);
+        }
+        if (server->passthrough_shader_time_loc != -1) {
+            glUniform1f(server->passthrough_shader_time_loc, get_monotonic_time_seconds_as_float());
+        }
+
+        // Render passthrough shader to intermediate texture
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+        
+        // ====================================================================
+        // PASS 2: RENDER GENIE SHADER USING INTERMEDIATE TEXTURE
+        // ====================================================================
+        
+        // Switch back to original framebuffer
+        glBindFramebuffer(GL_FRAMEBUFFER, original_fbo);
+        
+        // Reset viewport to output dimensions
+        glViewport(0, 0, output->width, output->height);
+        
+        // Use genie shader program
+        glUseProgram(server->genie_shader_program);
+
+        // --- MVP Matrix Calculation for the render_box (same as paste-1) ---
+        float main_mvp[9];
+        float box_scale_x = (float)render_box.width * (2.0f / output->width);
+        float box_scale_y = (float)render_box.height * (-2.0f / output->height);
+        float box_translate_x = ((float)render_box.x / output->width) * 2.0f - 1.0f;
+        float box_translate_y = ((float)render_box.y / output->height) * -2.0f + 1.0f;
+        float model_view[9] = {box_scale_x, 0.0f, 0.0f, 0.0f, box_scale_y, 0.0f, box_translate_x, box_translate_y, 1.0f};
+        memcpy(main_mvp, model_view, sizeof(model_view));
+
+        // Apply output and buffer transforms
+        if (output->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+            float temp_mvp[9]; memcpy(temp_mvp, main_mvp, sizeof(main_mvp));
+            float transform_matrix[9]; wlr_matrix_transform(transform_matrix, output->transform);
+            wlr_matrix_multiply(main_mvp, transform_matrix, temp_mvp);
+        }
+        if (scene_buffer->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+            float temp_mvp_buffer[9]; memcpy(temp_mvp_buffer, main_mvp, sizeof(main_mvp));
+            float buffer_matrix[9]; wlr_matrix_transform(buffer_matrix, scene_buffer->transform);
+            wlr_matrix_multiply(main_mvp, temp_mvp_buffer, buffer_matrix);
+        }
+        glUniformMatrix3fv(server->genie_shader_mvp_loc, 1, GL_FALSE, main_mvp);
+        
+        // --- Set Genie Shader Uniforms ---
+        // Bind the intermediate texture (contains passthrough shader result)
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, intermediate_texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glUniform1i(server->genie_shader_tex_loc, 0);
+
+        float anim_progress = toplevel->minimizing_to_dock ? progress : 1.0 - progress;
+        glUniform1f(server->genie_shader_progress_loc, anim_progress);
+        glUniform1f(server->genie_shader_bend_factor_loc, 2.5f);
+
+        // --- Draw the genie effect with passthrough shader result ---
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+        
+        // Clean up OpenGL state
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glDisable(GL_BLEND);
+        
+        // Clean up intermediate resources
+        glDeleteTextures(1, &intermediate_texture);
+        glDeleteFramebuffers(1, &intermediate_fbo);
+    }
+
+    if (created_temp_texture && anim_texture) {
+        wlr_texture_destroy(anim_texture);
+    }
+} else {
+        // --- PATH 2: Standard Scale Animation or Static Rendering ---
+        
+        // Create texture from current buffer for normal rendering
+        struct wlr_texture *texture = wlr_texture_from_buffer(renderer, scene_buffer->buffer);
+        if (!texture) {
+            wlr_log(WLR_ERROR, "[SCENE_ITERATOR:%s] Failed to create wlr_texture from buffer %p.", output_name_log, (void*)scene_buffer->buffer);
+            return;
+        }
+
+        // Surface validation
+        struct wlr_scene_surface *current_scene_surface = wlr_scene_surface_try_from_buffer(scene_buffer);
+        struct wlr_surface *surface_to_render = current_scene_surface ? current_scene_surface->surface : NULL;
+        if (!surface_to_render) {
+            wlr_texture_destroy(texture);
+            return;
+        }
+
+        // Get texture attributes
+        wlr_gles2_texture_get_attribs(texture, &tex_attribs);
+
+        // Debug logging
+        char title_buffer[128] = "NO_TL_ITER";
+        const char* tl_title_for_log = "UNKNOWN_OR_NOT_TOPLEVEL_CONTENT";
+
+        if (toplevel) {
+            if (toplevel->xdg_toplevel && toplevel->xdg_toplevel->title) {
+                snprintf(title_buffer, sizeof(title_buffer), "%s", toplevel->xdg_toplevel->title);
+                tl_title_for_log = title_buffer;
+            } else {
+                snprintf(title_buffer, sizeof(title_buffer), "Ptr:%p (XDG maybe NULL)", toplevel);
+                tl_title_for_log = "TOPLEVEL_NO_TITLE";
+            }
+
+            wlr_log(WLR_DEBUG, "[ITERATOR DEBUG:%s] Processing TL ('%s' Ptr:%p). Anim:%d, Scale:%.3f, Target:%.3f, StartT:%.3f, PendingD:%d, NodeEn:%d",
+                   output_name_log, title_buffer, toplevel,
+                   toplevel->is_animating, toplevel->scale, toplevel->target_scale,
+                   toplevel->animation_start, toplevel->pending_destroy,
+                   (toplevel->scene_tree ? toplevel->scene_tree->node.enabled : -1));
+        }
+
+        // --- Animation Scaling Logic ---
+        float anim_scale_factor = 1.0f;
+        if (toplevel && toplevel->is_animating) {
+            float elapsed = get_monotonic_time_seconds_as_float() - toplevel->animation_start;
             if (elapsed < 0.0f) elapsed = 0.0f;
+            
             float t = 0.0f;
             if (toplevel->animation_duration > 1e-5f) {
                 t = elapsed / toplevel->animation_duration;
@@ -2431,7 +2805,7 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
                 anim_scale_factor = toplevel->target_scale;
                 if (toplevel->target_scale == 0.0f && !toplevel->pending_destroy) {
                     toplevel->scale = 0.0f;
-                    wlr_log(WLR_ERROR, "[ITERATOR DEBUG:%s] '%s' close anim reached t>=1. Scale=0.0.", output_name_log, title_buffer);
+                    wlr_log(WLR_DEBUG, "[ITERATOR DEBUG:%s] '%s' close anim reached t>=1. Scale=0.0.", output_name_log, title_buffer);
                     wlr_output_schedule_frame(output);
                 } else {
                     toplevel->is_animating = false;
@@ -2444,38 +2818,52 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
             if (toplevel->is_animating) {
                 wlr_output_schedule_frame(output);
             }
-            wlr_log(WLR_ERROR, "[ITERATOR DEBUG:%s] '%s': t=%.3f, anim_scale_factor=%.3f",
+            wlr_log(WLR_DEBUG, "[ITERATOR DEBUG:%s] '%s': t=%.3f, anim_scale_factor=%.3f",
                    output_name_log, title_buffer, t, anim_scale_factor);
-        } else {
+        } else if (toplevel) {
             anim_scale_factor = toplevel->scale;
-            if (toplevel->target_scale == 0.0f && toplevel->scale <= 0.001f && !toplevel->pending_destroy) {
-                wlr_log(WLR_ERROR, "[ITERATOR DEBUG:%s] '%s' static at scale 0.0.", output_name_log, title_buffer);
+        }
+
+        if (anim_scale_factor < 0.001f && !(toplevel && toplevel->target_scale == 0.0f && !toplevel->pending_destroy)) {
+            anim_scale_factor = 0.001f;
+        }
+
+         // --- Main Window Rendering ---
+        struct wlr_box main_render_box = {
+            .x = (int)round((double)sx + (double)texture->width * (1.0 - (double)anim_scale_factor) / 2.0),
+            .y = (int)round((double)sy + (double)texture->height * (1.0 - (double)anim_scale_factor) / 2.0),
+            .width = (int)round((double)texture->width * (double)anim_scale_factor),
+            .height = (int)round((double)texture->height * (double)anim_scale_factor),
+        };
+
+        if (main_render_box.width <= 0 || main_render_box.height <= 0) {
+            if (toplevel && !toplevel->pending_destroy && toplevel->target_scale == 0.0f) {
+                wlr_log(WLR_DEBUG, "[ITERATOR DEBUG:%s] '%s' scaled to zero W/H.", output_name_log, title_buffer);
                 wlr_output_schedule_frame(output);
             }
+            wlr_texture_destroy(texture);
+            return;
         }
-    }
 
-    if (anim_scale_factor < 0.001f && !(toplevel && toplevel->target_scale == 0.0f && !toplevel->pending_destroy)) {
-        anim_scale_factor = 0.001f;
-    }
+float elapsed = get_monotonic_time_seconds_as_float() - toplevel->minimize_start_time;
+        float progress = (toplevel->minimize_duration > 1e-5f)
+                       ? fminf(1.0f, elapsed / toplevel->minimize_duration)
+                       : 1.0f;
 
-    // --- Main Window Rendering (using second version's approach) ---
-    struct wlr_texture *texture = wlr_texture_from_buffer(renderer, scene_buffer->buffer);
-    if (!texture) {
-        wlr_log(WLR_ERROR, "[SCENE_ITERATOR:%s] Failed to create wlr_texture from buffer %p for '%s'.",
-                output_name_log, (void*)scene_buffer->buffer, tl_title_for_log);
-        return;
-    }
-    wlr_gles2_texture_get_attribs(texture, &tex_attribs);
+        if (progress < 1.0f) {
+            wlr_output_schedule_frame(output);
+        } else {
+            toplevel->is_minimizing = false;
+            if (toplevel->minimizing_to_dock) {
+                toplevel->minimized = true;
+                wlr_scene_node_set_enabled(&toplevel->scene_tree->node, false);
+            }
+        }
 
-    glUseProgram(server->passthrough_shader_program);
 
-    struct wlr_box main_render_box = {
-        .x = (int)round((double)sx + (double)texture->width * (1.0 - (double)anim_scale_factor) / 2.0),
-        .y = (int)round((double)sy + (double)texture->height * (1.0 - (double)anim_scale_factor) / 2.0),
-        .width = (int)round((double)texture->width * (double)anim_scale_factor),
-        .height = (int)round((double)texture->height * (double)anim_scale_factor),
-    };
+       glUseProgram(server->passthrough_shader_program);
+
+  
 
     if (main_render_box.width <= 0 || main_render_box.height <= 0) {
         if (toplevel && !toplevel->pending_destroy && toplevel->target_scale == 0.0f) {
@@ -2532,257 +2920,198 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
         glUniform1i(tex_loc, 0);
     }
 
-    // Set time uniform like second version
-    struct timespec now_shader_time_iter_draw;
-    clock_gettime(CLOCK_MONOTONIC, &now_shader_time_iter_draw);
-    float time_value_iter_draw = now_shader_time_iter_draw.tv_sec + now_shader_time_iter_draw.tv_nsec / 1e9f;
-    GLint time_loc_iter_draw = glGetUniformLocation(server->shader_program, "time");
-    if (time_loc_iter_draw != -1) glUniform1f(time_loc_iter_draw, time_value_iter_draw);
+        // Set time uniform
+        struct timespec now_shader_time_iter_draw;
+        clock_gettime(CLOCK_MONOTONIC, &now_shader_time_iter_draw);
+        float time_value_iter_draw = now_shader_time_iter_draw.tv_sec + now_shader_time_iter_draw.tv_nsec / 1e9f;
+        GLint time_loc_iter_draw = glGetUniformLocation(server->passthrough_shader_program, "time");
+        if (time_loc_iter_draw != -1) glUniform1f(time_loc_iter_draw, time_value_iter_draw);
 
-    // Set resolution uniform like second version
-    float resolution_iter_draw[2] = {(float)output->width, (float)output->height};
-    GLint resolution_loc_iter_draw = glGetUniformLocation(server->shader_program, "iResolution");
-    if (resolution_loc_iter_draw != -1) glUniform2fv(resolution_loc_iter_draw, 1, resolution_iter_draw);
+        // Set resolution uniform
+        float resolution_iter_draw[2] = {(float)output->width, (float)output->height};
+        GLint resolution_loc_iter_draw = glGetUniformLocation(server->passthrough_shader_program, "iResolution");
+        if (resolution_loc_iter_draw != -1) glUniform2fv(resolution_loc_iter_draw, 1, resolution_iter_draw);
 
-    // --- SET THE NEW UNIFORMS HERE ---
-    // Pass the dimensions of the final rendered box (in pixels) to the shader.
-    glUniform2f(server->passthrough_shader_res_loc, (float)main_render_box.width, (float)main_render_box.height);
+        // --- SET THE NEW UNIFORMS HERE ---
+        // Pass the dimensions of the final rendered box (in pixels) to the shader.
+        glUniform2f(server->passthrough_shader_res_loc, (float)main_render_box.width, (float)main_render_box.height);
 
-    // Set the corner radius in pixels. You can make this configurable.
-    glUniform1f(server->passthrough_shader_cornerRadius_loc, 12.0f); // e.g., 12 pixel radius
+        // Set the corner radius in pixels
+        glUniform1f(server->passthrough_shader_cornerRadius_loc, 12.0f);
 
-    // ====================================================================
-    // --- NEW: LOGIC TO CALCULATE CYCLING BEVEL COLOR ---
-    // ====================================================================
-    
-    // 1. Define our color palette
-    static const float color_palette[][4] = {
-        {1.0f, 0.2f, 0.2f, 0.7f}, // Red
-        {1.0f, 1.0f, 0.2f, 0.7f}, // Yellow
-        {0.2f, 1.0f, 0.2f, 0.7f}, // Green
-        {0.2f, 1.0f, 1.0f, 0.7f}, // Cyan
-        {0.2f, 0.2f, 1.0f, 0.7f}, // Blue
-        {1.0f, 0.2f, 1.0f, 0.7f}  // Magenta
-    };
-    const int num_colors = sizeof(color_palette) / sizeof(color_palette[0]);
-    
-    // 2. Calculate timing for the cycle
-    float time_sec = get_monotonic_time_seconds_as_float();
-    float time_per_color = 2.0f; // Each color transition takes 2 seconds
-    float total_cycle_duration = (float)num_colors * time_per_color;
-    float time_in_cycle = fmod(time_sec, total_cycle_duration);
+        // ====================================================================
+        // --- NEW: LOGIC TO CALCULATE CYCLING BEVEL COLOR ---
+        // ====================================================================
+        
+        // 1. Define our color palette
+        static const float color_palette[][4] = {
+            {1.0f, 0.2f, 0.2f, 0.7f}, // Red
+            {1.0f, 1.0f, 0.2f, 0.7f}, // Yellow
+            {0.2f, 1.0f, 0.2f, 0.7f}, // Green
+            {0.2f, 1.0f, 1.0f, 0.7f}, // Cyan
+            {0.2f, 0.2f, 1.0f, 0.7f}, // Blue
+            {1.0f, 0.2f, 1.0f, 0.7f}  // Magenta
+        };
+        const int num_colors = sizeof(color_palette) / sizeof(color_palette[0]);
+        
+        // 2. Calculate timing for the cycle
+        float time_sec = get_monotonic_time_seconds_as_float();
+        float time_per_color = 2.0f; // Each color transition takes 2 seconds
+        float total_cycle_duration = (float)num_colors * time_per_color;
+        float time_in_cycle = fmod(time_sec, total_cycle_duration);
 
-    // 3. Determine which two colors to blend between
-    int current_color_idx = (int)floor(time_in_cycle / time_per_color);
-    int next_color_idx = (current_color_idx + 1) % num_colors; // Wrap around to the start
+        // 3. Determine which two colors to blend between
+        int current_color_idx = (int)floor(time_in_cycle / time_per_color);
+        int next_color_idx = (current_color_idx + 1) % num_colors; // Wrap around to the start
 
-    // 4. Calculate the blend factor for a smooth transition
-    float time_in_transition = fmod(time_in_cycle, time_per_color);
-    float mix_factor = time_in_transition / time_per_color;
-    // Apply a smooth easing function (smoothstep)
-    float eased_mix_factor = mix_factor * mix_factor * (3.0f - 2.0f * mix_factor);
+        // 4. Calculate the blend factor for a smooth transition
+        float time_in_transition = fmod(time_in_cycle, time_per_color);
+        float mix_factor = time_in_transition / time_per_color;
+        // Apply a smooth easing function (smoothstep)
+        float eased_mix_factor = mix_factor * mix_factor * (3.0f - 2.0f * mix_factor);
 
-    // 5. Interpolate between the two colors
-    float final_bevel_color[4];
-    for (int i = 0; i < 4; ++i) {
-        final_bevel_color[i] = 
-            color_palette[current_color_idx][i] * (1.0f - eased_mix_factor) +
-            color_palette[next_color_idx][i] * eased_mix_factor;
-    }
+        // 5. Interpolate between the two colors
+        float final_bevel_color[4];
+        for (int i = 0; i < 4; ++i) {
+            final_bevel_color[i] = 
+                color_palette[current_color_idx][i] * (1.0f - eased_mix_factor) +
+                color_palette[next_color_idx][i] * eased_mix_factor;
+        }
 
-    // 6. Set the final calculated color as the uniform
-    glUniform4fv(server->passthrough_shader_bevelColor_loc, 1, final_bevel_color);
-    glUniform1f(server->passthrough_shader_time_loc, get_monotonic_time_seconds_as_float());
-    // --- END OF NEW UNIFORMS ---
+        // 6. Set the final calculated color as the uniform
+        if (server->passthrough_shader_bevelColor_loc != -1) {
+            glUniform4fv(server->passthrough_shader_bevelColor_loc, 1, final_bevel_color);
+        }
+        if (server->passthrough_shader_time_loc != -1) {
+            glUniform1f(server->passthrough_shader_time_loc, get_monotonic_time_seconds_as_float());
+        }
+        // --- END OF NEW UNIFORMS ---
 
-    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
-    wlr_log(WLR_DEBUG, "[SCENE_ITERATOR:%s] Drew main window for '%s'", output_name_log, tl_title_for_log);
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+        wlr_log(WLR_DEBUG, "[SCENE_ITERATOR:%s] Drew main window for '%s'", output_name_log, tl_title_for_log);
 
-    // --- IMPROVED Preview Rendering with Proper Alignment ---
-    if (toplevel && server->top_panel_node && server->top_panel_node->enabled && texture) {
-        struct wlr_scene_rect *panel_srect = wlr_scene_rect_from_node(server->top_panel_node);
-
-        if (panel_srect) {
-            glUseProgram(server->shader_program);
-            
-            // Constants for preview layout
-            const float PREVIEW_PADDING = 5.0f;          // Padding around each preview
-            const float PANEL_LEFT_MARGIN = 20.0f;       // Left margin in panel
-            const float PANEL_RIGHT_MARGIN = 20.0f;      // Right margin in panel
-            const float MIN_PREVIEW_WIDTH = 30.0f;       // Minimum preview width
-            const float MAX_PREVIEW_WIDTH = 120.0f;      // Maximum preview width
-            
-            // Calculate available space for previews
-            float available_panel_width = (float)panel_srect->width - PANEL_LEFT_MARGIN - PANEL_RIGHT_MARGIN;
-            float preview_y_padding = PREVIEW_PADDING;
-            float preview_height = (float)panel_srect->height - 2.0f * preview_y_padding;
-            if (preview_height < 1.0f) preview_height = 1.0f;
-            
-            // Count total windows on this desktop
-            int desktop_window_count = 0;
-            struct tinywl_toplevel *iter_tl;
-            wl_list_for_each(iter_tl, &server->toplevels, link) {
-                if (iter_tl->desktop == rdata->desktop_index) {
-                    desktop_window_count++;
+        // --- IMPROVED Preview Rendering with Proper Alignment ---
+        if (toplevel && server->top_panel_node && server->top_panel_node->enabled) {
+            struct wlr_scene_rect *panel_srect = wlr_scene_rect_from_node(server->top_panel_node);
+            if (panel_srect) {
+                glUseProgram(server->shader_program); // Use flame shader for previews
+                
+                const float PREVIEW_PADDING = 5.0f, PANEL_LEFT_MARGIN = 20.0f, MAX_PREVIEW_WIDTH = 120.0f;
+                float available_panel_width = (float)panel_srect->width - PANEL_LEFT_MARGIN * 2.0f;
+                float preview_y_padding = PREVIEW_PADDING;
+                float preview_height = (float)panel_srect->height - 2.0f * preview_y_padding;
+                
+                int desktop_window_count = 0;
+                struct tinywl_toplevel *iter_tl;
+                wl_list_for_each(iter_tl, &server->toplevels, link) {
+                    if (iter_tl->desktop == rdata->desktop_index) desktop_window_count++;
                 }
-            }
-            
-            if (desktop_window_count == 0) {
-                wlr_texture_destroy(texture);
-                return;
-            }
-            
-            // Calculate optimal preview width
-            float total_padding = (desktop_window_count - 1) * PREVIEW_PADDING;
-            float ideal_preview_width = (available_panel_width - total_padding) / desktop_window_count;
-            
-            // Clamp preview width to reasonable bounds
-            if (ideal_preview_width < MIN_PREVIEW_WIDTH) {
-                ideal_preview_width = MIN_PREVIEW_WIDTH;
-            } else if (ideal_preview_width > MAX_PREVIEW_WIDTH) {
-                ideal_preview_width = MAX_PREVIEW_WIDTH;
-            }
-            
-            // Find this toplevel's index among windows on the same desktop
-            int per_desktop_index = 0;
-            wl_list_for_each(iter_tl, &server->toplevels, link) {
-                if (iter_tl->desktop == rdata->desktop_index) {
-                    if (iter_tl == toplevel) {
-                        break;
+                if (desktop_window_count == 0) { wlr_texture_destroy(texture); return; }
+                
+                float ideal_preview_width = fminf(MAX_PREVIEW_WIDTH, (available_panel_width - (desktop_window_count - 1) * PREVIEW_PADDING) / desktop_window_count);
+
+                int per_desktop_index = 0;
+                wl_list_for_each(iter_tl, &server->toplevels, link) {
+                    if (iter_tl->desktop == rdata->desktop_index) {
+                        if (iter_tl == toplevel) break;
+                        per_desktop_index++;
                     }
-                    per_desktop_index++;
-                }
-            }
-            
-            // Calculate this preview's allocated slot position
-            float slot_x_offset = PANEL_LEFT_MARGIN + (per_desktop_index * (ideal_preview_width + PREVIEW_PADDING));
-            
-            // Calculate aspect ratio and adjust dimensions
-            float aspect_ratio = (texture->width > 0 && texture->height > 0) ? 
-                                (float)texture->width / (float)texture->height : 1.0f;
-            
-            float preview_width = ideal_preview_width;
-            float preview_height_adjusted = preview_height;
-            
-            // Maintain aspect ratio by adjusting the smaller dimension
-            float width_from_height = preview_height_adjusted * aspect_ratio;
-            float height_from_width = preview_width / aspect_ratio;
-            
-            if (width_from_height <= preview_width) {
-                // Height is the limiting factor
-                preview_width = width_from_height;
-            } else {
-                // Width is the limiting factor
-                preview_height_adjusted = height_from_width;
-            }
-            
-            // Center the actual preview within its allocated slot
-            float preview_x_offset = slot_x_offset + (ideal_preview_width - preview_width) / 2.0f;
-            
-            // Ensure we don't exceed panel bounds
-            if (preview_x_offset + preview_width > panel_srect->width - PANEL_RIGHT_MARGIN) {
-                float max_width = panel_srect->width - PANEL_RIGHT_MARGIN - preview_x_offset;
-                if (max_width > 0) {
-                    preview_width = max_width;
-                    preview_height_adjusted = preview_width / aspect_ratio;
-                    if (preview_height_adjusted > preview_height) {
-                        preview_height_adjusted = preview_height;
-                        preview_width = preview_height_adjusted * aspect_ratio;
-                    }
-                } else {
-                    // No space left, skip this preview
-                    wlr_texture_destroy(texture);
-                    return;
-                }
-            }
-            
-            // Center vertically if preview height is smaller than available height
-            float y_offset = preview_y_padding;
-            if (preview_height_adjusted < preview_height) {
-                y_offset += (preview_height - preview_height_adjusted) / 2.0f;
-            }
-            
-            int panel_screen_x = server->top_panel_node->x;
-            int panel_screen_y = server->top_panel_node->y;
-            
-            struct wlr_box preview_box_on_screen = {
-                .x = (int)round((double)panel_screen_x + preview_x_offset),
-                .y = (int)round((double)panel_screen_y + y_offset),
-                .width = (int)round(preview_width),
-                .height = (int)round(preview_height_adjusted),
-            };
-            
-            wlr_log(WLR_INFO, "[SCENE_ITERATOR_PREVIEW:%s] Rendering preview for '%s' (desktop %d, index %d/%d) at %.1f,%.1f %dx%d",
-                    output_name_log, tl_title_for_log, rdata->desktop_index, 
-                    per_desktop_index, desktop_window_count,
-                    preview_x_offset, y_offset,
-                    preview_box_on_screen.width, preview_box_on_screen.height);
-            
-            if (preview_box_on_screen.width > 0 && preview_box_on_screen.height > 0) {
-                float preview_mvp[9];
-                float p_box_scale_x = (float)preview_box_on_screen.width * (2.0f / output->width);
-                float p_box_scale_y = (float)preview_box_on_screen.height * (-2.0f / output->height);
-                float p_box_translate_x = ((float)preview_box_on_screen.x / output->width) * 2.0f - 1.0f;
-                float p_box_translate_y = ((float)preview_box_on_screen.y / output->height) * -2.0f + 1.0f;
-                float p_model_view[9] = { p_box_scale_x, 0.0f, 0.0f, 0.0f, p_box_scale_y, 0.0f, p_box_translate_x, p_box_translate_y, 1.0f };
-
-                memcpy(preview_mvp, p_model_view, sizeof(p_model_view));
-
-                // Apply output transform to the preview MVP
-                if (output->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
-                    float temp_preview_mvp[9];
-                    memcpy(temp_preview_mvp, preview_mvp, sizeof(preview_mvp));
-                    float output_transform_matrix[9];
-                    wlr_matrix_identity(output_transform_matrix);
-                    wlr_matrix_transform(output_transform_matrix, output->transform);
-                    wlr_matrix_multiply(preview_mvp, output_transform_matrix, temp_preview_mvp);
                 }
 
-                // Re-set uniforms for the preview draw call
-                GLint preview_mvp_loc = glGetUniformLocation(server->shader_program, "mvp");
-                if (preview_mvp_loc != -1) glUniformMatrix3fv(preview_mvp_loc, 1, GL_FALSE, preview_mvp);
+                float slot_x_offset = PANEL_LEFT_MARGIN + (per_desktop_index * (ideal_preview_width + PREVIEW_PADDING));
+                float aspect_ratio = (texture->width > 0 && texture->height > 0) ? (float)texture->width / (float)texture->height : 1.0f;
+                float preview_width = fminf(ideal_preview_width, preview_height * aspect_ratio);
+                float preview_height_adjusted = preview_width / aspect_ratio;
+                float preview_x_offset = slot_x_offset + (ideal_preview_width - preview_width) / 2.0f;
+                float y_offset = preview_y_padding + (preview_height - preview_height_adjusted) / 2.0f;
 
-                GLint preview_tex_loc = glGetUniformLocation(server->shader_program, "texture_sampler_uniform");
-                if (preview_tex_loc != -1) {
+                struct wlr_box preview_box_on_screen = {
+                    .x = (int)round((double)server->top_panel_node->x + preview_x_offset),
+                    .y = (int)round((double)server->top_panel_node->y + y_offset),
+                    .width = (int)round(preview_width),
+                    .height = (int)round(preview_height_adjusted),
+                };
+                
+                toplevel->panel_preview_box = preview_box_on_screen;
+
+                if (preview_box_on_screen.width > 0 && preview_box_on_screen.height > 0) {
+                    float preview_mvp[9];
+                    float p_box_scale_x = (float)preview_box_on_screen.width * (2.0f / output->width);
+                    float p_box_scale_y = (float)preview_box_on_screen.height * (-2.0f / output->height);
+                    float p_box_translate_x = ((float)preview_box_on_screen.x / output->width) * 2.0f - 1.0f;
+                    float p_box_translate_y = ((float)preview_box_on_screen.y / output->height) * -2.0f + 1.0f;
+                    float p_model_view[9] = { p_box_scale_x, 0, 0, 0, p_box_scale_y, 0, p_box_translate_x, p_box_translate_y, 1 };
+                    memcpy(preview_mvp, p_model_view, sizeof(p_model_view));
+                    
+                    glUniformMatrix3fv(server->flame_shader_mvp_loc, 1, GL_FALSE, preview_mvp);
                     glActiveTexture(GL_TEXTURE0);
                     glBindTexture(tex_attribs.target, tex_attribs.tex);
-                    glUniform1i(preview_tex_loc, 0);
-                }
-
-                // Set iResolution specifically for the preview's dimensions
-                GLint preview_res_loc = glGetUniformLocation(server->shader_program, "iResolution");
-                if (preview_res_loc != -1) {
+                    glUniform1i(server->flame_shader_tex_loc, 0);
+                    glUniform1f(server->flame_shader_time_loc, get_monotonic_time_seconds_as_float());
                     float preview_res_vec[2] = {(float)preview_box_on_screen.width, (float)preview_box_on_screen.height};
-                    glUniform2fv(preview_res_loc, 1, preview_res_vec);
-                }
-
-                glUniform1f(server->flame_shader_time_loc, get_monotonic_time_seconds_as_float());
-
-                glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
-                wlr_log(WLR_DEBUG, "[SCENE_ITERATOR_PREVIEW:%s] Drew preview for '%s' at %d,%d %dx%d",
-                       output_name_log, tl_title_for_log,
-                       preview_box_on_screen.x, preview_box_on_screen.y,
-                       preview_box_on_screen.width, preview_box_on_screen.height);
-
-                // Restore iResolution for subsequent main window rendering
-                if (preview_res_loc != -1) {
-                     float main_res_vec[2] = {(float)output->width, (float)output->height};
-                     glUniform2fv(preview_res_loc, 1, main_res_vec);
+                    glUniform2fv(server->flame_shader_res_loc, 1, preview_res_vec);
+                    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
                 }
             }
-        } else {
-            wlr_log(WLR_ERROR, "[SCENE_ITERATOR_PREVIEW:%s] Panel node is not a wlr_scene_rect, cannot get dimensions.", output_name_log);
+        } else if (toplevel) {
+            toplevel->panel_preview_box = (struct wlr_box){0, 0, 0, 0};
         }
-    }
-    
-    // Cleanup like second version
-    if (tex_loc != -1) {
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(tex_attribs.target, 0);
-    }
-    wlr_texture_destroy(texture);
-}
 
+        
+            if (main_render_box.width > 0 && main_render_box.height > 0) {
+            // Enable blending for proper alpha rendering
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            
+            // Use the genie shader program
+            glUseProgram(server->genie_shader_program);
+            
+                    // Calculate MVP matrix properly for the interpolated render box
+                float main_mvp[9];
+                float box_scale_x = (float)main_render_box.width * (2.0f / output->width);
+                float box_scale_y = (float)main_render_box.height * (-2.0f / output->height);
+                float box_translate_x = ((float)main_render_box.x / output->width) * 2.0f - 1.0f;
+                float box_translate_y = ((float)main_render_box.y / output->height) * -2.0f + 1.0f;
+                float model_view[9] = {box_scale_x, 0.0f, 0.0f, 0.0f, box_scale_y, 0.0f, box_translate_x, box_translate_y, 1.0f};
+                memcpy(main_mvp, model_view, sizeof(model_view));
+
+                if (output->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+                    float temp_mvp[9];
+                    memcpy(temp_mvp, main_mvp, sizeof(model_view));
+                    float transform_matrix[9];
+                    wlr_matrix_transform(transform_matrix, output->transform);
+                    wlr_matrix_multiply(main_mvp, transform_matrix, temp_mvp);
+                }
+                if (scene_buffer->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+                    float temp_mvp_buffer[9];
+                    memcpy(temp_mvp_buffer, main_mvp, sizeof(main_mvp));
+                    float buffer_matrix[9];
+                    wlr_matrix_transform(buffer_matrix, scene_buffer->transform);
+                    wlr_matrix_multiply(main_mvp, temp_mvp_buffer, buffer_matrix);
+                }
+                    
+            // Set MVP uniform using glGetUniformLocation for safety
+            GLint mvp_loc = glGetUniformLocation(server->genie_shader_program, "mvp");
+            if (mvp_loc == -1) {
+                mvp_loc = server->genie_shader_mvp_loc; // fallback to cached location
+            }
+            if (mvp_loc != -1) {
+                glUniformMatrix3fv(mvp_loc, 1, GL_FALSE, main_mvp);
+            }
+
+            
+            
+            wlr_log(WLR_DEBUG, "[GENIE_ANIM:%s] Drew genie effect with texture, progress: %.3f", output_name_log, progress);
+        }
+        
+        // Cleanup
+        if (tex_loc != -1) {
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(tex_attribs.target, 0);
+        }
+        wlr_texture_destroy(texture);
+    }
+}
 
 
 static pthread_mutex_t rdp_transmit_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -3284,7 +3613,7 @@ if (desktop_to_render == 3) {
     glUseProgram(0);
 }
 */
-
+/*
 static void render_desktop_content(struct tinywl_server *server,
                                    struct wlr_output *wlr_output,
                                    struct render_data *current_rdata,
@@ -3336,6 +3665,105 @@ static void render_desktop_content(struct tinywl_server *server,
                     glUseProgram(server->shader_program);
                     wlr_scene_node_for_each_buffer(&toplevel_s_tree->node, scene_buffer_iterator, current_rdata);
                 }
+            }
+        }
+    }
+
+    glBindVertexArray(0);
+    glUseProgram(0);
+}*/
+
+// MODIFIED: This is the final, correct version using the wlr_render_pass API.
+static void render_desktop_content(struct tinywl_server *server,
+                                   struct wlr_output *wlr_output,
+                                   struct render_data *current_rdata,
+                                   int desktop_to_render) {
+    if (server->quad_vao == 0) return;
+    glBindVertexArray(server->quad_vao);
+
+    // --- Render Desktop Chrome (Background and Panel Base) ---
+    if (server->main_background_node && server->main_background_node->enabled) {
+        render_rect_node(server->main_background_node, current_rdata);
+    }
+    if (server->top_panel_node && server->top_panel_node->enabled) {
+        render_panel_node(server->top_panel_node, current_rdata);
+    }
+
+    // --- LOOP 1: Render MAIN WINDOWS (non-minimized only) ---
+    struct wlr_scene_node *scene_node;
+    wl_list_for_each(scene_node, &server->scene->tree.children, link) {
+        // Skip nodes that are disabled (minimized) or are desktop chrome
+        if (!scene_node->enabled || scene_node == server->main_background_node || scene_node == server->top_panel_node) {
+            continue;
+        }
+
+        if (scene_node->type == WLR_SCENE_NODE_TREE) {
+            struct tinywl_toplevel *toplevel = scene_node->data;
+
+            // Skip rendering the main window if it's minimized
+            if (toplevel && toplevel->desktop == desktop_to_render && !toplevel->minimized) {
+                if (toplevel->ssd.enabled) {
+                    struct wlr_scene_node *ssd_node;
+                    wl_list_for_each(ssd_node, &toplevel->scene_tree->children, link) {
+                        if (ssd_node->type == WLR_SCENE_NODE_RECT) render_rect_node(ssd_node, current_rdata);
+                    }
+                }
+                // The scene_buffer_iterator now correctly handles its own rendering.
+                wlr_scene_node_for_each_buffer(scene_node, scene_buffer_iterator, current_rdata);
+            }
+        }
+    }
+
+    // --- LOOP 2: Render ALL panel previews for this desktop ---
+    if (server->top_panel_node && server->top_panel_node->enabled && current_rdata->pass) {
+        struct wlr_scene_rect *panel_srect = wlr_scene_rect_from_node(server->top_panel_node);
+        int desktop_window_count = 0;
+        struct tinywl_toplevel *iter_tl;
+        wl_list_for_each(iter_tl, &server->toplevels, link) {
+            if (iter_tl->desktop == desktop_to_render) desktop_window_count++;
+        }
+
+        if (desktop_window_count > 0) {
+            const float PREVIEW_PADDING = 5.0f, PANEL_LEFT_MARGIN = 20.0f, MAX_PREVIEW_WIDTH = 120.0f;
+            float available_width = panel_srect->width - PANEL_LEFT_MARGIN * 2;
+            float ideal_width = fminf(MAX_PREVIEW_WIDTH, (available_width - (desktop_window_count - 1) * PREVIEW_PADDING) / desktop_window_count);
+            float preview_y_padding = PREVIEW_PADDING;
+            float preview_height = panel_srect->height - 2.0f * preview_y_padding;
+
+            int per_desktop_index = 0;
+            wl_list_for_each(iter_tl, &server->toplevels, link) {
+                if (iter_tl->desktop != desktop_to_render || !iter_tl->cached_texture) {
+                    continue;
+                }
+
+                struct wlr_texture *texture = iter_tl->cached_texture;
+                float aspect_ratio = (texture->width > 0) ? (float)texture->width / (float)texture->height : 1.0f;
+                float preview_width = fminf(ideal_width, preview_height * aspect_ratio);
+                float preview_height_adjusted = preview_width / aspect_ratio;
+                float slot_x = PANEL_LEFT_MARGIN + per_desktop_index * (ideal_width + PREVIEW_PADDING);
+                float preview_x = slot_x + (ideal_width - preview_width) / 2.0f;
+                float preview_y = preview_y_padding + (preview_height - preview_height_adjusted) / 2.0f;
+
+                struct wlr_box box = {
+                    .x = (int)round(server->top_panel_node->x + preview_x),
+                    .y = (int)round(server->top_panel_node->y + preview_y),
+                    .width = (int)round(preview_width),
+                    .height = (int)round(preview_height_adjusted)
+                };
+                iter_tl->panel_preview_box = box;
+
+                if (box.width > 0 && box.height > 0) {
+                    // ***** THIS IS THE FINAL, CORRECT API USAGE *****
+                    // We construct the options struct and pass its address.
+                    // The renderer and render pass handle all matrix transformations.
+                    struct wlr_render_texture_options options = {
+                        .texture = texture,
+                        .dst_box = box,
+                        // No need for transform here as dst_box is already in output-local coords.
+                    };
+                    wlr_render_pass_add_texture(current_rdata->pass, &options);
+                }
+                per_desktop_index++;
             }
         }
     }
@@ -4446,6 +4874,11 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
     wlr_log(WLR_INFO, "[MAP:%s] Toplevel mapped. Starting geometry negotiation.", title);
     toplevel->mapped = true;
 
+    // NEW: Explicitly set the initial state to not minimized.
+    toplevel->mapped = true;
+    toplevel->minimized = false; // <<< THIS IS THE KEY LINE
+    toplevel->panel_preview_box = (struct wlr_box){0, 0, 0, 0};
+
     // Default content size if client provides no hints.
     int target_content_width = 800;
     int target_content_height = 600;
@@ -4613,6 +5046,40 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
     if (needs_surface_configure || (xdg_surface->initialized && !xdg_surface->configured)) {
         wlr_log(WLR_INFO, "[COMMIT:%s] Scheduling configure for xdg_surface.", title);
         wlr_xdg_surface_schedule_configure(xdg_surface);
+    }
+
+    // Caching and redrawing logic remains the same.
+    if (surface->current.buffer) {
+        if (!(toplevel->cached_texture && toplevel->last_commit_seq == surface->current.seq)) {
+            if (toplevel->cached_texture) wlr_texture_destroy(toplevel->cached_texture);
+            toplevel->cached_texture = wlr_texture_from_buffer(server->renderer, surface->current.buffer);
+            toplevel->last_commit_seq = surface->current.seq;
+        }
+    } else {
+        if (toplevel->cached_texture) {
+            wlr_texture_destroy(toplevel->cached_texture);
+            toplevel->cached_texture = NULL;
+        }
+        toplevel->last_commit_seq = surface->current.seq;
+    }
+
+    
+
+   if (surface->mapped && !toplevel->minimized && !toplevel->is_minimizing) {
+        toplevel->restored_geom.x = toplevel->scene_tree->node.x;
+        toplevel->restored_geom.y = toplevel->scene_tree->node.y;
+
+        // --- THE FIX IS HERE ---
+        // Get geometry directly from the struct member instead of the old function.
+        struct wlr_box content_geom = xdg_surface->geometry;
+
+        if (toplevel->ssd.enabled) {
+            toplevel->restored_geom.width = content_geom.width + 2 * BORDER_WIDTH;
+            toplevel->restored_geom.height = content_geom.height + TITLE_BAR_HEIGHT + BORDER_WIDTH;
+        } else {
+            toplevel->restored_geom.width = content_geom.width;
+            toplevel->restored_geom.height = content_geom.height;
+        }
     }
 
     // Caching and redrawing logic remains the same.
@@ -9772,6 +10239,74 @@ static const char *passthrough_fragment_shader_src =
     "    frag_color = vec4(final_rgb, final_alpha).bgra;\n"
     "}\n";
 
+
+  // MODIFIED: Corrected Genie Effect Vertex Shader (simpler, only does positioning)
+static const char *genie_vertex_shader_src =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "\n"
+    "layout(location = 0) in vec2 position;\n" // Quad vertices (0,0 to 1,1)
+    "layout(location = 1) in vec2 texcoord;\n" // Texture coordinates
+    "\n"
+    "// Uniforms\n"
+    "uniform mat3 mvp;\n"
+    "\n"
+    "out vec2 v_texcoord;\n"
+    "\n"
+    "void main() {\n"
+    "    // The C code will calculate the exact position and size of the quad for this frame.\n"
+    "    // The vertex shader's only job is to project these vertices to the screen.\n"
+    "    vec3 pos_transformed = mvp * vec3(position, 1.0);\n"
+    "    gl_Position = vec4(pos_transformed.xy, 0.0, 1.0);\n"
+    "\n"
+    "    // Pass the original, unmodified texture coordinate to the fragment shader.\n"
+    "    // The fragment shader will do all the heavy lifting.\n"
+    "    v_texcoord = texcoord;\n"
+    "}\n";
+
+// MODIFIED: Corrected Genie Effect Fragment Shader (does all the warping)
+static const char *genie_fragment_shader_src =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "\n"
+    "uniform sampler2D u_texture;\n"
+    "uniform float progress; // Animation progress: 0.0 (start) to 1.0 (end)\n"
+    "uniform float u_bend_factor;\n"
+    "\n"
+    "// Easing function for smooth animation\n"
+    "float easeInOutCubic(float t) {\n"
+    "    return t < 0.5 ? 4.0 * t * t * t : 1.0 - pow(-2.0 * t + 2.0, 3.0) / 2.0;\n"
+    "}\n"
+    "\n"
+    "void main() {\n"
+    "    float t = easeInOutCubic(progress);\n"
+    "\n"
+    "    // 1. Calculate the Y-squash factor\n"
+    "    float y_squash = 1.0 - pow(t, 2.5);\n"
+    "\n"
+    "    // 2. Calculate the X-squash factor\n"
+    "    float x_squash = 1.0 - t;\n"
+    "\n"
+    "    // 3. Calculate horizontal bending\n"
+    "    float bend_t = sin(t * 3.14159); // Parabolic curve (0 -> 1 -> 0)\n"
+    "    float bend_amount = (v_texcoord.x - 0.5) * (v_texcoord.x - 0.5) * -u_bend_factor * bend_t;\n"
+    "\n"
+    "    // 4. Warp the texture coordinate based on our calculations\n"
+    "    vec2 warped_uv = v_texcoord;\n"
+    "    warped_uv.x = 0.5 + (v_texcoord.x - 0.5) / x_squash;\n"
+    "    warped_uv.y = v_texcoord.y / y_squash + bend_amount;\n"
+    "\n"
+    "    // 5. Check if the warped coordinate is out of bounds [0,1]\n"
+    "    if (warped_uv.x < 0.0 || warped_uv.x > 1.0 || warped_uv.y < 0.0 || warped_uv.y > 1.0) {\n"
+    "        discard;\n"
+    "    }\n"
+    "\n"
+    "    // Sample the texture with the final, warped coordinate (flip Y)\n"
+    "    frag_color = texture(u_texture, vec2(warped_uv.x, 1.0 - warped_uv.y)).bgra;\n"
+    "}\n";
+
     setenv("MESA_VK_VERSION_OVERRIDE", "1.2", 1);
     setenv("MESA_LOADER_DRIVER_OVERRIDE", "zink", 1);
    // setenv("GALLIUM_DRIVER", "zink", 1);
@@ -10191,8 +10726,27 @@ for (int i = 0; i < 16; ++i) {
                                      sizeof(passthrough_uniforms) / sizeof(passthrough_uniforms[0]))) {
         // ... error handling ...
     }
-    // Initialize zoom effect variables
-    // Initialize zoom effect variables
+
+
+// In main(), inside the shader setup section
+    // ... (after your other create_generic_shader_program calls)
+    // --- Create Genie/Minimize Shader ---
+    struct shader_uniform_spec genie_uniforms[] = {
+        {"mvp", &server.genie_shader_mvp_loc},
+        {"u_texture", &server.genie_shader_tex_loc}, // Corrected name
+        {"progress", &server.genie_shader_progress_loc},
+        {"u_bend_factor", &server.genie_shader_bend_factor_loc}
+    };
+    if (!create_generic_shader_program(server.renderer, "GenieShader",
+                                     genie_vertex_shader_src,
+                                     genie_fragment_shader_src,
+                                     &server.genie_shader_program,
+                                     genie_uniforms,
+                                     sizeof(genie_uniforms) / sizeof(genie_uniforms[0]))) {
+        wlr_log(WLR_ERROR, "Failed to create genie effect shader program.");
+        server_destroy(&server);
+        return 1;
+    }
 
     server.current_desktop = 0;
     DestopGridSize = 4; // Assuming a 4x4 grid for 16 desktops
