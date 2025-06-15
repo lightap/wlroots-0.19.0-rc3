@@ -1328,7 +1328,7 @@ static void toggle_minimize_toplevel(struct tinywl_toplevel *toplevel, bool mini
     toplevel->is_minimizing = true;
     toplevel->minimizing_to_dock = minimized; // Direction of animation
     toplevel->minimize_start_time = get_monotonic_time_seconds_as_float();
-    toplevel->minimize_duration = 3.2f; // 400ms animation
+    toplevel->minimize_duration = 1.0f; // 400ms animation
     
     if (minimized) { // We are minimizing TO the dock
         toplevel->minimize_start_geom = toplevel->restored_geom;
@@ -10303,12 +10303,9 @@ static const char *passthrough_fragment_shader_src =
     "}\n";
 
 
-  // Classic Genie Effect Vertex Shader with an initial Ripple/Wavy effect.
-// The animation begins with a "wobble," which then resolves into the
-// classic genie taper effect.// Classic Genie Effect with an INITIAL, ANIMATED Ripple/Wavy effect.
-// The ripple's amplitude, frequency, and speed all change over the
-// duration of the animation for a more dynamic feel.
-static const char *genie_vertex_shader_src =
+
+/*    //squezze genie
+const char *genie_vertex_shader_src =
     "#version 300 es\n"
     "precision highp float;\n"
     "\n"
@@ -10317,18 +10314,95 @@ static const char *genie_vertex_shader_src =
     "\n"
     "uniform mat3 mvp;\n"
     "uniform float progress;\n"
-    "uniform float u_bend_factor;\n"
-    "uniform vec2 u_target_pos;\n"
+    "uniform vec4 src_box;\n"
+    "uniform vec4 target_box;\n"
+    "uniform int upward;\n"
     "\n"
     "out vec2 v_texcoord;\n"
     "\n"
     "void main() {\n"
-    "    // Simple passthrough - no transformation\n"
-    "    gl_Position = vec4((mvp * vec3(position, 1.0)).xy, 0.0, 1.0);\n"
+    "    vec2 pos = position;\n"
+    "    \n"
+    "    // Calculate normalized Y position (0 at bottom, 1 at top)\n"
+    "    float norm_y = (upward == 1) ? texcoord.y : (1.0 - texcoord.y);\n"
+    "    \n"
+    "    // Create stepped width progression: 5% at bottom, incrementally to 100% at top\n"
+    "    // Each step increases by ~5% (actually 5% per 20 steps for smooth progression)\n"
+    "    float step_size = 0.05; // 5% increment\n"
+    "    float min_width = 0.005; // 5% minimum width at bottom\n"
+    "    \n"
+    "    // Calculate which step we're in (0-19 steps for smooth transition)\n"
+    "    float step_count = 5000.0;\n"
+    "    float current_step = floor(norm_y * step_count);\n"
+    "    \n"
+    "    // Calculate width percentage for current step\n"
+    "    // Bottom (step 0) = 5%, Top (step 5000) = 100%\n"
+    "    float width_factor = min_width + (current_step / (step_count - 1.0)) * (1.0 - min_width);\n"
+    "    \n"
+    "    // Apply progressive squeeze based on progress and width factor\n"
+    "    float squeeze_amount = progress * (1.0 - width_factor)+(sin(progress)/5.0);\n"
+    "    \n"
+    "    // Calculate source and target centers\n"
+    "    float target_center_x = (target_box.x + target_box.z) * 0.5;\n"
+    "    float src_center_x = (src_box.x + src_box.z) * 0.5;\n"
+    "    \n"
+    "    // Create trail path - bottom follows target, top stays at source initially\n"
+    "    // The trail effect moves up the genie as progress increases\n"
+    "    float trail_progress = progress * 2.0; // Speed up the trail effect\n"
+    "    float trail_position = trail_progress - norm_y; // Trail moves from bottom to top\n"
+    "    trail_position = clamp(trail_position, 0.0, 1.0);\n"
+    "    \n"
+    "    // Calculate center position based on trail - bottom warps to target first\n"
+    "    float center_x = mix(src_center_x, target_center_x, trail_position);\n"
+    "    \n"
+    "    // Calculate window center for bottom squeeze centering\n"
+    "    float window_center_x = 0.0;\n"
+    "    \n"
+    "    // Apply horizontal squeeze toward dynamic center\n"
+    "    float distance_from_center = pos.x - center_x;\n"
+    "    pos.x = center_x + distance_from_center * (1.0 - squeeze_amount );\n"
+    "    \n"
+    "    // Add subtle wave distortion for magical effect\n"
+    "    float wave_intensity = squeeze_amount * 0.8;\n"
+    "    float wave_freq = 1.0 + norm_y * 4.0; // Higher frequency at top\n"
+    "    float wave = sin(norm_y * wave_freq + mix(-progress, progress, progress) * 6.28318) * wave_intensity;\n"
+    "    \n"
+    "    // Create trail-based wave positioning\n"
+    "    float bottom_weight = 1.0 - norm_y; // Stronger effect at bottom\n"
+    "    float trail_center = mix(center_x, target_center_x, trail_position);\n"
+    "    pos.x = mix(center_x + (pos.x - center_x) + wave, trail_center + wave, bottom_weight * squeeze_amount) ;\n"
+    "    \n"
+    "    // Add slight vertical compression as it gets squeezed\n"
+    "    float vertical_compress = squeeze_amount * 0.1;\n"
+    "    pos.y = mix(pos.y, center_x, vertical_compress * norm_y);\n"
+    "    \n"
+    "    gl_Position = vec4((mvp * vec3(pos, 1.0)).xy, 0.0, 1.0);\n"
     "    v_texcoord = texcoord;\n"
-    "}";
-    
-    static const char *genie_fragment_shader_src =
+    "}\n";
+  */
+  
+  const char *genie_vertex_shader_src =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "\n"
+    "layout(location = 0) in vec2 position;\n"
+    "layout(location = 1) in vec2 texcoord;\n"
+    "\n"
+    "uniform mat3 mvp;\n"
+    "uniform float progress;\n"
+    "uniform vec4 src_box;\n"
+    "uniform vec4 target_box;\n"
+    "uniform int upward;\n"
+    "\n"
+    "out vec2 v_texcoord;\n"
+    "\n"
+    "void main() {\n"
+    "    vec2 pos = position;\n"
+    "    \n"
+    "    gl_Position = vec4((mvp * vec3(pos, 1.0)).xy, 0.0, 1.0);\n"
+    "    v_texcoord = texcoord;\n"
+    "}\n";
+  static const char *genie_fragment_shader_src =
     "#version 300 es\n"
     "precision highp float;\n"
     "in vec2 v_texcoord;\n"
