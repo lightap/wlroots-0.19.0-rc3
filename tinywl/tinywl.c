@@ -2508,16 +2508,27 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
  if (toplevel && toplevel->is_minimizing) {
     // --- PATH 1: MODIFIED Genie Minimize/Restore Animation with Passthrough Shader and Tessellated Mesh ---
 
-    // Use cached texture for minimize animation.
-    struct wlr_texture *anim_texture = toplevel->cached_texture;
-    bool created_temp_texture = false;
+    // Get the live texture from the surface, not the scene buffer
+    // Get the live texture from the surface, not the scene buffer
+struct wlr_texture *anim_texture = NULL;
+
+// Try to get the texture from the toplevel's surface directly
+if (toplevel->xdg_toplevel && toplevel->xdg_toplevel->base && toplevel->xdg_toplevel->base->surface) {
+    struct wlr_surface *surface = toplevel->xdg_toplevel->base->surface;
+    if (surface->buffer) {
+        // Fix: Access the underlying wlr_buffer from wlr_client_buffer
+        anim_texture = wlr_texture_from_buffer(renderer, &surface->buffer->base);
+    }
+}
+
+// Fallback to scene buffer if surface texture isn't available
+if (!anim_texture) {
+    anim_texture = wlr_texture_from_buffer(renderer, scene_buffer->buffer);
+}
+    
     if (!anim_texture) {
-        anim_texture = wlr_texture_from_buffer(renderer, scene_buffer->buffer);
-        if (!anim_texture) {
-            wlr_log(WLR_ERROR, "[GENIE_ANIM:%s] Failed to create texture for genie animation", output_name_log);
-            return;
-        }
-        created_temp_texture = true;
+        wlr_log(WLR_ERROR, "[GENIE_ANIM:%s] Failed to create live texture for genie animation.", output_name_log);
+        return;
     }
 
     wlr_gles2_texture_get_attribs(anim_texture, &tex_attribs);
@@ -2552,6 +2563,20 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
     if (render_box.width < 1) render_box.width = 1;
     if (render_box.height < 1) render_box.height = 1;
     
+   
+    // Account for decoration size to prevent over-scaling
+    int decoration_left = BORDER_WIDTH;   // Left border width
+    int decoration_right = BORDER_WIDTH;  // Right border width  
+    int decoration_top = TITLE_BAR_HEIGHT;   // Title bar height
+    int decoration_bottom = BORDER_WIDTH; // Bottom border width
+    
+    // Calculate content area within the render box
+    struct wlr_box content_area;
+    content_area.x = render_box.x + decoration_left;
+    content_area.y = render_box.y + decoration_top;
+    content_area.width = fmaxf(1, render_box.width - decoration_left - decoration_right);
+    content_area.height = fmaxf(1, render_box.height - decoration_top - decoration_bottom);
+    
     if (render_box.width > 0 && render_box.height > 0) {
         // Store the original framebuffer binding
         GLint original_fbo;
@@ -2585,6 +2610,7 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
             glBindFramebuffer(GL_FRAMEBUFFER, original_fbo);
             glDeleteTextures(1, &intermediate_texture);
             glDeleteFramebuffers(1, &intermediate_fbo);
+            wlr_texture_destroy(anim_texture);
             return;
         }
         
@@ -2616,26 +2642,24 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
             wlr_matrix_multiply(passthrough_mvp, temp_mvp_buffer, buffer_matrix);
         }
         
-        // Render passthrough shader to intermediate texture
+        // Use passthrough shader program
         glUseProgram(server->passthrough_shader_program);
+        
+        // Get fresh texture attributes for the current frame
+        struct wlr_gles2_texture_attribs fresh_tex_attribs;
+        wlr_gles2_texture_get_attribs(anim_texture, &fresh_tex_attribs);
+        
+        // Bind the current frame's texture (this gets updated each frame)
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(fresh_tex_attribs.target, fresh_tex_attribs.tex);
+        glUniform1i(server->passthrough_shader_tex_loc, 0);
+        glTexParameteri(fresh_tex_attribs.target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(fresh_tex_attribs.target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         
         // Set MVP uniform for passthrough
         GLint mvp_loc_pass = glGetUniformLocation(server->passthrough_shader_program, "mvp");
         if (mvp_loc_pass != -1) {
             glUniformMatrix3fv(mvp_loc_pass, 1, GL_FALSE, passthrough_mvp);
-        }
-
-        // Set up original texture binding for passthrough shader
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(tex_attribs.target, tex_attribs.tex);
-        glTexParameteri(tex_attribs.target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(tex_attribs.target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(tex_attribs.target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(tex_attribs.target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        
-        GLint tex_loc_pass = glGetUniformLocation(server->passthrough_shader_program, "texture_sampler_uniform");
-        if (tex_loc_pass != -1) {
-            glUniform1i(tex_loc_pass, 0);
         }
 
         // Set passthrough shader uniforms
@@ -2712,12 +2736,12 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
         glUseProgram(server->genie_shader_program);
         glBindVertexArray(server->genie_vao);
 
-        // --- MVP Matrix Calculation for the render_box ---
+        // --- MVP Matrix Calculation using content_area to account for decoration ---
         float main_mvp[9];
-        float box_scale_x = (float)render_box.width * (2.0f / output->width);
-        float box_scale_y = (float)render_box.height * (-2.0f / output->height);
-        float box_translate_x = ((float)render_box.x / output->width) * 2.0f - 1.0f;
-        float box_translate_y = ((float)render_box.y / output->height) * -2.0f + 1.0f;
+        float box_scale_x = (float)content_area.width * (2.0f / output->width);
+        float box_scale_y = (float)content_area.height * (-2.0f / output->height);
+        float box_translate_x = ((float)content_area.x / output->width) * 2.0f - 1.0f;
+        float box_translate_y = ((float)content_area.y / output->height) * -2.0f + 1.0f;
         float model_view[9] = {box_scale_x, 0.0f, 0.0f, 0.0f, box_scale_y, 0.0f, box_translate_x, box_translate_y, 1.0f};
         memcpy(main_mvp, model_view, sizeof(model_view));
 
@@ -2747,6 +2771,24 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glUniform1i(server->genie_shader_tex_loc, 0);
 
+        // Pass texture coordinate scaling/offset to account for decoration
+        GLint tex_scale_loc = glGetUniformLocation(server->genie_shader_program, "texScale");
+        GLint tex_offset_loc = glGetUniformLocation(server->genie_shader_program, "texOffset");
+        if (tex_scale_loc != -1) {
+            float tex_scale[2] = {
+                (float)content_area.width / (float)render_box.width,
+                (float)content_area.height / (float)render_box.height
+            };
+            glUniform2fv(tex_scale_loc, 1, tex_scale);
+        }
+        if (tex_offset_loc != -1) {
+            float tex_offset[2] = {
+                (float)decoration_left / (float)render_box.width,
+                (float)decoration_top / (float)render_box.height
+            };
+            glUniform2fv(tex_offset_loc, 1, tex_offset);
+        }
+
         float anim_progress = toplevel->minimizing_to_dock ? progress : 1.0 - progress;
         glUniform1f(server->genie_shader_progress_loc, anim_progress);
         glUniform1f(server->genie_shader_bend_factor_loc, 0.2f);
@@ -2766,9 +2808,7 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
         glDeleteFramebuffers(1, &intermediate_fbo);
     }
 
-    if (created_temp_texture && anim_texture) {
-        wlr_texture_destroy(anim_texture);
-    }
+    wlr_texture_destroy(anim_texture);
 } else {
         // --- PATH 2: Standard Scale Animation or Static Rendering ---
         
@@ -10272,86 +10312,21 @@ static const char *genie_vertex_shader_src =
     "#version 300 es\n"
     "precision highp float;\n"
     "\n"
-    "layout(location = 0) in vec2 position; // Grid vertices (0,0 to 1,1)\n"
+    "layout(location = 0) in vec2 position;\n"
     "layout(location = 1) in vec2 texcoord;\n"
     "\n"
     "uniform mat3 mvp;\n"
-    "uniform float progress; // Animation progress: 0.0 (start) to 1.0 (end)\n"
-    "uniform float u_bend_factor; // Controls how much the genie effect bends\n"
-    "uniform vec2 u_target_pos; // Target position (dock icon position)\n"
+    "uniform float progress;\n"
+    "uniform float u_bend_factor;\n"
+    "uniform vec2 u_target_pos;\n"
     "\n"
     "out vec2 v_texcoord;\n"
     "\n"
-    "// --- Ripple Animation Parameters (Start and End values) ---\n"
-    "// You can tune these constants to change the feel of the ripple.\n"
-    "const float AMPLITUDE_START = 0.04;  // Initial wave height (4% of window height)\n"
-    "const float AMPLITUDE_END   = 0.0;     // End wave height (fades to nothing)\n"
-    "\n"
-    "const float FREQUENCY_START = 20.0;    // Initial number of waves\n"
-    "const float FREQUENCY_END   = 80.0;    // Final number of waves (makes them get tighter)\n"
-    "\n"
-    "const float SPEED_START = 30.0;      // Initial wave travel speed\n"
-    "const float SPEED_END   = 5.0;       // Final wave travel speed (slows down)\n"
-    "\n"
-    "// Smooth easing function for the main genie effect\n"
-    "float easeInOutCubic(float t) {\n"
-    "    return t < 0.5 ? 4.0 * t * t * t : 1.0 - pow(-2.0 * t + 2.0, 3.0) / 2.0;\n"
-    "}\n"
-    "\n"
     "void main() {\n"
-    "    vec2 transformed_pos = position;\n"
-    "\n"
-    "    // Eased progress for smooth animation of all effects\n"
-    "    float t = easeInOutCubic(progress);\n"
-    "\n"
-    "    // --- RIPPLE/WAVY EFFECT STAGE ---\n"
-    "\n"
-    "    // Interpolate ripple properties from START to END values over the animation's progress.\n"
-    "    // The 'mix' function performs linear interpolation: mix(start, end, progress)\n"
-    "    float ripple_amplitude = mix(AMPLITUDE_START, AMPLITUDE_END, t);\n"
-    "    float ripple_frequency = mix(FREQUENCY_START, FREQUENCY_END, t);\n"
-    "    float ripple_speed     = mix(SPEED_START, SPEED_END, t);\n"
-    "\n"
-    "    // The ripple_envelope makes the wave effect swell up and then die down.\n"
-    "    float ripple_envelope = sin(progress * 3.14159265);\n"
-    "\n"
-    "    // Calculate the wave based on interpolated frequency and speed\n"
-    "    float wave_value = sin(position.x * ripple_frequency + progress * ripple_speed);\n"
-    "\n"
-    "    // Apply the wave, scaled by the interpolated amplitude and the envelope\n"
-    "    float ripple_y_offset = wave_value * ripple_amplitude * ripple_envelope;\n"
-    "    transformed_pos.y += ripple_y_offset;\n"
-    "\n"
-    "    // --- CLASSIC GENIE EFFECT STAGE ---\n"
-    "    // This effect ramps up as the ripple fades out.\n"
-    "\n"
-    "    // Use original position.y so the ripple doesn't affect the genie logic.\n"
-    "    float vertical_influence = pow(position.y, 1.5);\n"
-    "    vec2 target = u_target_pos;\n"
-    "    float taper_strength = t * vertical_influence * u_bend_factor;\n"
-    "\n"
-    "    // INWARD CURVING\n"
-    "    float center_x = 0.5;\n"
-    "    float distance_from_center = position.x - center_x;\n"
-    "    float width_compression = t * vertical_influence * 0.7;\n"
-    "    float curve_factor = 4.0 * distance_from_center * distance_from_center;\n"
-    "    float inward_curve = curve_factor * t * vertical_influence * 0.3;\n"
-    "    float compressed_distance = distance_from_center * (1.0 - width_compression);\n"
-    "    compressed_distance -= inward_curve * sign(distance_from_center);\n"
-    "\n"
-    "    transformed_pos.x = center_x + compressed_distance;\n"
-    "    transformed_pos.x += (target.x - center_x) * taper_strength;\n"
-    "\n"
-    "    // Final pull toward target Y. This is applied to the already-rippled surface.\n"
-    "    float y_pull = (target.y - transformed_pos.y) * t * vertical_influence;\n"
-    "    transformed_pos.y += y_pull;\n"
-    "\n"
-    "    // Transform to screen coordinates\n"
-    "    gl_Position = vec4((mvp * vec3(transformed_pos, 1.0)).xy, 0.0, 1.0);\n"
-    "\n"
-    "    // Pass through texture coordinates\n"
+    "    // Simple passthrough - no transformation\n"
+    "    gl_Position = vec4((mvp * vec3(position, 1.0)).xy, 0.0, 1.0);\n"
     "    v_texcoord = texcoord;\n"
-    "}\n";
+    "}";
     
     static const char *genie_fragment_shader_src =
     "#version 300 es\n"
