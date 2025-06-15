@@ -726,6 +726,14 @@ struct wlr_xdg_toplevel_decoration_v1 *decoration;
      // NEW: Fields for minimizing via taskbar
     bool minimized;
     struct wlr_box panel_preview_box;
+
+    // Fields for maximizing animation
+    bool is_maximizing;
+    bool maximized;
+    float maximize_start_time;
+    float maximize_duration;
+    struct wlr_box maximize_start_geom;
+    struct wlr_box maximize_target_geom;
     
 };
 
@@ -1311,49 +1319,55 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel) {
         // or if focus should only be set if a keyboard is present.
         // For now, just logging is fine to confirm if this is the path.
     }
+}static void toggle_minimize_toplevel(struct tinywl_toplevel *toplevel, bool minimized) {
+	// This check now primarily handles restoring a window or re-focusing an active one.
+	if (toplevel->minimized == minimized) {
+		if (!minimized) focus_toplevel(toplevel);
+		return;
+	}
+
+	wlr_log(WLR_INFO, "Toggling 'minimize' for '%s' to %d",
+			toplevel->xdg_toplevel->title, minimized);
+	
+	// Set up animation parameters
+	toplevel->is_minimizing = true;
+	toplevel->minimizing_to_dock = minimized; // This still controls the animation's direction
+	toplevel->minimize_start_time = get_monotonic_time_seconds_as_float();
+	toplevel->minimize_duration = 1.0f; // 1-second animation
+	
+	if (minimized) { // This is the case for animating TO the dock
+		toplevel->minimize_start_geom = toplevel->restored_geom;
+		toplevel->minimize_target_geom = toplevel->panel_preview_box;
+		
+		// The scene node must be enabled for the animation to be visible.
+		wlr_scene_node_set_enabled(&toplevel->scene_tree->node, true);
+		
+		// We can still clear keyboard focus to make the window feel "inactive".
+		if (toplevel->server->seat->keyboard_state.focused_surface == toplevel->xdg_toplevel->base->surface) {
+			wlr_seat_keyboard_clear_focus(toplevel->server->seat);
+		}
+
+		// *** THE KEY CHANGE IS HERE ***
+		// We DO NOT set `toplevel->minimized = true;`.
+		// By omitting this state change, the render loop will not hide the window's
+		// scene node when the animation finishes. The window will animate to the
+		// panel preview box and remain there as a tiny, visible version.
+		wlr_log(WLR_INFO, "Playing minimize animation, but the window will remain visible.");
+
+	} else { // This case handles restoring FROM the dock
+		toplevel->minimized = false; // Set the state back to normal.
+		toplevel->minimize_start_geom = toplevel->panel_preview_box;
+		toplevel->minimize_target_geom = toplevel->restored_geom;
+		wlr_scene_node_set_enabled(&toplevel->scene_tree->node, true);
+		focus_toplevel(toplevel);
+	}
+
+	// A redraw is needed to start the animation.
+	struct tinywl_output *output;
+	wl_list_for_each(output, &toplevel->server->outputs, link) {
+		wlr_output_schedule_frame(output->wlr_output);
+	}
 }
-
-static void toggle_minimize_toplevel(struct tinywl_toplevel *toplevel, bool minimized) {
-    if (toplevel->minimized == minimized) {
-        if (!minimized) focus_toplevel(toplevel);
-        return;
-    }
-
-    wlr_log(WLR_INFO, "Toggling minimize for '%s' to %d",
-            toplevel->xdg_toplevel->title, minimized);
-    
-    toplevel->minimized = minimized;
-    
-    // Set up animation parameters
-    toplevel->is_minimizing = true;
-    toplevel->minimizing_to_dock = minimized; // Direction of animation
-    toplevel->minimize_start_time = get_monotonic_time_seconds_as_float();
-    toplevel->minimize_duration = 1.0f; // 400ms animation
-    
-    if (minimized) { // We are minimizing TO the dock
-        toplevel->minimize_start_geom = toplevel->restored_geom;
-        toplevel->minimize_target_geom = toplevel->panel_preview_box;
-        
-        // Hide the main node *after* the animation finishes
-        wlr_scene_node_set_enabled(&toplevel->scene_tree->node, true);
-        
-        if (toplevel->server->seat->keyboard_state.focused_surface == toplevel->xdg_toplevel->base->surface) {
-            wlr_seat_keyboard_clear_focus(toplevel->server->seat);
-        }
-    } else { // We are restoring FROM the dock
-        toplevel->minimize_start_geom = toplevel->panel_preview_box;
-        toplevel->minimize_target_geom = toplevel->restored_geom;
-        wlr_scene_node_set_enabled(&toplevel->scene_tree->node, true);
-        focus_toplevel(toplevel);
-    }
-
-    // A redraw is needed to start the animation.
-    struct tinywl_output *output;
-    wl_list_for_each(output, &toplevel->server->outputs, link) {
-        wlr_output_schedule_frame(output->wlr_output);
-    }
-}
-
 static void keyboard_handle_modifiers(struct wl_listener *listener, void *data) {
     struct tinywl_keyboard *keyboard = wl_container_of(listener, keyboard, modifiers);
     wlr_seat_set_keyboard(keyboard->server->seat, keyboard->wlr_keyboard);
@@ -2505,311 +2519,338 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
     // --- DECISION: Which rendering path to take? ---
     // ====================================================================
 
- if (toplevel && toplevel->is_minimizing) {
-    // --- PATH 1: MODIFIED Genie Minimize/Restore Animation with Passthrough Shader and Tessellated Mesh ---
+    if (toplevel && (toplevel->is_minimizing || toplevel->is_maximizing)) {
+        // --- PATH 1: MODIFIED Genie Minimize/Restore/Maximize Animation with Passthrough Shader and Tessellated Mesh ---
 
-    // Get the live texture from the surface, not the scene buffer
-    // Get the live texture from the surface, not the scene buffer
-struct wlr_texture *anim_texture = NULL;
+        // Get the live texture from the surface, not the scene buffer
+        struct wlr_texture *anim_texture = NULL;
 
-// Try to get the texture from the toplevel's surface directly
-if (toplevel->xdg_toplevel && toplevel->xdg_toplevel->base && toplevel->xdg_toplevel->base->surface) {
-    struct wlr_surface *surface = toplevel->xdg_toplevel->base->surface;
-    if (surface->buffer) {
-        // Fix: Access the underlying wlr_buffer from wlr_client_buffer
-        anim_texture = wlr_texture_from_buffer(renderer, &surface->buffer->base);
-    }
-}
-
-// Fallback to scene buffer if surface texture isn't available
-if (!anim_texture) {
-    anim_texture = wlr_texture_from_buffer(renderer, scene_buffer->buffer);
-}
-    
-    if (!anim_texture) {
-        wlr_log(WLR_ERROR, "[GENIE_ANIM:%s] Failed to create live texture for genie animation.", output_name_log);
-        return;
-    }
-
-    wlr_gles2_texture_get_attribs(anim_texture, &tex_attribs);
-
-    float elapsed = get_monotonic_time_seconds_as_float() - toplevel->minimize_start_time;
-    float progress = (toplevel->minimize_duration > 1e-5f)
-                   ? fminf(1.0f, elapsed / toplevel->minimize_duration)
-                   : 1.0f;
-
-    if (progress >= 1.0f) {
-        toplevel->is_minimizing = false;
-        if (toplevel->minimizing_to_dock) {
-            toplevel->minimized = true;
-            wlr_scene_node_set_enabled(&toplevel->scene_tree->node, false);
+        // Try to get the texture from the toplevel's surface directly
+        if (toplevel->xdg_toplevel && toplevel->xdg_toplevel->base && toplevel->xdg_toplevel->base->surface) {
+            struct wlr_surface *surface = toplevel->xdg_toplevel->base->surface;
+            if (surface->buffer) {
+                // Fix: Access the underlying wlr_buffer from wlr_client_buffer
+                anim_texture = wlr_texture_from_buffer(renderer, &surface->buffer->base);
+            }
         }
-    } else {
-        wlr_output_schedule_frame(output);
-    }
 
-    struct wlr_box start_box = toplevel->minimize_start_geom;
-    struct wlr_box target_box = toplevel->minimize_target_geom;
-
-    // This box represents the quad on the screen, which will contain the entire effect.
-    // By interpolating its size, we ensure it's large enough to prevent clipping.
-    struct wlr_box render_box;
-    render_box.x = round((double)start_box.x * (1.0 - progress) + (double)target_box.x * progress);
-    render_box.y = round((double)start_box.y * (1.0 - progress) + (double)target_box.y * progress);
-    render_box.width = round((double)start_box.width * (1.0 - progress) + (double)target_box.width * progress);
-    render_box.height = round((double)start_box.height * (1.0 - progress) + (double)target_box.height * progress);
-    
-    // Fallback for minimized windows that might not have a valid target geom yet.
-    if (render_box.width < 1) render_box.width = 1;
-    if (render_box.height < 1) render_box.height = 1;
-    
-   
-    // Account for decoration size to prevent over-scaling
-    int decoration_left = BORDER_WIDTH;   // Left border width
-    int decoration_right = BORDER_WIDTH;  // Right border width  
-    int decoration_top = TITLE_BAR_HEIGHT;   // Title bar height
-    int decoration_bottom = BORDER_WIDTH; // Bottom border width
-    
-    // Calculate content area within the render box
-    struct wlr_box content_area;
-    content_area.x = render_box.x + decoration_left;
-    content_area.y = render_box.y + decoration_top;
-    content_area.width = fmaxf(1, render_box.width - decoration_left - decoration_right);
-    content_area.height = fmaxf(1, render_box.height - decoration_top - decoration_bottom);
-    
-    if (render_box.width > 0 && render_box.height > 0) {
-        // Store the original framebuffer binding
-        GLint original_fbo;
-        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &original_fbo);
+        // Fallback to scene buffer if surface texture isn't available
+        if (!anim_texture) {
+            anim_texture = wlr_texture_from_buffer(renderer, scene_buffer->buffer);
+        }
         
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        
-        // ====================================================================
-        // PASS 1: RENDER PASSTHROUGH SHADER TO TEXTURE (FBO)
-        // ====================================================================
-        
-        // Create intermediate texture for passthrough shader result
-        GLuint intermediate_fbo, intermediate_texture;
-        glGenTextures(1, &intermediate_texture);
-        glBindTexture(GL_TEXTURE_2D, intermediate_texture);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, render_box.width, render_box.height, 
-                     0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        
-        // Create FBO
-        glGenFramebuffers(1, &intermediate_fbo);
-        glBindFramebuffer(GL_FRAMEBUFFER, intermediate_fbo);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, intermediate_texture, 0);
-        
-        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-            wlr_log(WLR_ERROR, "Framebuffer not complete! Status: %d", glCheckFramebufferStatus(GL_FRAMEBUFFER));
-            glBindFramebuffer(GL_FRAMEBUFFER, original_fbo);
-            glDeleteTextures(1, &intermediate_texture);
-            glDeleteFramebuffers(1, &intermediate_fbo);
-            wlr_texture_destroy(anim_texture);
+        if (!anim_texture) {
+            wlr_log(WLR_ERROR, "[GENIE_ANIM:%s] Failed to create live texture for genie animation.", output_name_log);
             return;
         }
-        
-        // Set viewport for intermediate render
-        glViewport(0, 0, render_box.width, render_box.height);
-        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);  // Clear to transparent
-        glClear(GL_COLOR_BUFFER_BIT);
-        
-        // Calculate MVP matrix for passthrough shader (render full quad to texture)
-        float passthrough_mvp[9] = {
-            2.0f, 0.0f, 0.0f,   // Scale X by 2 (from -1 to 1)
-            0.0f, -2.0f, 0.0f,  // Scale Y by -2 (flip Y and scale)
-            -1.0f, 1.0f, 1.0f   // Translate to fill texture
-        };
 
-        // Apply output and buffer transforms to passthrough MVP
-        if (output->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
-            float temp_mvp[9];
-            memcpy(temp_mvp, passthrough_mvp, sizeof(passthrough_mvp));
-            float transform_matrix[9];
-            wlr_matrix_transform(transform_matrix, output->transform);
-            wlr_matrix_multiply(passthrough_mvp, transform_matrix, temp_mvp);
-        }
-        if (scene_buffer->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
-            float temp_mvp_buffer[9];
-            memcpy(temp_mvp_buffer, passthrough_mvp, sizeof(passthrough_mvp));
-            float buffer_matrix[9];
-            wlr_matrix_transform(buffer_matrix, scene_buffer->transform);
-            wlr_matrix_multiply(passthrough_mvp, temp_mvp_buffer, buffer_matrix);
-        }
+        wlr_gles2_texture_get_attribs(anim_texture, &tex_attribs);
+
+        // Determine which animation we're doing and calculate progress
+        float elapsed, progress;
+        struct wlr_box start_box, target_box;
+        bool is_minimize_anim = toplevel->is_minimizing;
         
-        // Use passthrough shader program
-        glUseProgram(server->passthrough_shader_program);
-        
-        // Get fresh texture attributes for the current frame
-        struct wlr_gles2_texture_attribs fresh_tex_attribs;
-        wlr_gles2_texture_get_attribs(anim_texture, &fresh_tex_attribs);
-        
-        // Bind the current frame's texture (this gets updated each frame)
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(fresh_tex_attribs.target, fresh_tex_attribs.tex);
-        glUniform1i(server->passthrough_shader_tex_loc, 0);
-        glTexParameteri(fresh_tex_attribs.target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(fresh_tex_attribs.target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        
-        // Set MVP uniform for passthrough
-        GLint mvp_loc_pass = glGetUniformLocation(server->passthrough_shader_program, "mvp");
-        if (mvp_loc_pass != -1) {
-            glUniformMatrix3fv(mvp_loc_pass, 1, GL_FALSE, passthrough_mvp);
+        if (is_minimize_anim) {
+            elapsed = get_monotonic_time_seconds_as_float() - toplevel->minimize_start_time;
+            progress = (toplevel->minimize_duration > 1e-5f)
+                     ? fminf(1.0f, elapsed / toplevel->minimize_duration)
+                     : 1.0f;
+            start_box = toplevel->minimize_start_geom;
+            target_box = toplevel->minimize_target_geom;
+            
+        } else {
+            // Maximizing animation
+            elapsed = get_monotonic_time_seconds_as_float() - toplevel->maximize_start_time;
+            progress = (toplevel->maximize_duration > 1e-5f)
+                     ? fminf(1.0f, elapsed / toplevel->maximize_duration)
+                     : 1.0f;
+            start_box = toplevel->maximize_start_geom;
+            target_box = toplevel->maximize_target_geom;
         }
 
-        // Set passthrough shader uniforms
-        GLint time_loc_pass = glGetUniformLocation(server->passthrough_shader_program, "time");
-        if (time_loc_pass != -1) glUniform1f(time_loc_pass, get_monotonic_time_seconds_as_float());
-
-        GLint resolution_loc_pass = glGetUniformLocation(server->passthrough_shader_program, "iResolution");
-        if (resolution_loc_pass != -1) {
-            float resolution_pass[2] = {(float)render_box.width, (float)render_box.height};
-            glUniform2fv(resolution_loc_pass, 1, resolution_pass);
+        // Check if animation is complete
+        if (progress >= 1.0f) {
+            if (is_minimize_anim) {
+                toplevel->is_minimizing = false;
+                if (toplevel->minimizing_to_dock) {
+                    toplevel->minimized = true;
+                    wlr_scene_node_set_enabled(&toplevel->scene_tree->node, false);
+                }
+            } else {
+                toplevel->is_maximizing = false;
+                toplevel->maximized = true;
+            }
+        } else {
+            wlr_output_schedule_frame(output);
         }
 
-        // Pass the dimensions of the final rendered box
-        if (server->passthrough_shader_res_loc != -1) {
-            glUniform2f(server->passthrough_shader_res_loc, (float)render_box.width, (float)render_box.height);
-        }
-
-        // Set the corner radius
-        if (server->passthrough_shader_cornerRadius_loc != -1) {
-            glUniform1f(server->passthrough_shader_cornerRadius_loc, 12.0f);
-        }
-
-        // Calculate cycling bevel color
-        static const float color_palette[][4] = {
-            {1.0f, 0.2f, 0.2f, 0.7f}, // Red
-            {1.0f, 1.0f, 0.2f, 0.7f}, // Yellow
-            {0.2f, 1.0f, 0.2f, 0.7f}, // Green
-            {0.2f, 1.0f, 1.0f, 0.7f}, // Cyan
-            {0.2f, 0.2f, 1.0f, 0.7f}, // Blue
-            {1.0f, 0.2f, 1.0f, 0.7f}  // Magenta
-        };
-        const int num_colors = sizeof(color_palette) / sizeof(color_palette[0]);
+        // This box represents the quad on the screen, which will contain the entire effect.
+        // By interpolating its size, we ensure it's large enough to prevent clipping.
+        struct wlr_box render_box;
+        render_box.x = round((double)start_box.x * (1.0 - progress) + (double)target_box.x * progress);
+        render_box.y = round((double)start_box.y * (1.0 - progress) + (double)target_box.y * progress);
+        render_box.width = round((double)start_box.width * (1.0 - progress) + (double)target_box.width * progress);
+        render_box.height = round((double)start_box.height * (1.0 - progress) + (double)target_box.height * progress);
         
-        float time_sec = get_monotonic_time_seconds_as_float();
-        float time_per_color = 2.0f;
-        float total_cycle_duration = (float)num_colors * time_per_color;
-        float time_in_cycle = fmod(time_sec, total_cycle_duration);
-
-        int current_color_idx = (int)floor(time_in_cycle / time_per_color);
-        int next_color_idx = (current_color_idx + 1) % num_colors;
-
-        float time_in_transition = fmod(time_in_cycle, time_per_color);
-        float mix_factor = time_in_transition / time_per_color;
-        float eased_mix_factor = mix_factor * mix_factor * (3.0f - 2.0f * mix_factor);
-
-        float final_bevel_color[4];
-        for (int i = 0; i < 4; ++i) {
-            final_bevel_color[i] = 
-                color_palette[current_color_idx][i] * (1.0f - eased_mix_factor) +
-                color_palette[next_color_idx][i] * eased_mix_factor;
-        }
-
-        if (server->passthrough_shader_bevelColor_loc != -1) {
-            glUniform4fv(server->passthrough_shader_bevelColor_loc, 1, final_bevel_color);
-        }
-        if (server->passthrough_shader_time_loc != -1) {
-            glUniform1f(server->passthrough_shader_time_loc, get_monotonic_time_seconds_as_float());
-        }
-
-        // Render passthrough shader to intermediate texture
-        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+        // Fallback for windows that might not have a valid target geom yet.
+        if (render_box.width < 1) render_box.width = 1;
+        if (render_box.height < 1) render_box.height = 1;
         
-        // ====================================================================
-        // PASS 2: RENDER GENIE SHADER WITH TESSELLATED MESH USING INTERMEDIATE TEXTURE
-        // ====================================================================
+        // Account for decoration size to prevent over-scaling
+        int decoration_left = BORDER_WIDTH;   // Left border width
+        int decoration_right = BORDER_WIDTH;  // Right border width  
+        int decoration_top = TITLE_BAR_HEIGHT;   // Title bar height
+        int decoration_bottom = BORDER_WIDTH; // Bottom border width
         
-        // Switch back to original framebuffer
-        glBindFramebuffer(GL_FRAMEBUFFER, original_fbo);
+        // Calculate content area within the render box
+        struct wlr_box content_area;
+        content_area.x = render_box.x + decoration_left;
+        content_area.y = render_box.y + decoration_top;
+        content_area.width = fmaxf(1, render_box.width - decoration_left - decoration_right);
+        content_area.height = fmaxf(1, render_box.height - decoration_top - decoration_bottom);
         
-        // Reset viewport to output dimensions
-        glViewport(0, 0, output->width, output->height);
-        
-        // Use genie shader program with tessellated mesh
-        glUseProgram(server->genie_shader_program);
-        glBindVertexArray(server->genie_vao);
-
-        // --- MVP Matrix Calculation using content_area to account for decoration ---
-        float main_mvp[9];
-        float box_scale_x = (float)content_area.width * (2.0f / output->width);
-        float box_scale_y = (float)content_area.height * (-2.0f / output->height);
-        float box_translate_x = ((float)content_area.x / output->width) * 2.0f - 1.0f;
-        float box_translate_y = ((float)content_area.y / output->height) * -2.0f + 1.0f;
-        float model_view[9] = {box_scale_x, 0.0f, 0.0f, 0.0f, box_scale_y, 0.0f, box_translate_x, box_translate_y, 1.0f};
-        memcpy(main_mvp, model_view, sizeof(model_view));
-
-        // Apply output and buffer transforms
-        if (output->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
-            float temp_mvp[9]; 
-            memcpy(temp_mvp, main_mvp, sizeof(main_mvp));
-            float transform_matrix[9]; 
-            wlr_matrix_transform(transform_matrix, output->transform);
-            wlr_matrix_multiply(main_mvp, transform_matrix, temp_mvp);
-        }
-        if (scene_buffer->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
-            float temp_mvp_buffer[9]; 
-            memcpy(temp_mvp_buffer, main_mvp, sizeof(main_mvp));
-            float buffer_matrix[9]; 
-            wlr_matrix_transform(buffer_matrix, scene_buffer->transform);
-            wlr_matrix_multiply(main_mvp, temp_mvp_buffer, buffer_matrix);
-        }
-        
-        glUniformMatrix3fv(server->genie_shader_mvp_loc, 1, GL_FALSE, main_mvp);
-        
-        // --- Set Genie Shader Uniforms ---
-        // Bind the intermediate texture (contains passthrough shader result)
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, intermediate_texture);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glUniform1i(server->genie_shader_tex_loc, 0);
-
-        // Pass texture coordinate scaling/offset to account for decoration
-        GLint tex_scale_loc = glGetUniformLocation(server->genie_shader_program, "texScale");
-        GLint tex_offset_loc = glGetUniformLocation(server->genie_shader_program, "texOffset");
-        if (tex_scale_loc != -1) {
-            float tex_scale[2] = {
-                (float)content_area.width / (float)render_box.width,
-                (float)content_area.height / (float)render_box.height
+        if (render_box.width > 0 && render_box.height > 0) {
+            // Store the original framebuffer binding
+            GLint original_fbo;
+            glGetIntegerv(GL_FRAMEBUFFER_BINDING, &original_fbo);
+            
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            
+            // ====================================================================
+            // PASS 1: RENDER PASSTHROUGH SHADER TO TEXTURE (FBO)
+            // ====================================================================
+            
+            // Create intermediate texture for passthrough shader result
+            GLuint intermediate_fbo, intermediate_texture;
+            glGenTextures(1, &intermediate_texture);
+            glBindTexture(GL_TEXTURE_2D, intermediate_texture);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, render_box.width, render_box.height, 
+                         0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            
+            // Create FBO
+            glGenFramebuffers(1, &intermediate_fbo);
+            glBindFramebuffer(GL_FRAMEBUFFER, intermediate_fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, intermediate_texture, 0);
+            
+            if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+                wlr_log(WLR_ERROR, "Framebuffer not complete! Status: %d", glCheckFramebufferStatus(GL_FRAMEBUFFER));
+                glBindFramebuffer(GL_FRAMEBUFFER, original_fbo);
+                glDeleteTextures(1, &intermediate_texture);
+                glDeleteFramebuffers(1, &intermediate_fbo);
+                wlr_texture_destroy(anim_texture);
+                return;
+            }
+            
+            // Set viewport for intermediate render
+            glViewport(0, 0, render_box.width, render_box.height);
+            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);  // Clear to transparent
+            glClear(GL_COLOR_BUFFER_BIT);
+            
+            // Calculate MVP matrix for passthrough shader (render full quad to texture)
+            float passthrough_mvp[9] = {
+                2.0f, 0.0f, 0.0f,   // Scale X by 2 (from -1 to 1)
+                0.0f, -2.0f, 0.0f,  // Scale Y by -2 (flip Y and scale)
+                -1.0f, 1.0f, 1.0f   // Translate to fill texture
             };
-            glUniform2fv(tex_scale_loc, 1, tex_scale);
-        }
-        if (tex_offset_loc != -1) {
-            float tex_offset[2] = {
-                (float)decoration_left / (float)render_box.width,
-                (float)decoration_top / (float)render_box.height
+
+            // Apply output and buffer transforms to passthrough MVP
+            if (output->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+                float temp_mvp[9];
+                memcpy(temp_mvp, passthrough_mvp, sizeof(passthrough_mvp));
+                float transform_matrix[9];
+                wlr_matrix_transform(transform_matrix, output->transform);
+                wlr_matrix_multiply(passthrough_mvp, transform_matrix, temp_mvp);
+            }
+            if (scene_buffer->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+                float temp_mvp_buffer[9];
+                memcpy(temp_mvp_buffer, passthrough_mvp, sizeof(passthrough_mvp));
+                float buffer_matrix[9];
+                wlr_matrix_transform(buffer_matrix, scene_buffer->transform);
+                wlr_matrix_multiply(passthrough_mvp, temp_mvp_buffer, buffer_matrix);
+            }
+            
+            // Use passthrough shader program
+            glUseProgram(server->passthrough_shader_program);
+            
+            // Get fresh texture attributes for the current frame
+            struct wlr_gles2_texture_attribs fresh_tex_attribs;
+            wlr_gles2_texture_get_attribs(anim_texture, &fresh_tex_attribs);
+            
+            // Bind the current frame's texture (this gets updated each frame)
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(fresh_tex_attribs.target, fresh_tex_attribs.tex);
+            glUniform1i(server->passthrough_shader_tex_loc, 0);
+            glTexParameteri(fresh_tex_attribs.target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(fresh_tex_attribs.target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            
+            // Set MVP uniform for passthrough
+            GLint mvp_loc_pass = glGetUniformLocation(server->passthrough_shader_program, "mvp");
+            if (mvp_loc_pass != -1) {
+                glUniformMatrix3fv(mvp_loc_pass, 1, GL_FALSE, passthrough_mvp);
+            }
+
+            // Set passthrough shader uniforms
+            GLint time_loc_pass = glGetUniformLocation(server->passthrough_shader_program, "time");
+            if (time_loc_pass != -1) glUniform1f(time_loc_pass, get_monotonic_time_seconds_as_float());
+
+            GLint resolution_loc_pass = glGetUniformLocation(server->passthrough_shader_program, "iResolution");
+            if (resolution_loc_pass != -1) {
+                float resolution_pass[2] = {(float)render_box.width, (float)render_box.height};
+                glUniform2fv(resolution_loc_pass, 1, resolution_pass);
+            }
+
+            // Pass the dimensions of the final rendered box
+            if (server->passthrough_shader_res_loc != -1) {
+                glUniform2f(server->passthrough_shader_res_loc, (float)render_box.width, (float)render_box.height);
+            }
+
+            // Set the corner radius
+            if (server->passthrough_shader_cornerRadius_loc != -1) {
+                glUniform1f(server->passthrough_shader_cornerRadius_loc, 12.0f);
+            }
+
+            // Calculate cycling bevel color
+            static const float color_palette[][4] = {
+                {1.0f, 0.2f, 0.2f, 0.7f}, // Red
+                {1.0f, 1.0f, 0.2f, 0.7f}, // Yellow
+                {0.2f, 1.0f, 0.2f, 0.7f}, // Green
+                {0.2f, 1.0f, 1.0f, 0.7f}, // Cyan
+                {0.2f, 0.2f, 1.0f, 0.7f}, // Blue
+                {1.0f, 0.2f, 1.0f, 0.7f}  // Magenta
             };
-            glUniform2fv(tex_offset_loc, 1, tex_offset);
+            const int num_colors = sizeof(color_palette) / sizeof(color_palette[0]);
+            
+            float time_sec = get_monotonic_time_seconds_as_float();
+            float time_per_color = 2.0f;
+            float total_cycle_duration = (float)num_colors * time_per_color;
+            float time_in_cycle = fmod(time_sec, total_cycle_duration);
+
+            int current_color_idx = (int)floor(time_in_cycle / time_per_color);
+            int next_color_idx = (current_color_idx + 1) % num_colors;
+
+            float time_in_transition = fmod(time_in_cycle, time_per_color);
+            float mix_factor = time_in_transition / time_per_color;
+            float eased_mix_factor = mix_factor * mix_factor * (3.0f - 2.0f * mix_factor);
+
+            float final_bevel_color[4];
+            for (int i = 0; i < 4; ++i) {
+                final_bevel_color[i] = 
+                    color_palette[current_color_idx][i] * (1.0f - eased_mix_factor) +
+                    color_palette[next_color_idx][i] * eased_mix_factor;
+            }
+
+            if (server->passthrough_shader_bevelColor_loc != -1) {
+                glUniform4fv(server->passthrough_shader_bevelColor_loc, 1, final_bevel_color);
+            }
+            if (server->passthrough_shader_time_loc != -1) {
+                glUniform1f(server->passthrough_shader_time_loc, get_monotonic_time_seconds_as_float());
+            }
+
+            // Render passthrough shader to intermediate texture
+            glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+            
+            // ====================================================================
+            // PASS 2: RENDER GENIE SHADER WITH TESSELLATED MESH USING INTERMEDIATE TEXTURE
+            // ====================================================================
+            
+            // Switch back to original framebuffer
+            glBindFramebuffer(GL_FRAMEBUFFER, original_fbo);
+            
+            // Reset viewport to output dimensions
+            glViewport(0, 0, output->width, output->height);
+            
+            // Use genie shader program with tessellated mesh
+            glUseProgram(server->genie_shader_program);
+            glBindVertexArray(server->genie_vao);
+
+            // --- MVP Matrix Calculation using content_area to account for decoration ---
+            float main_mvp[9];
+            float box_scale_x = (float)content_area.width * (2.0f / output->width);
+            float box_scale_y = (float)content_area.height * (-2.0f / output->height);
+            float box_translate_x = ((float)content_area.x / output->width) * 2.0f - 1.0f;
+            float box_translate_y = ((float)content_area.y / output->height) * -2.0f + 1.0f;
+            float model_view[9] = {box_scale_x, 0.0f, 0.0f, 0.0f, box_scale_y, 0.0f, box_translate_x, box_translate_y, 1.0f};
+            memcpy(main_mvp, model_view, sizeof(model_view));
+
+            // Apply output and buffer transforms
+            if (output->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+                float temp_mvp[9]; 
+                memcpy(temp_mvp, main_mvp, sizeof(main_mvp));
+                float transform_matrix[9]; 
+                wlr_matrix_transform(transform_matrix, output->transform);
+                wlr_matrix_multiply(main_mvp, transform_matrix, temp_mvp);
+            }
+            if (scene_buffer->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+                float temp_mvp_buffer[9]; 
+                memcpy(temp_mvp_buffer, main_mvp, sizeof(main_mvp));
+                float buffer_matrix[9]; 
+                wlr_matrix_transform(buffer_matrix, scene_buffer->transform);
+                wlr_matrix_multiply(main_mvp, temp_mvp_buffer, buffer_matrix);
+            }
+            
+            glUniformMatrix3fv(server->genie_shader_mvp_loc, 1, GL_FALSE, main_mvp);
+            
+            // --- Set Genie Shader Uniforms ---
+            // Bind the intermediate texture (contains passthrough shader result)
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, intermediate_texture);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glUniform1i(server->genie_shader_tex_loc, 0);
+
+            // Pass texture coordinate scaling/offset to account for decoration
+            GLint tex_scale_loc = glGetUniformLocation(server->genie_shader_program, "texScale");
+            GLint tex_offset_loc = glGetUniformLocation(server->genie_shader_program, "texOffset");
+            if (tex_scale_loc != -1) {
+                float tex_scale[2] = {
+                    (float)content_area.width / (float)render_box.width,
+                    (float)content_area.height / (float)render_box.height
+                };
+                glUniform2fv(tex_scale_loc, 1, tex_scale);
+            }
+            if (tex_offset_loc != -1) {
+                float tex_offset[2] = {
+                    (float)decoration_left / (float)render_box.width,
+                    (float)decoration_top / (float)render_box.height
+                };
+                glUniform2fv(tex_offset_loc, 1, tex_offset);
+            }
+
+            // Calculate animation progress based on animation type
+            float anim_progress;
+            if (is_minimize_anim) {
+                anim_progress = toplevel->minimizing_to_dock ? progress : 1.0 - progress;
+            } else {
+                // For maximizing, we want the opposite effect of minimizing
+                anim_progress = 1.0 - progress; // Start from genie effect and expand to normal
+            }
+            
+            glUniform1f(server->genie_shader_progress_loc, anim_progress);
+            glUniform1f(server->genie_shader_bend_factor_loc, 0.2f);
+
+            // --- Draw the genie effect with tessellated mesh using passthrough shader result ---
+            glDrawElements(GL_TRIANGLES, server->genie_index_count, GL_UNSIGNED_INT, 0);
+            
+            // Clean up OpenGL state
+            glBindVertexArray(0);
+            glUseProgram(0);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glDisable(GL_BLEND);
+            
+            // Clean up intermediate resources
+            glDeleteTextures(1, &intermediate_texture);
+            glDeleteFramebuffers(1, &intermediate_fbo);
         }
 
-        float anim_progress = toplevel->minimizing_to_dock ? progress : 1.0 - progress;
-        glUniform1f(server->genie_shader_progress_loc, anim_progress);
-        glUniform1f(server->genie_shader_bend_factor_loc, 0.2f);
-
-        // --- Draw the genie effect with tessellated mesh using passthrough shader result ---
-        glDrawElements(GL_TRIANGLES, server->genie_index_count, GL_UNSIGNED_INT, 0);
-        
-        // Clean up OpenGL state
-        glBindVertexArray(0);
-        glUseProgram(0);
-        glBindTexture(GL_TEXTURE_2D, 0);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glDisable(GL_BLEND);
-        
-        // Clean up intermediate resources
-        glDeleteTextures(1, &intermediate_texture);
-        glDeleteFramebuffers(1, &intermediate_fbo);
-    }
-
-    wlr_texture_destroy(anim_texture);
-} else {
+        wlr_texture_destroy(anim_texture);
+    } else {
         // --- PATH 2: Standard Scale Animation or Static Rendering ---
         
         // Create texture from current buffer for normal rendering
