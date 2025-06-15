@@ -606,6 +606,7 @@ GLuint intermediate_rbo[16];
     GLint genie_shader_progress_loc;
    
     GLint genie_shader_bend_factor_loc;
+    struct tinywl_toplevel *animating_toplevel;
     
 // NEW: Tessellated mesh for Genie Effect
     GLuint genie_vao;
@@ -1319,7 +1320,73 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel) {
         // or if focus should only be set if a keyboard is present.
         // For now, just logging is fine to confirm if this is the path.
     }
-}static void toggle_minimize_toplevel(struct tinywl_toplevel *toplevel, bool minimized) {
+}
+
+
+static void toggle_minimize_toplevel(struct tinywl_toplevel *toplevel, bool minimized) {
+    if (toplevel->minimized == minimized) {
+        if (!minimized) focus_toplevel(toplevel);
+        return;
+    }
+
+    wlr_log(WLR_INFO, "Toggling minimize for '%s' to %d",
+            toplevel->xdg_toplevel->title, minimized);
+
+    // --- STATE MANAGEMENT FIX ---
+    // If another toplevel is already animating, we must snap it to its
+    // final state before starting the new animation.
+    if (toplevel->server->animating_toplevel && toplevel->server->animating_toplevel != toplevel) {
+        struct tinywl_toplevel *other = toplevel->server->animating_toplevel;
+        wlr_log(WLR_INFO, "Interrupting animation for '%s' to start one for '%s'.",
+                other->xdg_toplevel->title, toplevel->xdg_toplevel->title);
+        
+        // End the old animation instantly
+        other->is_minimizing = false;
+        other->is_maximizing = false; // Also handle maximizing if you add it
+        
+        if (other->minimizing_to_dock) { // It was minimizing
+            other->minimized = true;
+            if (other->scene_tree) {
+                wlr_scene_node_set_enabled(&other->scene_tree->node, false);
+            }
+        } else { // It was restoring
+            other->minimized = false;
+        }
+    }
+    // Now, the "animation slot" is free for our new toplevel.
+    toplevel->server->animating_toplevel = toplevel;
+
+    // Set up animation parameters
+    toplevel->is_minimizing = true;
+    toplevel->minimizing_to_dock = minimized;
+    toplevel->minimize_start_time = get_monotonic_time_seconds_as_float();
+    toplevel->minimize_duration = 1.0f;
+
+    if (minimized) { // We are minimizing TO the dock
+        toplevel->minimized = false; // Not officially minimized until animation ends
+        toplevel->minimize_start_geom = toplevel->restored_geom;
+        toplevel->minimize_target_geom = toplevel->panel_preview_box;
+        
+        wlr_scene_node_set_enabled(&toplevel->scene_tree->node, true);
+        
+        if (toplevel->server->seat->keyboard_state.focused_surface == toplevel->xdg_toplevel->base->surface) {
+            wlr_seat_keyboard_clear_focus(toplevel->server->seat);
+        }
+    } else { // We are restoring FROM the dock
+        toplevel->minimized = false;
+        toplevel->minimize_start_geom = toplevel->panel_preview_box;
+        toplevel->minimize_target_geom = toplevel->restored_geom;
+        wlr_scene_node_set_enabled(&toplevel->scene_tree->node, true);
+        focus_toplevel(toplevel);
+    }
+
+    struct tinywl_output *output;
+    wl_list_for_each(output, &toplevel->server->outputs, link) {
+        wlr_output_schedule_frame(output->wlr_output);
+    }
+}
+/*
+static void toggle_minimize_toplevel(struct tinywl_toplevel *toplevel, bool minimized) {
 	// This check now primarily handles restoring a window or re-focusing an active one.
 	if (toplevel->minimized == minimized) {
 		if (!minimized) focus_toplevel(toplevel);
@@ -1367,7 +1434,7 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel) {
 	wl_list_for_each(output, &toplevel->server->outputs, link) {
 		wlr_output_schedule_frame(output->wlr_output);
 	}
-}
+}*/
 static void keyboard_handle_modifiers(struct wl_listener *listener, void *data) {
     struct tinywl_keyboard *keyboard = wl_container_of(listener, keyboard, modifiers);
     wlr_seat_set_keyboard(keyboard->server->seat, keyboard->wlr_keyboard);
@@ -2570,15 +2637,22 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
         }
 
         // Check if animation is complete
+        // Find this block:
         if (progress >= 1.0f) {
             if (is_minimize_anim) {
                 toplevel->is_minimizing = false;
+                // *** ADD THIS LINE ***
+                toplevel->server->animating_toplevel = NULL;
+                
                 if (toplevel->minimizing_to_dock) {
                     toplevel->minimized = true;
                     wlr_scene_node_set_enabled(&toplevel->scene_tree->node, false);
                 }
             } else {
                 toplevel->is_maximizing = false;
+                // *** ADD THIS LINE ***
+                toplevel->server->animating_toplevel = NULL;
+                
                 toplevel->maximized = true;
             }
         } else {
@@ -10492,6 +10566,8 @@ const char *genie_vertex_shader_src =
     }
 
     struct tinywl_server server = {0};
+    server.animating_toplevel = NULL; 
+
     server.tv_is_on = true; // Start with the TV on
        server.tv_effect_animating = false; // The effect is off by default
     server.tv_effect_start_time = 0.0f;
