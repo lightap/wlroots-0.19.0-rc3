@@ -735,6 +735,8 @@ struct wlr_xdg_toplevel_decoration_v1 *decoration;
     float maximize_duration;
     struct wlr_box maximize_start_geom;
     struct wlr_box maximize_target_geom;
+
+    struct wl_list animation_link;
     
 };
 
@@ -1322,6 +1324,27 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel) {
     }
 }
 
+// Original interruption code - REMOVE THIS ENTIRE BLOCK to allow multiple animations:
+/*
+if (toplevel->server->animating_toplevel && toplevel->server->animating_toplevel != toplevel) {
+    struct tinywl_toplevel *other = toplevel->server->animating_toplevel;
+    wlr_log(WLR_INFO, "Interrupting animation for '%s' to start one for '%s'.",
+            other->xdg_toplevel->title, toplevel->xdg_toplevel->title);
+            
+    // End the old animation instantly
+    other->is_minimizing = false;
+    other->is_maximizing = false; // Also handle maximizing if you add it
+            
+    if (other->minimizing_to_dock) { // It was minimizing
+        other->minimized = true;
+        if (other->scene_tree) {
+            wlr_scene_node_set_enabled(&other->scene_tree->node, false);
+        }
+    } else { // It was restoring
+        other->minimized = false;
+    }
+}
+*/
 
 static void toggle_minimize_toplevel(struct tinywl_toplevel *toplevel, bool minimized) {
     if (toplevel->minimized == minimized) {
@@ -1332,29 +1355,8 @@ static void toggle_minimize_toplevel(struct tinywl_toplevel *toplevel, bool mini
     wlr_log(WLR_INFO, "Toggling minimize for '%s' to %d",
             toplevel->xdg_toplevel->title, minimized);
 
-    // --- STATE MANAGEMENT FIX ---
-    // If another toplevel is already animating, we must snap it to its
-    // final state before starting the new animation.
-    if (toplevel->server->animating_toplevel && toplevel->server->animating_toplevel != toplevel) {
-        struct tinywl_toplevel *other = toplevel->server->animating_toplevel;
-        wlr_log(WLR_INFO, "Interrupting animation for '%s' to start one for '%s'.",
-                other->xdg_toplevel->title, toplevel->xdg_toplevel->title);
-        
-        // End the old animation instantly
-        other->is_minimizing = false;
-        other->is_maximizing = false; // Also handle maximizing if you add it
-        
-        if (other->minimizing_to_dock) { // It was minimizing
-            other->minimized = true;
-            if (other->scene_tree) {
-                wlr_scene_node_set_enabled(&other->scene_tree->node, false);
-            }
-        } else { // It was restoring
-            other->minimized = false;
-        }
-    }
-    // Now, the "animation slot" is free for our new toplevel.
-    toplevel->server->animating_toplevel = toplevel;
+    // REMOVE OR COMMENT OUT this line to allow multiple animations:
+    // toplevel->server->animating_toplevel = toplevel;
 
     // Set up animation parameters
     toplevel->is_minimizing = true;
@@ -2512,8 +2514,6 @@ void debug_scene_tree(struct wlr_scene *scene, struct wlr_output *output) {
     wlr_log(WLR_INFO, "[DEBUG] Total nodes: %d", node_count);
 }
 
-
-// Modified scene_buffer_iterator with proper preview alignment
 static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
                                  int sx, int sy,
                                  void *user_data) {
@@ -2526,30 +2526,33 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
 
     // Basic validation
     if (!rdata || !server || !renderer || !output) {
-        wlr_log(WLR_ERROR, "[SCENE_ITERATOR_FATAL:%s] Invalid render_data, server, renderer, or output.", output_name_log);
+        wlr_log(WLR_ERROR, "[SCENE_INV:%s] Fatal: Invalid render_data, server, renderer, or output.", output_name_log);
         return;
     }
     if (!scene_buffer) {
-        wlr_log(WLR_ERROR, "[SCENE_ITERATOR_FATAL:%s] scene_buffer is NULL.", output_name_log);
+        wlr_log(WLR_ERROR, "[SCENE_INV:%s] Fatal: scene_buffer is NULL.", output_name_log);
         return;
     }
     if (!scene_buffer->node.enabled) {
-        wlr_log(WLR_DEBUG, "[SCENE_ITERATOR:%s] scene_buffer %p node not enabled, skipping.", output_name_log, (void*)scene_buffer);
+        wlr_log(WLR_DEBUG, "[SCENE_INV:%s] scene_buffer %p node not enabled, skipping.", output_name_log, (void*)scene_buffer);
         return;
     }
     if (output->width == 0 || output->height == 0) {
-        wlr_log(WLR_ERROR, "[SCENE_ITERATOR:%s] Output has zero width/height.", output_name_log);
+        wlr_log(WLR_ERROR, "[SCENE_INV:%s] Output has zero width/height.", output_name_log);
         return;
     }
     if (!scene_buffer->buffer) {
-        wlr_log(WLR_DEBUG, "[SCENE_ITERATOR:%s] scene_buffer %p has NULL wlr_buffer, skipping.", output_name_log, (void*)scene_buffer);
+        wlr_log(WLR_DEBUG, "[SCENE_INV:%s] scene_buffer %p has NULL wlr_buffer.", output_name_log, (void*)scene_buffer);
         return;
     }
 
-    // --- Toplevel identification ---
+    // Toplevel identification
     struct tinywl_toplevel *toplevel = NULL;
     struct wlr_scene_node *node_iter = &scene_buffer->node;
-    while (node_iter) {
+    int depth = 0;
+    const int MAX_DEPTH = 10;
+    
+    while (node_iter && depth < MAX_DEPTH) {
         if (node_iter->data) {
             struct tinywl_toplevel *temp_ptl = node_iter->data;
             if (temp_ptl && temp_ptl->server == server && temp_ptl->scene_tree == (struct wlr_scene_tree*)node_iter) {
@@ -2559,19 +2562,12 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
         }
         if (!node_iter->parent) break;
         node_iter = &node_iter->parent->node;
+        depth++;
     }
 
-    // If this buffer isn't part of a toplevel we manage, handle it gracefully
-    if (!toplevel) {
-        struct wlr_texture *texture = wlr_texture_from_buffer(renderer, scene_buffer->buffer);
-        if (texture) {
-            // Default rendering for non-toplevel buffers - you might want to add this logic
-            wlr_texture_destroy(texture);
-        }
-        return;
-    }
 
-    // --- Manual Projection Matrix Calculation for the entire output ---
+    
+    // Projection matrix
     float projection[9];
     enum wl_output_transform transform = wlr_output_transform_invert(output->transform);
     wlr_matrix_identity(projection);
@@ -2582,40 +2578,49 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
     wlr_matrix_transform(transform_matrix, transform);
     wlr_matrix_multiply(projection, transform_matrix, projection);
 
-    // ====================================================================
-    // --- DECISION: Which rendering path to take? ---
-    // ====================================================================
+    static int active_animation_count = 0;
+    wlr_log(WLR_DEBUG, "[DEBUG] Animation check for toplevel %p", (void*)toplevel);
 
+    // Genie animation path
     if (toplevel && (toplevel->is_minimizing || toplevel->is_maximizing)) {
-        // --- PATH 1: MODIFIED Genie Minimize/Restore/Maximize Animation with Passthrough Shader and Tessellated Mesh ---
-
-        // Get the live texture from the surface, not the scene buffer
-        struct wlr_texture *anim_texture = NULL;
-
-        // Try to get the texture from the toplevel's surface directly
+        const int MAX_ANIMATIONS = 5;
+        if (active_animation_count >= MAX_ANIMATIONS) {
+            wlr_log(WLR_ERROR, "[ANIM] Too many active animations (%d), skipping", active_animation_count);
+            return;
+        }
+        
+        active_animation_count++;
+        
+        // Create texture from surface or fallback to scene buffer
+        struct wlr_texture *texture = NULL;
         if (toplevel->xdg_toplevel && toplevel->xdg_toplevel->base && toplevel->xdg_toplevel->base->surface) {
             struct wlr_surface *surface = toplevel->xdg_toplevel->base->surface;
             if (surface->buffer) {
-                // Fix: Access the underlying wlr_buffer from wlr_client_buffer
-                anim_texture = wlr_texture_from_buffer(renderer, &surface->buffer->base);
+                texture = wlr_texture_from_buffer(renderer, &surface->buffer->base);
             }
         }
-
-        // Fallback to scene buffer if surface texture isn't available
-        if (!anim_texture) {
-            anim_texture = wlr_texture_from_buffer(renderer, scene_buffer->buffer);
+        if (!texture) {
+            texture = wlr_texture_from_buffer(renderer, scene_buffer->buffer);
         }
         
-        if (!anim_texture) {
-            wlr_log(WLR_ERROR, "[GENIE_ANIM:%s] Failed to create live texture for genie animation.", output_name_log);
+        if (!texture) {
+            wlr_log(WLR_ERROR, "[GENIE_ANIM:%s] Failed to create texture for genie animation.", output_name_log);
+            active_animation_count--;
             return;
         }
 
-        wlr_gles2_texture_get_attribs(anim_texture, &tex_attribs);
+        wlr_gles2_texture_get_attribs(texture, &tex_attribs);
+        
+        if (!tex_attribs.tex) {
+            wlr_log(WLR_ERROR, "[GENIE_ANIM:%s] Invalid texture attributes.", output_name_log);
+            wlr_texture_destroy(texture);
+            active_animation_count--;
+            return;
+        }
 
-        // Determine which animation we're doing and calculate progress
+        // Animation progress
         float elapsed, progress;
-        struct wlr_box start_box, target_box;
+        struct wlr_box start_box = {0}, target_box = {0};
         bool is_minimize_anim = toplevel->is_minimizing;
         
         if (is_minimize_anim) {
@@ -2625,9 +2630,7 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
                      : 1.0f;
             start_box = toplevel->minimize_start_geom;
             target_box = toplevel->minimize_target_geom;
-            
         } else {
-            // Maximizing animation
             elapsed = get_monotonic_time_seconds_as_float() - toplevel->maximize_start_time;
             progress = (toplevel->maximize_duration > 1e-5f)
                      ? fminf(1.0f, elapsed / toplevel->maximize_duration)
@@ -2636,104 +2639,114 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
             target_box = toplevel->maximize_target_geom;
         }
 
-        // Check if animation is complete
-        // Find this block:
+        // Validate geometry
+        if (start_box.width <= 0 || start_box.height <= 0 || 
+            target_box.width <= 0 || target_box.height <= 0) {
+            wlr_log(WLR_ERROR, "[GENIE_ANIM] Invalid geometry: start %dx%d, target %dx%d", 
+                    start_box.width, start_box.height, target_box.width, target_box.height);
+            wlr_texture_destroy(texture);
+            active_animation_count--;
+            return;
+        }
+
+        // Check animation completion
         if (progress >= 1.0f) {
             if (is_minimize_anim) {
                 toplevel->is_minimizing = false;
-                // *** ADD THIS LINE ***
                 toplevel->server->animating_toplevel = NULL;
-                
                 if (toplevel->minimizing_to_dock) {
                     toplevel->minimized = true;
                     wlr_scene_node_set_enabled(&toplevel->scene_tree->node, false);
                 }
             } else {
                 toplevel->is_maximizing = false;
-                // *** ADD THIS LINE ***
                 toplevel->server->animating_toplevel = NULL;
-                
                 toplevel->maximized = true;
             }
-        } else {
-            wlr_output_schedule_frame(output);
+            
+            wlr_texture_destroy(texture);
+            active_animation_count--;
+            return;
         }
 
-        // This box represents the quad on the screen, which will contain the entire effect.
-        // By interpolating its size, we ensure it's large enough to prevent clipping.
-        struct wlr_box render_box;
-        render_box.x = round((double)start_box.x * (1.0 - progress) + (double)target_box.x * progress);
-        render_box.y = round((double)start_box.y * (1.0 - progress) + (double)target_box.y * progress);
-        render_box.width = round((double)start_box.width * (1.0 - progress) + (double)target_box.width * progress);
-        render_box.height = round((double)start_box.height * (1.0 - progress) + (double)target_box.height * progress);
+        // Schedule next frame
+        wlr_output_schedule_frame(output);
+
+        // Interpolated render box
+        struct wlr_box render_box = {0};
+        render_box.x = (int)round((double)start_box.x * (1.0 - progress) + (double)target_box.x * progress);
+        render_box.y = (int)round((double)start_box.y * (1.0 - progress) + (double)target_box.y * progress);
+        render_box.width = (int)round((double)start_box.width * (1.0 - progress) + (double)target_box.width * progress);
+        render_box.height = (int)round((double)start_box.height * (1.0 - progress) + (double)target_box.height * progress);
         
-        // Fallback for windows that might not have a valid target geom yet.
         if (render_box.width < 1) render_box.width = 1;
         if (render_box.height < 1) render_box.height = 1;
+
+        // Account for decoration size
+        int decoration_left = BORDER_WIDTH;
+        int decoration_right = BORDER_WIDTH;
+        int decoration_top = TITLE_BAR_HEIGHT;
+        int decoration_bottom = BORDER_WIDTH;
         
-        // Account for decoration size to prevent over-scaling
-        int decoration_left = BORDER_WIDTH;   // Left border width
-        int decoration_right = BORDER_WIDTH;  // Right border width  
-        int decoration_top = TITLE_BAR_HEIGHT;   // Title bar height
-        int decoration_bottom = BORDER_WIDTH; // Bottom border width
-        
-        // Calculate content area within the render box
-        struct wlr_box content_area;
-        content_area.x = render_box.x + decoration_left;
-        content_area.y = render_box.y + decoration_top;
-        content_area.width = fmaxf(1, render_box.width - decoration_left - decoration_right);
-        content_area.height = fmaxf(1, render_box.height - decoration_top - decoration_bottom);
-        
-        if (render_box.width > 0 && render_box.height > 0) {
-            // Store the original framebuffer binding
-            GLint original_fbo;
+        struct wlr_box content_area = {
+            .x = render_box.x + decoration_left,
+            .y = render_box.y + decoration_top,
+            .width = fmaxf(1, render_box.width - decoration_left - decoration_right),
+            .height = fmaxf(1, render_box.height - decoration_top - decoration_bottom)
+        };
+
+ 
+
+        // Render genie animation
+        if (render_box.width > 0 && render_box.height > 0 && 
+            render_box.width <= 8192 && render_box.height <= 8192) {
+            
+            GLint original_fbo = 0;
             glGetIntegerv(GL_FRAMEBUFFER_BINDING, &original_fbo);
             
-            glEnable(GL_BLEND);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            
-            // ====================================================================
-            // PASS 1: RENDER PASSTHROUGH SHADER TO TEXTURE (FBO)
-            // ====================================================================
-            
-            // Create intermediate texture for passthrough shader result
+            // Pass 1: Render passthrough shader to intermediate texture
             GLuint intermediate_fbo, intermediate_texture;
             glGenTextures(1, &intermediate_texture);
             glBindTexture(GL_TEXTURE_2D, intermediate_texture);
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, render_box.width, render_box.height, 
-                         0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+                        0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
             
-            // Create FBO
             glGenFramebuffers(1, &intermediate_fbo);
             glBindFramebuffer(GL_FRAMEBUFFER, intermediate_fbo);
             glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, intermediate_texture, 0);
             
             if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-                wlr_log(WLR_ERROR, "Framebuffer not complete! Status: %d", glCheckFramebufferStatus(GL_FRAMEBUFFER));
+                wlr_log(WLR_ERROR, "[GENIE_ANIM:%s] Framebuffer not complete: %d", 
+                        output_name_log, glCheckFramebufferStatus(GL_FRAMEBUFFER));
                 glBindFramebuffer(GL_FRAMEBUFFER, original_fbo);
                 glDeleteTextures(1, &intermediate_texture);
                 glDeleteFramebuffers(1, &intermediate_fbo);
-                wlr_texture_destroy(anim_texture);
+                wlr_texture_destroy(texture);
+                active_animation_count--;
                 return;
             }
             
-            // Set viewport for intermediate render
             glViewport(0, 0, render_box.width, render_box.height);
-            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);  // Clear to transparent
+            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
             glClear(GL_COLOR_BUFFER_BIT);
             
-            // Calculate MVP matrix for passthrough shader (render full quad to texture)
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            
+            glUseProgram(server->passthrough_shader_program);
+            glBindVertexArray(server->quad_vao);
+            
+            // Passthrough MVP matrix (from second version)
             float passthrough_mvp[9] = {
-                2.0f, 0.0f, 0.0f,   // Scale X by 2 (from -1 to 1)
-                0.0f, -2.0f, 0.0f,  // Scale Y by -2 (flip Y and scale)
-                -1.0f, 1.0f, 1.0f   // Translate to fill texture
+                2.0f, 0.0f, 0.0f,
+                0.0f, -2.0f, 0.0f,
+                -1.0f, 1.0f, 1.0f
             };
-
-            // Apply output and buffer transforms to passthrough MVP
+            
             if (output->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
                 float temp_mvp[9];
                 memcpy(temp_mvp, passthrough_mvp, sizeof(passthrough_mvp));
@@ -2749,47 +2762,43 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
                 wlr_matrix_multiply(passthrough_mvp, temp_mvp_buffer, buffer_matrix);
             }
             
-            // Use passthrough shader program
-            glUseProgram(server->passthrough_shader_program);
-            
-            // Get fresh texture attributes for the current frame
-            struct wlr_gles2_texture_attribs fresh_tex_attribs;
-            wlr_gles2_texture_get_attribs(anim_texture, &fresh_tex_attribs);
-            
-            // Bind the current frame's texture (this gets updated each frame)
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(fresh_tex_attribs.target, fresh_tex_attribs.tex);
-            glUniform1i(server->passthrough_shader_tex_loc, 0);
-            glTexParameteri(fresh_tex_attribs.target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameteri(fresh_tex_attribs.target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            
-            // Set MVP uniform for passthrough
             GLint mvp_loc_pass = glGetUniformLocation(server->passthrough_shader_program, "mvp");
             if (mvp_loc_pass != -1) {
                 glUniformMatrix3fv(mvp_loc_pass, 1, GL_FALSE, passthrough_mvp);
             }
-
-            // Set passthrough shader uniforms
-            GLint time_loc_pass = glGetUniformLocation(server->passthrough_shader_program, "time");
-            if (time_loc_pass != -1) glUniform1f(time_loc_pass, get_monotonic_time_seconds_as_float());
-
-            GLint resolution_loc_pass = glGetUniformLocation(server->passthrough_shader_program, "iResolution");
-            if (resolution_loc_pass != -1) {
-                float resolution_pass[2] = {(float)render_box.width, (float)render_box.height};
-                glUniform2fv(resolution_loc_pass, 1, resolution_pass);
+            
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(tex_attribs.target, tex_attribs.tex);
+            glTexParameteri(tex_attribs.target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(tex_attribs.target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(tex_attribs.target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(tex_attribs.target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            
+            GLint tex_loc_pass = glGetUniformLocation(server->passthrough_shader_program, "u_texture");
+            if (tex_loc_pass != -1) {
+                glUniform1i(tex_loc_pass, 0);
             }
-
-            // Pass the dimensions of the final rendered box
+            
+            GLint time_loc_pass = glGetUniformLocation(server->passthrough_shader_program, "time");
+            if (time_loc_pass != -1) {
+                glUniform1f(time_loc_pass, get_monotonic_time_seconds_as_float());
+            }
+            
+            GLint res_loc_pass = glGetUniformLocation(server->passthrough_shader_program, "iResolution");
+            if (res_loc_pass != -1) {
+                float resolution[2] = {(float)render_box.width, (float)render_box.height};
+                glUniform2fv(res_loc_pass, 1, resolution);
+            }
+            
             if (server->passthrough_shader_res_loc != -1) {
                 glUniform2f(server->passthrough_shader_res_loc, (float)render_box.width, (float)render_box.height);
             }
-
-            // Set the corner radius
+            
             if (server->passthrough_shader_cornerRadius_loc != -1) {
                 glUniform1f(server->passthrough_shader_cornerRadius_loc, 12.0f);
             }
-
-            // Calculate cycling bevel color
+            
+            // Cycling bevel color (from second version)
             static const float color_palette[][4] = {
                 {1.0f, 0.2f, 0.2f, 0.7f}, // Red
                 {1.0f, 1.0f, 0.2f, 0.7f}, // Yellow
@@ -2804,81 +2813,91 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
             float time_per_color = 2.0f;
             float total_cycle_duration = (float)num_colors * time_per_color;
             float time_in_cycle = fmod(time_sec, total_cycle_duration);
-
             int current_color_idx = (int)floor(time_in_cycle / time_per_color);
             int next_color_idx = (current_color_idx + 1) % num_colors;
-
             float time_in_transition = fmod(time_in_cycle, time_per_color);
             float mix_factor = time_in_transition / time_per_color;
             float eased_mix_factor = mix_factor * mix_factor * (3.0f - 2.0f * mix_factor);
-
+            
             float final_bevel_color[4];
             for (int i = 0; i < 4; ++i) {
                 final_bevel_color[i] = 
                     color_palette[current_color_idx][i] * (1.0f - eased_mix_factor) +
                     color_palette[next_color_idx][i] * eased_mix_factor;
             }
-
+            
             if (server->passthrough_shader_bevelColor_loc != -1) {
                 glUniform4fv(server->passthrough_shader_bevelColor_loc, 1, final_bevel_color);
             }
+            
             if (server->passthrough_shader_time_loc != -1) {
                 glUniform1f(server->passthrough_shader_time_loc, get_monotonic_time_seconds_as_float());
             }
-
-            // Render passthrough shader to intermediate texture
+            
             glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
             
-            // ====================================================================
-            // PASS 2: RENDER GENIE SHADER WITH TESSELLATED MESH USING INTERMEDIATE TEXTURE
-            // ====================================================================
-            
-            // Switch back to original framebuffer
+            // Pass 2: Render genie shader with tessellated mesh
             glBindFramebuffer(GL_FRAMEBUFFER, original_fbo);
-            
-            // Reset viewport to output dimensions
             glViewport(0, 0, output->width, output->height);
             
-            // Use genie shader program with tessellated mesh
             glUseProgram(server->genie_shader_program);
+            if (!server->genie_vao) {
+                wlr_log(WLR_ERROR, "[GENIE_ANIM:%s] Genie VAO not initialized.", output_name_log);
+                glDeleteTextures(1, &intermediate_texture);
+                glDeleteFramebuffers(1, &intermediate_fbo);
+                wlr_texture_destroy(texture);
+                active_animation_count--;
+                return;
+            }
             glBindVertexArray(server->genie_vao);
 
-            // --- MVP Matrix Calculation using content_area to account for decoration ---
-            float main_mvp[9];
+            // MVP matrix for genie shader
+            float genie_mvp[9];
             float box_scale_x = (float)content_area.width * (2.0f / output->width);
-            float box_scale_y = (float)content_area.height * (-2.0f / output->height);
+            float box_scale_y = (float)content_area.height * (-2.0f / output->height);  
             float box_translate_x = ((float)content_area.x / output->width) * 2.0f - 1.0f;
             float box_translate_y = ((float)content_area.y / output->height) * -2.0f + 1.0f;
-            float model_view[9] = {box_scale_x, 0.0f, 0.0f, 0.0f, box_scale_y, 0.0f, box_translate_x, box_translate_y, 1.0f};
-            memcpy(main_mvp, model_view, sizeof(model_view));
+            
+            float model_view[9] = {
+                box_scale_x, 0.0f, 0.0f,
+                0.0f, box_scale_y, 0.0f,
+                box_translate_x, box_translate_y, 1.0f
+            };
+            memcpy(genie_mvp, model_view, sizeof(model_view));
 
-            // Apply output and buffer transforms
             if (output->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
-                float temp_mvp[9]; 
-                memcpy(temp_mvp, main_mvp, sizeof(main_mvp));
-                float transform_matrix[9]; 
+                float temp_mvp[9];
+                memcpy(temp_mvp, genie_mvp, sizeof(genie_mvp));
+                float transform_matrix[9];
                 wlr_matrix_transform(transform_matrix, output->transform);
-                wlr_matrix_multiply(main_mvp, transform_matrix, temp_mvp);
+                wlr_matrix_multiply(genie_mvp, transform_matrix, temp_mvp);
             }
+            
             if (scene_buffer->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
-                float temp_mvp_buffer[9]; 
-                memcpy(temp_mvp_buffer, main_mvp, sizeof(main_mvp));
-                float buffer_matrix[9]; 
+                float temp_mvp_buffer[9];
+                memcpy(temp_mvp_buffer, genie_mvp, sizeof(genie_mvp));
+                float buffer_matrix[9];
                 wlr_matrix_transform(buffer_matrix, scene_buffer->transform);
-                wlr_matrix_multiply(main_mvp, temp_mvp_buffer, buffer_matrix);
+                wlr_matrix_multiply(genie_mvp, temp_mvp_buffer, buffer_matrix);
             }
             
-            glUniformMatrix3fv(server->genie_shader_mvp_loc, 1, GL_FALSE, main_mvp);
-            
-            // --- Set Genie Shader Uniforms ---
-            // Bind the intermediate texture (contains passthrough shader result)
+            if (server->genie_shader_mvp_loc != -1) {
+                glUniformMatrix3fv(server->genie_shader_mvp_loc, 1, GL_FALSE, genie_mvp);
+            }
+
+            // Bind intermediate texture
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, intermediate_texture);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glUniform1i(server->genie_shader_tex_loc, 0);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            
+            if (server->genie_shader_tex_loc != -1) {
+                glUniform1i(server->genie_shader_tex_loc, 0);
+            }
 
-            // Pass texture coordinate scaling/offset to account for decoration
+            // Texture coordinate scaling/offset for decorations
             GLint tex_scale_loc = glGetUniformLocation(server->genie_shader_program, "texScale");
             GLint tex_offset_loc = glGetUniformLocation(server->genie_shader_program, "texOffset");
             if (tex_scale_loc != -1) {
@@ -2896,163 +2915,149 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
                 glUniform2fv(tex_offset_loc, 1, tex_offset);
             }
 
-            // Calculate animation progress based on animation type
-            float anim_progress;
-            if (is_minimize_anim) {
-                anim_progress = toplevel->minimizing_to_dock ? progress : 1.0 - progress;
-            } else {
-                // For maximizing, we want the opposite effect of minimizing
-                anim_progress = 1.0 - progress; // Start from genie effect and expand to normal
+            // Animation uniforms
+            float anim_progress = is_minimize_anim ? (toplevel->minimizing_to_dock ? progress : 1.0f - progress) : (1.0f - progress);
+            if (server->genie_shader_progress_loc != -1) {
+                glUniform1f(server->genie_shader_progress_loc, anim_progress);
             }
-            
-            glUniform1f(server->genie_shader_progress_loc, anim_progress);
-            glUniform1f(server->genie_shader_bend_factor_loc, 0.2f);
+            if (server->genie_shader_bend_factor_loc != -1) {
+                glUniform1f(server->genie_shader_bend_factor_loc, 0.3f);
+            }
 
-            // --- Draw the genie effect with tessellated mesh using passthrough shader result ---
+            GLint time_loc = glGetUniformLocation(server->genie_shader_program, "time");
+            if (time_loc != -1) {
+                glUniform1f(time_loc, time_sec);
+            }
+
+            GLint resolution_loc = glGetUniformLocation(server->genie_shader_program, "iResolution");
+            if (resolution_loc != -1) {
+                float resolution[2] = {(float)content_area.width, (float)content_area.height};
+                glUniform2fv(resolution_loc, 1, resolution);
+            }
+
+            float alpha = is_minimize_anim ? (1.0f - progress * 0.3f) : (0.7f + 0.3f * progress);
+            GLint alpha_loc = glGetUniformLocation(server->genie_shader_program, "alpha");
+            if (alpha_loc != -1) {
+                glUniform1f(alpha_loc, alpha);
+            }
+
+            // Draw
             glDrawElements(GL_TRIANGLES, server->genie_index_count, GL_UNSIGNED_INT, 0);
             
-            // Clean up OpenGL state
+            wlr_log(WLR_DEBUG, "[GENIE_ANIM:%s] Rendered genie effect, progress: %.3f, alpha: %.3f", 
+                    output_name_log, anim_progress, alpha);
+
+            // Clean up
             glBindVertexArray(0);
             glUseProgram(0);
             glBindTexture(GL_TEXTURE_2D, 0);
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            glDisable(GL_BLEND);
-            
-            // Clean up intermediate resources
+            glBindFramebuffer(GL_FRAMEBUFFER, original_fbo);
             glDeleteTextures(1, &intermediate_texture);
             glDeleteFramebuffers(1, &intermediate_fbo);
+            glDisable(GL_BLEND);
         }
-
-        wlr_texture_destroy(anim_texture);
-    } else {
-        // --- PATH 2: Standard Scale Animation or Static Rendering ---
         
-        // Create texture from current buffer for normal rendering
-        struct wlr_texture *texture = wlr_texture_from_buffer(renderer, scene_buffer->buffer);
-        if (!texture) {
-            wlr_log(WLR_ERROR, "[SCENE_ITERATOR:%s] Failed to create wlr_texture from buffer %p.", output_name_log, (void*)scene_buffer->buffer);
-            return;
-        }
+        wlr_texture_destroy(texture);
+        active_animation_count--;
+        return;
+    }
 
-        // Surface validation
-        struct wlr_scene_surface *current_scene_surface = wlr_scene_surface_try_from_buffer(scene_buffer);
-        struct wlr_surface *surface_to_render = current_scene_surface ? current_scene_surface->surface : NULL;
-        if (!surface_to_render) {
-            wlr_texture_destroy(texture);
-            return;
-        }
+    // Normal rendering
+    wlr_log(WLR_DEBUG, "[NORMAL] Normal rendering for scene_buffer %p", (void*)scene_buffer);
+    
+    struct wlr_texture *texture = wlr_texture_from_buffer(renderer, scene_buffer->buffer);
+    if (!texture) {
+        wlr_log(WLR_ERROR, "[SCENE_INV:%s] Failed to create wlr_texture from buffer %p.", output_name_log, (void*)scene_buffer->buffer);
+        return;//
+    }
 
-        // Get texture attributes
-        wlr_gles2_texture_get_attribs(texture, &tex_attribs);
+    struct wlr_scene_surface *current_scene_surface = wlr_scene_surface_try_from_buffer(scene_buffer);
+    struct wlr_surface *surface_to_render = current_scene_surface ? current_scene_surface->surface : NULL;
+    if (!surface_to_render) {
+        wlr_texture_destroy(texture);
+        return;
+    }
 
-        // Debug logging
-        char title_buffer[128] = "NO_TL_ITER";
-        const char* tl_title_for_log = "UNKNOWN_OR_NOT_TOPLEVEL_CONTENT";
+    wlr_gles2_texture_get_attribs(texture, &tex_attribs);
 
-        if (toplevel) {
-            if (toplevel->xdg_toplevel && toplevel->xdg_toplevel->title) {
-                snprintf(title_buffer, sizeof(title_buffer), "%s", toplevel->xdg_toplevel->title);
-                tl_title_for_log = title_buffer;
-            } else {
-                snprintf(title_buffer, sizeof(title_buffer), "Ptr:%p (XDG maybe NULL)", toplevel);
-                tl_title_for_log = "TOPLEVEL_NO_TITLE";
-            }
+    char title_buffer[128] = "NO_TL_ITER";
+    const char* tl_title_for_log = "UNKNOWN_OR_NOT_TOPLEVEL_CONTENT";
 
-            wlr_log(WLR_DEBUG, "[ITERATOR DEBUG:%s] Processing TL ('%s' Ptr:%p). Anim:%d, Scale:%.3f, Target:%.3f, StartT:%.3f, PendingD:%d, NodeEn:%d",
-                   output_name_log, title_buffer, toplevel,
-                   toplevel->is_animating, toplevel->scale, toplevel->target_scale,
-                   toplevel->animation_start, toplevel->pending_destroy,
-                   (toplevel->scene_tree ? toplevel->scene_tree->node.enabled : -1));
-        }
-
-        // --- Animation Scaling Logic ---
-        float anim_scale_factor = 1.0f;
-        if (toplevel && toplevel->is_animating) {
-            float elapsed = get_monotonic_time_seconds_as_float() - toplevel->animation_start;
-            if (elapsed < 0.0f) elapsed = 0.0f;
-            
-            float t = 0.0f;
-            if (toplevel->animation_duration > 1e-5f) {
-                t = elapsed / toplevel->animation_duration;
-            } else if (elapsed > 0) {
-                t = 1.0f;
-            }
-
-            if (t >= 1.0f) {
-                t = 1.0f;
-                anim_scale_factor = toplevel->target_scale;
-                if (toplevel->target_scale == 0.0f && !toplevel->pending_destroy) {
-                    toplevel->scale = 0.0f;
-                    wlr_log(WLR_DEBUG, "[ITERATOR DEBUG:%s] '%s' close anim reached t>=1. Scale=0.0.", output_name_log, title_buffer);
-                    wlr_output_schedule_frame(output);
-                } else {
-                    toplevel->is_animating = false;
-                    toplevel->scale = toplevel->target_scale;
-                }
-            } else {
-                anim_scale_factor = toplevel->scale + (toplevel->target_scale - toplevel->scale) * t;
-            }
-
-            if (toplevel->is_animating) {
-                wlr_output_schedule_frame(output);
-            }
-            wlr_log(WLR_DEBUG, "[ITERATOR DEBUG:%s] '%s': t=%.3f, anim_scale_factor=%.3f",
-                   output_name_log, title_buffer, t, anim_scale_factor);
-        } else if (toplevel) {
-            anim_scale_factor = toplevel->scale;
-        }
-
-        if (anim_scale_factor < 0.001f && !(toplevel && toplevel->target_scale == 0.0f && !toplevel->pending_destroy)) {
-            anim_scale_factor = 0.001f;
-        }
-
-         // --- Main Window Rendering ---
-        struct wlr_box main_render_box = {
-            .x = (int)round((double)sx + (double)texture->width * (1.0 - (double)anim_scale_factor) / 2.0),
-            .y = (int)round((double)sy + (double)texture->height * (1.0 - (double)anim_scale_factor) / 2.0),
-            .width = (int)round((double)texture->width * (double)anim_scale_factor),
-            .height = (int)round((double)texture->height * (double)anim_scale_factor),
-        };
-
-        if (main_render_box.width <= 0 || main_render_box.height <= 0) {
-            if (toplevel && !toplevel->pending_destroy && toplevel->target_scale == 0.0f) {
-                wlr_log(WLR_DEBUG, "[ITERATOR DEBUG:%s] '%s' scaled to zero W/H.", output_name_log, title_buffer);
-                wlr_output_schedule_frame(output);
-            }
-            wlr_texture_destroy(texture);
-            return;
-        }
-
-float elapsed = get_monotonic_time_seconds_as_float() - toplevel->minimize_start_time;
-        float progress = (toplevel->minimize_duration > 1e-5f)
-                       ? fminf(1.0f, elapsed / toplevel->minimize_duration)
-                       : 1.0f;
-
-        if (progress < 1.0f) {
-            wlr_output_schedule_frame(output);
+    if (toplevel) {
+        if (toplevel->xdg_toplevel && toplevel->xdg_toplevel->title) {
+            snprintf(title_buffer, sizeof(title_buffer), "%s", toplevel->xdg_toplevel->title);
+            tl_title_for_log = title_buffer;
         } else {
-            toplevel->is_minimizing = false;
-            if (toplevel->minimizing_to_dock) {
-                toplevel->minimized = true;
-                wlr_scene_node_set_enabled(&toplevel->scene_tree->node, false);
-            }
+            snprintf(title_buffer, sizeof(title_buffer), "Ptr:%p (XDG maybe NULL)", toplevel);
+            tl_title_for_log = "TOPLEVEL_NO_TITLE";
         }
 
+        wlr_log(WLR_DEBUG, "[ITERATOR:%s] Processing TL ('%s' Ptr:%p). Anim:%d, Scale:%.3f, Target:%.3f, StartT:%.3f, PendingD:%d, NodeEn:%d",
+               output_name_log, title_buffer, toplevel,
+               toplevel->is_animating, toplevel->scale, toplevel->target_scale,
+               toplevel->animation_start, toplevel->pending_destroy,
+               (toplevel->scene_tree ? toplevel->scene_tree->node.enabled : -1));
+    }
 
-       glUseProgram(server->passthrough_shader_program);
+    // Scaling animation
+    float anim_scale_factor = 1.0f;
+    if (toplevel && toplevel->is_animating) {
+        float elapsed = get_monotonic_time_seconds_as_float() - toplevel->animation_start;
+        if (elapsed < 0.0f) elapsed = 0.0f;
+        
+        float t = 0.0f;
+        if (toplevel->animation_duration > 1e-5f) {
+            t = elapsed / toplevel->animation_duration;
+        } else if (elapsed > 0) {
+            t = 1.0f;
+        }
 
-  
+        if (t >= 1.0f) {
+            t = 1.0f;
+            anim_scale_factor = toplevel->target_scale;
+            if (toplevel->target_scale == 0.0f && !toplevel->pending_destroy) {
+                toplevel->scale = 0.0f;
+                wlr_log(WLR_DEBUG, "[ITERATOR:%s] '%s' close anim reached t>=1. Scale=0.0.", output_name_log, title_buffer);
+                wlr_output_schedule_frame(output);
+            } else {
+                toplevel->is_animating = false;
+                toplevel->scale = toplevel->target_scale;
+            }
+        } else {
+            anim_scale_factor = toplevel->scale + (toplevel->target_scale - toplevel->scale) * t;
+        }
+
+        if (toplevel->is_animating) {
+            wlr_output_schedule_frame(output);
+        }
+        wlr_log(WLR_DEBUG, "[ITERATOR:%s] '%s': t=%.3f, anim_scale_factor=%.3f",
+               output_name_log, title_buffer, t, anim_scale_factor);
+    } else if (toplevel) {
+        anim_scale_factor = toplevel->scale;
+    }
+
+    if (anim_scale_factor < 0.001f && !(toplevel && toplevel->target_scale == 0.0f && !toplevel->pending_destroy)) {
+        anim_scale_factor = 0.001f;
+    }
+
+    // Main window rendering
+    struct wlr_box main_render_box = {
+        .x = (int)round((double)sx + (double)texture->width * (1.0 - (double)anim_scale_factor) / 2.0),
+        .y = (int)round((double)sy + (double)texture->height * (1.0 - (double)anim_scale_factor) / 2.0),
+        .width = (int)round((double)texture->width * (double)anim_scale_factor),
+        .height = (int)round((double)texture->height * (double)anim_scale_factor)
+    };
 
     if (main_render_box.width <= 0 || main_render_box.height <= 0) {
         if (toplevel && !toplevel->pending_destroy && toplevel->target_scale == 0.0f) {
-            wlr_log(WLR_ERROR, "[ITERATOR DEBUG:%s] '%s' scaled to zero W/H.", output_name_log, title_buffer);
+            wlr_log(WLR_DEBUG, "[DEBUG:%s] '%s' scaled to zero width/height.", output_name_log, title_buffer);
             wlr_output_schedule_frame(output);
         }
         wlr_texture_destroy(texture);
         return;
     }
 
-    // Calculate MVP matrix using second version's simpler approach
+    // Calculate MVP matrix (from second version)
     float main_mvp[9];
     wlr_matrix_identity(main_mvp);
     float box_scale_x = (float)main_render_box.width * (2.0f / output->width);
@@ -3060,7 +3065,6 @@ float elapsed = get_monotonic_time_seconds_as_float() - toplevel->minimize_start
     float box_translate_x = ((float)main_render_box.x / output->width) * 2.0f - 1.0f;
     float box_translate_y = ((float)main_render_box.y / output->height) * -2.0f + 1.0f;
 
-    // Handle output transforms like second version
     if (output->transform == WL_OUTPUT_TRANSFORM_FLIPPED_180) {
         main_mvp[0] = -box_scale_x; main_mvp[4] = -box_scale_y; main_mvp[6] = -box_translate_x; main_mvp[7] = -box_translate_y;
         main_mvp[1] = main_mvp[2] = main_mvp[3] = main_mvp[5] = 0.0f; main_mvp[8] = 1.0f;
@@ -3074,7 +3078,6 @@ float elapsed = get_monotonic_time_seconds_as_float() - toplevel->minimize_start
         wlr_matrix_multiply(main_mvp, transform_matrix, temp_mvp);
     }
 
-    // Handle buffer transforms like second version
     if (scene_buffer->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
         float temp_mvp_buffer[9];
         memcpy(temp_mvp_buffer, main_mvp, sizeof(main_mvp));
@@ -3083,11 +3086,17 @@ float elapsed = get_monotonic_time_seconds_as_float() - toplevel->minimize_start
         wlr_matrix_multiply(main_mvp, temp_mvp_buffer, buffer_matrix);
     }
 
-    // Set uniforms using glGetUniformLocation like second version
-    GLint mvp_loc = glGetUniformLocation(server->shader_program, "mvp");
-    if (mvp_loc != -1) glUniformMatrix3fv(mvp_loc, 1, GL_FALSE, main_mvp);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-    GLint tex_loc = glGetUniformLocation(server->shader_program, "texture_sampler_uniform");
+    glUseProgram(server->passthrough_shader_program);
+    
+    GLint mvp_loc = glGetUniformLocation(server->passthrough_shader_program, "mvp");
+    if (mvp_loc != -1) {
+        glUniformMatrix3fv(mvp_loc, 1, GL_FALSE, main_mvp);
+    }
+
+    GLint tex_loc = glGetUniformLocation(server->passthrough_shader_program, "u_texture");
     if (tex_loc != -1) {
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(tex_attribs.target, tex_attribs.tex);
@@ -3098,200 +3107,165 @@ float elapsed = get_monotonic_time_seconds_as_float() - toplevel->minimize_start
         glUniform1i(tex_loc, 0);
     }
 
-        // Set time uniform
-        struct timespec now_shader_time_iter_draw;
-        clock_gettime(CLOCK_MONOTONIC, &now_shader_time_iter_draw);
-        float time_value_iter_draw = now_shader_time_iter_draw.tv_sec + now_shader_time_iter_draw.tv_nsec / 1e9f;
-        GLint time_loc_iter_draw = glGetUniformLocation(server->passthrough_shader_program, "time");
-        if (time_loc_iter_draw != -1) glUniform1f(time_loc_iter_draw, time_value_iter_draw);
+    // Set time uniform (from second version)
+    struct timespec now_shader_time_iter_draw;
+    clock_gettime(CLOCK_MONOTONIC, &now_shader_time_iter_draw);
+    float time_value_iter_draw = now_shader_time_iter_draw.tv_sec + now_shader_time_iter_draw.tv_nsec / 1e9f;
+    GLint time_loc_iter_draw = glGetUniformLocation(server->passthrough_shader_program, "time");
+    if (time_loc_iter_draw != -1) glUniform1f(time_loc_iter_draw, time_value_iter_draw);
 
-        // Set resolution uniform
-        float resolution_iter_draw[2] = {(float)output->width, (float)output->height};
-        GLint resolution_loc_iter_draw = glGetUniformLocation(server->passthrough_shader_program, "iResolution");
-        if (resolution_loc_iter_draw != -1) glUniform2fv(resolution_loc_iter_draw, 1, resolution_iter_draw);
+    // Set resolution uniform (from second version)
+    float resolution_iter_draw[2] = {(float)output->width, (float)output->height};
+    GLint resolution_loc_iter_draw = glGetUniformLocation(server->passthrough_shader_program, "iResolution");
+    if (resolution_loc_iter_draw != -1) glUniform2fv(resolution_loc_iter_draw, 1, resolution_iter_draw);
 
-        // --- SET THE NEW UNIFORMS HERE ---
-        // Pass the dimensions of the final rendered box (in pixels) to the shader.
+    // Set new uniforms (from second version)
+    if (server->passthrough_shader_res_loc != -1) {
         glUniform2f(server->passthrough_shader_res_loc, (float)main_render_box.width, (float)main_render_box.height);
+    }
 
-        // Set the corner radius in pixels
+    if (server->passthrough_shader_cornerRadius_loc != -1) {
         glUniform1f(server->passthrough_shader_cornerRadius_loc, 12.0f);
+    }
 
-        // ====================================================================
-        // --- NEW: LOGIC TO CALCULATE CYCLING BEVEL COLOR ---
-        // ====================================================================
-        
-        // 1. Define our color palette
-        static const float color_palette[][4] = {
-            {1.0f, 0.2f, 0.2f, 0.7f}, // Red
-            {1.0f, 1.0f, 0.2f, 0.7f}, // Yellow
-            {0.2f, 1.0f, 0.2f, 0.7f}, // Green
-            {0.2f, 1.0f, 1.0f, 0.7f}, // Cyan
-            {0.2f, 0.2f, 1.0f, 0.7f}, // Blue
-            {1.0f, 0.2f, 1.0f, 0.7f}  // Magenta
-        };
-        const int num_colors = sizeof(color_palette) / sizeof(color_palette[0]);
-        
-        // 2. Calculate timing for the cycle
-        float time_sec = get_monotonic_time_seconds_as_float();
-        float time_per_color = 2.0f; // Each color transition takes 2 seconds
-        float total_cycle_duration = (float)num_colors * time_per_color;
-        float time_in_cycle = fmod(time_sec, total_cycle_duration);
+    // Cycling bevel color (from second version)
+    static const float color_palette[][4] = {
+        {1.0f, 0.2f, 0.2f, 0.7f}, // Red
+        {1.0f, 1.0f, 0.2f, 0.7f}, // Yellow
+        {0.2f, 1.0f, 0.2f, 0.7f}, // Green
+        {0.2f, 1.0f, 1.0f, 0.7f}, // Cyan
+        {0.2f, 0.2f, 1.0f, 0.7f}, // Blue
+        {1.0f, 0.2f, 1.0f, 0.7f}  // Magenta
+    };
+    const int num_colors = sizeof(color_palette) / sizeof(color_palette[0]);
+    
+    float time_sec = get_monotonic_time_seconds_as_float();
+    float time_per_color = 2.0f;
+    float total_cycle_duration = (float)num_colors * time_per_color;
+    float time_in_cycle = fmod(time_sec, total_cycle_duration);
+    int current_color_idx = (int)floor(time_in_cycle / time_per_color);
+    int next_color_idx = (current_color_idx + 1) % num_colors;
+    float time_in_transition = fmod(time_in_cycle, time_per_color);
+    float mix_factor = time_in_transition / time_per_color;
+    float eased_mix_factor = mix_factor * mix_factor * (3.0f - 2.0f * mix_factor);
 
-        // 3. Determine which two colors to blend between
-        int current_color_idx = (int)floor(time_in_cycle / time_per_color);
-        int next_color_idx = (current_color_idx + 1) % num_colors; // Wrap around to the start
+    float final_bevel_color[4];
+    for (int i = 0; i < 4; ++i) {
+        final_bevel_color[i] = 
+            color_palette[current_color_idx][i] * (1.0f - eased_mix_factor) +
+            color_palette[next_color_idx][i] * eased_mix_factor;
+    }
 
-        // 4. Calculate the blend factor for a smooth transition
-        float time_in_transition = fmod(time_in_cycle, time_per_color);
-        float mix_factor = time_in_transition / time_per_color;
-        // Apply a smooth easing function (smoothstep)
-        float eased_mix_factor = mix_factor * mix_factor * (3.0f - 2.0f * mix_factor);
+    if (server->passthrough_shader_bevelColor_loc != -1) {
+        glUniform4fv(server->passthrough_shader_bevelColor_loc, 1, final_bevel_color);
+    }
+    if (server->passthrough_shader_time_loc != -1) {
+        glUniform1f(server->passthrough_shader_time_loc, get_monotonic_time_seconds_as_float());
+    }
 
-        // 5. Interpolate between the two colors
-        float final_bevel_color[4];
-        for (int i = 0; i < 4; ++i) {
-            final_bevel_color[i] = 
-                color_palette[current_color_idx][i] * (1.0f - eased_mix_factor) +
-                color_palette[next_color_idx][i] * eased_mix_factor;
-        }
+    glBindVertexArray(server->quad_vao);
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+    wlr_log(WLR_DEBUG, "[DEBUG:%s] Drew main window for '%s'", output_name_log, tl_title_for_log);
 
-        // 6. Set the final calculated color as the uniform
-        if (server->passthrough_shader_bevelColor_loc != -1) {
-            glUniform4fv(server->passthrough_shader_bevelColor_loc, 1, final_bevel_color);
-        }
-        if (server->passthrough_shader_time_loc != -1) {
-            glUniform1f(server->passthrough_shader_time_loc, get_monotonic_time_seconds_as_float());
-        }
-        // --- END OF NEW UNIFORMS ---
+    // Preview rendering
+    if (toplevel && server->top_panel_node && server->top_panel_node->enabled) {
+        struct wlr_scene_rect *panel_srect = wlr_scene_rect_from_node(server->top_panel_node);
+        if (panel_srect) {
+            glUseProgram(server->shader_program);
+            glBindVertexArray(server->quad_vao);
 
-        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
-        wlr_log(WLR_DEBUG, "[SCENE_ITERATOR:%s] Drew main window for '%s'", output_name_log, tl_title_for_log);
-
-        // --- IMPROVED Preview Rendering with Proper Alignment ---
-        if (toplevel && server->top_panel_node && server->top_panel_node->enabled) {
-            struct wlr_scene_rect *panel_srect = wlr_scene_rect_from_node(server->top_panel_node);
-            if (panel_srect) {
-                glUseProgram(server->shader_program); // Use flame shader for previews
-                
-                const float PREVIEW_PADDING = 5.0f, PANEL_LEFT_MARGIN = 20.0f, MAX_PREVIEW_WIDTH = 120.0f;
-                float available_panel_width = (float)panel_srect->width - PANEL_LEFT_MARGIN * 2.0f;
-                float preview_y_padding = PREVIEW_PADDING;
-                float preview_height = (float)panel_srect->height - 2.0f * preview_y_padding;
-                
-                int desktop_window_count = 0;
-                struct tinywl_toplevel *iter_tl;
-                wl_list_for_each(iter_tl, &server->toplevels, link) {
-                    if (iter_tl->desktop == rdata->desktop_index) desktop_window_count++;
+            const float PREVIEW_PADDING = 5.0f, PANEL_LEFT_MARGIN = 20.0f, MAX_PREVIEW_WIDTH = 120.0f;
+            float available_panel_width = (float)panel_srect->width - PANEL_LEFT_MARGIN * 2.0f;
+            float preview_y_padding = PREVIEW_PADDING;
+            float preview_height = (float)panel_srect->height - 2.0f * preview_y_padding;
+            
+            int desktop_window_count = 0;
+            struct tinywl_toplevel *iter_tl;
+            wl_list_for_each(iter_tl, &server->toplevels, link) {
+                if (iter_tl->desktop == rdata->desktop_index) desktop_window_count++;
+            }
+            if (desktop_window_count == 0) {
+                wlr_log(WLR_DEBUG, "[PREVIEW:%s] No windows on desktop %d.", output_name_log, rdata->desktop_index);
+                wlr_texture_destroy(texture);
+                return;
+            }
+            
+            float ideal_preview_width = fminf(MAX_PREVIEW_WIDTH, (available_panel_width - (desktop_window_count - 1) * PREVIEW_PADDING) / desktop_window_count);
+            
+            int per_desktop_index = 0;
+            wl_list_for_each(iter_tl, &server->toplevels, link) {
+                if (iter_tl->desktop == rdata->desktop_index) {
+                    if (iter_tl == toplevel) break;
+                    per_desktop_index++;
                 }
-                if (desktop_window_count == 0) { wlr_texture_destroy(texture); return; }
-                
-                float ideal_preview_width = fminf(MAX_PREVIEW_WIDTH, (available_panel_width - (desktop_window_count - 1) * PREVIEW_PADDING) / desktop_window_count);
+            }
 
-                int per_desktop_index = 0;
-                wl_list_for_each(iter_tl, &server->toplevels, link) {
-                    if (iter_tl->desktop == rdata->desktop_index) {
-                        if (iter_tl == toplevel) break;
-                        per_desktop_index++;
+            float slot_x_offset = PANEL_LEFT_MARGIN + (per_desktop_index * (ideal_preview_width + PREVIEW_PADDING));
+            float aspect_ratio = (texture->width > 0 && texture->height > 0) ? (float)texture->width / (float)texture->height : 1.0f;
+            float preview_width = fminf(ideal_preview_width, preview_height * aspect_ratio);
+            float preview_height_adjusted = preview_width / aspect_ratio;
+            float preview_x_offset = slot_x_offset + (ideal_preview_width - preview_width) / 2.0f;
+            float y_offset = preview_y_padding + (preview_height - preview_height_adjusted) / 2.0f;
+
+            struct wlr_box preview_box = {
+                .x = (int)round((double)server->top_panel_node->x + preview_x_offset),
+                .y = (int)round((double)server->top_panel_node->y + y_offset),
+                .width = (int)round(preview_width),
+                .height = (int)round(preview_height_adjusted)
+            };
+            
+            toplevel->panel_preview_box = preview_box;
+
+            if (preview_box.width > 0 && preview_box.height > 0) {
+                float preview_mvp[9];
+                float p_box_scale_x = (float)preview_box.width * (2.0f / output->width);
+                float p_box_scale_y = (float)preview_box.height * (-2.0f / output->height);
+                float p_box_translate_x = ((float)preview_box.x / output->width) * 2.0f - 1.0f;
+                float p_box_translate_y = ((float)preview_box.y / output->height) * -2.0f + 1.0f;
+                float p_model_view[] = {
+                    p_box_scale_x, 0.0f, 0.0f,
+                    0.0f, p_box_scale_y, 0.0f,
+                    p_box_translate_x, p_box_translate_y, 1.0f
+                };
+                memcpy(preview_mvp, p_model_view, sizeof(preview_mvp));
+                
+                if (server->flame_shader_mvp_loc != -1) {
+                    glUniformMatrix3fv(server->flame_shader_mvp_loc, 1, GL_FALSE, preview_mvp);
+                }
+
+                if (tex_attribs.tex) {
+                    glActiveTexture(GL_TEXTURE0);
+                    glBindTexture(tex_attribs.target, tex_attribs.tex);
+                    if (server->flame_shader_tex_loc != -1) {
+                        glUniform1i(server->flame_shader_tex_loc, 0);
                     }
                 }
 
-                float slot_x_offset = PANEL_LEFT_MARGIN + (per_desktop_index * (ideal_preview_width + PREVIEW_PADDING));
-                float aspect_ratio = (texture->width > 0 && texture->height > 0) ? (float)texture->width / (float)texture->height : 1.0f;
-                float preview_width = fminf(ideal_preview_width, preview_height * aspect_ratio);
-                float preview_height_adjusted = preview_width / aspect_ratio;
-                float preview_x_offset = slot_x_offset + (ideal_preview_width - preview_width) / 2.0f;
-                float y_offset = preview_y_padding + (preview_height - preview_height_adjusted) / 2.0f;
-
-                struct wlr_box preview_box_on_screen = {
-                    .x = (int)round((double)server->top_panel_node->x + preview_x_offset),
-                    .y = (int)round((double)server->top_panel_node->y + y_offset),
-                    .width = (int)round(preview_width),
-                    .height = (int)round(preview_height_adjusted),
-                };
-                
-                toplevel->panel_preview_box = preview_box_on_screen;
-
-                if (preview_box_on_screen.width > 0 && preview_box_on_screen.height > 0) {
-                    float preview_mvp[9];
-                    float p_box_scale_x = (float)preview_box_on_screen.width * (2.0f / output->width);
-                    float p_box_scale_y = (float)preview_box_on_screen.height * (-2.0f / output->height);
-                    float p_box_translate_x = ((float)preview_box_on_screen.x / output->width) * 2.0f - 1.0f;
-                    float p_box_translate_y = ((float)preview_box_on_screen.y / output->height) * -2.0f + 1.0f;
-                    float p_model_view[9] = { p_box_scale_x, 0, 0, 0, p_box_scale_y, 0, p_box_translate_x, p_box_translate_y, 1 };
-                    memcpy(preview_mvp, p_model_view, sizeof(p_model_view));
-                    
-                    glUniformMatrix3fv(server->flame_shader_mvp_loc, 1, GL_FALSE, preview_mvp);
-                    glActiveTexture(GL_TEXTURE0);
-                    glBindTexture(tex_attribs.target, tex_attribs.tex);
-                    glUniform1i(server->flame_shader_tex_loc, 0);
-                    glUniform1f(server->flame_shader_time_loc, get_monotonic_time_seconds_as_float());
-                    float preview_res_vec[2] = {(float)preview_box_on_screen.width, (float)preview_box_on_screen.height};
-                    glUniform2fv(server->flame_shader_res_loc, 1, preview_res_vec);
-                    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+                if (server->flame_shader_time_loc != -1) {
+                    glUniform1f(server->flame_shader_time_loc, time_sec);
                 }
-            }
-        } else if (toplevel) {
-            toplevel->panel_preview_box = (struct wlr_box){0, 0, 0, 0};
-        }
-
-        
-            if (main_render_box.width > 0 && main_render_box.height > 0) {
-            // Enable blending for proper alpha rendering
-            glEnable(GL_BLEND);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            
-            // Use the genie shader program
-            glUseProgram(server->genie_shader_program);
-            
-                    // Calculate MVP matrix properly for the interpolated render box
-                float main_mvp[9];
-                float box_scale_x = (float)main_render_box.width * (2.0f / output->width);
-                float box_scale_y = (float)main_render_box.height * (-2.0f / output->height);
-                float box_translate_x = ((float)main_render_box.x / output->width) * 2.0f - 1.0f;
-                float box_translate_y = ((float)main_render_box.y / output->height) * -2.0f + 1.0f;
-                float model_view[9] = {box_scale_x, 0.0f, 0.0f, 0.0f, box_scale_y, 0.0f, box_translate_x, box_translate_y, 1.0f};
-                memcpy(main_mvp, model_view, sizeof(model_view));
-
-                if (output->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
-                    float temp_mvp[9];
-                    memcpy(temp_mvp, main_mvp, sizeof(model_view));
-                    float transform_matrix[9];
-                    wlr_matrix_transform(transform_matrix, output->transform);
-                    wlr_matrix_multiply(main_mvp, transform_matrix, temp_mvp);
+                if (server->flame_shader_res_loc != -1) {
+                    float preview_res[2] = {(float)preview_box.width, (float)preview_box.height};
+                    glUniform2fv(server->flame_shader_res_loc, 1, preview_res);
                 }
-                if (scene_buffer->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
-                    float temp_mvp_buffer[9];
-                    memcpy(temp_mvp_buffer, main_mvp, sizeof(main_mvp));
-                    float buffer_matrix[9];
-                    wlr_matrix_transform(buffer_matrix, scene_buffer->transform);
-                    wlr_matrix_multiply(main_mvp, temp_mvp_buffer, buffer_matrix);
-                }
-                    
-            // Set MVP uniform using glGetUniformLocation for safety
-            GLint mvp_loc = glGetUniformLocation(server->genie_shader_program, "mvp");
-            if (mvp_loc == -1) {
-                mvp_loc = server->genie_shader_mvp_loc; // fallback to cached location
-            }
-            if (mvp_loc != -1) {
-                glUniformMatrix3fv(mvp_loc, 1, GL_FALSE, main_mvp);
-            }
 
-            
-            
-            wlr_log(WLR_DEBUG, "[GENIE_ANIM:%s] Drew genie effect with texture, progress: %.3f", output_name_log, progress);
+                glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+                wlr_log(WLR_DEBUG, "[PREVIEW:%s] Drew preview for %s", output_name_log, tl_title_for_log);
+            }
         }
-        
-        // Cleanup
-        if (tex_loc != -1) {
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(tex_attribs.target, 0);
-        }
-        wlr_texture_destroy(texture);
+    } else if (toplevel) {
+        toplevel->panel_preview_box = (struct wlr_box){0, 0, 0, 0};
     }
-}
 
-
+    // Final cleanup
+    glBindVertexArray(0);
+    glUseProgram(0);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(tex_attribs.target, 0);
+    glDisable(GL_BLEND);
+    
+    wlr_texture_destroy(texture);
+}////////////////////////////////////////////////////////////////////////
 static pthread_mutex_t rdp_transmit_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 
@@ -3355,114 +3329,262 @@ void check_scene_bypass_issue(struct wlr_scene_output *scene_output, struct wlr_
     wlr_log(WLR_INFO, "[BYPASS_CHECK:%s] If you see this but no rectangles, you might be bypassing scene rendering", output->name);
 }
 
+// Forward declaration
+static void render_rect_node(struct wlr_scene_node *node, void *user_data);
+
+// Helper function to check if a node is a descendant of a parent tree
+static bool is_node_descendant(struct wlr_scene_node *node, struct wlr_scene_tree *parent_tree) {
+    if (!node || !parent_tree) return false;
+    
+    struct wlr_scene_node *current = node;
+    while (current && current->parent) {
+        if (current->parent == parent_tree) return true;
+        current = &current->parent->node;
+    }
+    return false;
+}
+
+// Helper function to find and render all rect nodes in a scene tree
+static void find_and_render_all_rects(struct wlr_scene_node *node, void *user_data) {
+    if (!node) return;
+
+    // Process current node if it's a rect
+    if (node->type == WLR_SCENE_NODE_RECT) {
+        render_rect_node(node, user_data);
+    }
+
+    // Recursively process all children in tree nodes
+    if (node->type == WLR_SCENE_NODE_TREE) {
+        struct wlr_scene_tree *tree = wlr_scene_tree_from_node(node);
+        struct wlr_scene_node *child;
+        wl_list_for_each(child, &tree->children, link) {
+            find_and_render_all_rects(child, user_data);
+        }
+    }
+}
+
 static void render_rect_node(struct wlr_scene_node *node, void *user_data) {
     struct render_data *rdata = user_data;
     struct wlr_output *output = rdata->output;
     struct tinywl_server *server = rdata->server;
 
-    if (node->type != WLR_SCENE_NODE_RECT || !node->enabled) {
+    if (!node || node->type != WLR_SCENE_NODE_RECT || !node->enabled) {
+        wlr_log(WLR_DEBUG, "Node %p: invalid (type: %d, enabled: %d)",
+                (void*)node, node ? node->type : -1, node ? node->enabled : 0);
         return;
     }
-    struct wlr_scene_rect *scene_rect = wlr_scene_rect_from_node(node);
 
+    struct wlr_scene_rect *rect = wlr_scene_rect_from_node(node);
     int render_sx, render_sy;
     if (!wlr_scene_node_coords(node, &render_sx, &render_sy)) {
+        wlr_log(WLR_DEBUG, "Node %p: invalid coords.", (void*)node);
         return;
     }
 
-    if (output->width == 0 || output->height == 0) return;
+    if (output->width == 0 || output->height == 0) {
+        wlr_log(WLR_DEBUG, "Node %p: invalid output size (%dx%d).",
+                (void*)node, output->width, output->height);
+        return;
+    }
 
     GLuint program_to_use = 0;
-    GLint mvp_loc = -1, color_loc = -1, time_loc = -1, output_res_loc = -1;
-    
-    const float *color_to_use = scene_rect->color; 
+    GLint mvp_loc = -1, color_loc = -1, time_loc = -1, res_loc = -1;
+    const float *color_to_use = rect->color;
+    bool is_ssd = false;
+    bool needs_alpha_blending = false;
+    struct tinywl_toplevel *toplevel = NULL;
 
-    bool is_main_background = (server->main_background_node == node);
-
-    if (is_main_background) {
-        // --- Desktop background logic (unchanged) ---
+    // Check if this is a special node (main background or top panel)
+    if (server->main_background_node == node) {
         int desktop_idx = rdata->desktop_index;
         if (desktop_idx < 0 || desktop_idx >= server->num_desktops) {
             desktop_idx = 0;
+            wlr_log(WLR_DEBUG, "Invalid desktop index %d, using 0.", rdata->desktop_index);
         }
         program_to_use = server->desktop_background_shaders[desktop_idx];
         mvp_loc = server->desktop_bg_shader_mvp_loc[desktop_idx];
         color_loc = server->desktop_bg_shader_color_loc[desktop_idx];
         time_loc = server->desktop_bg_shader_time_loc[desktop_idx];
-        output_res_loc = server->desktop_bg_shader_res_loc[desktop_idx];
+        res_loc = server->desktop_bg_shader_res_loc[desktop_idx];
         if (desktop_idx != 0) {
-            static const float neutral_color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+            static const float neutral_color[] = {1.0f, 1.0f, 1.0f, 1.0f};
             color_to_use = neutral_color;
         }
-
-    } else { 
-        // --- SSD (Server-Side Decoration) logic ---
-        bool is_alacritty = false;
-        struct tinywl_toplevel *toplevel = node->data; // This now works because of Step 1
-
-        if (toplevel && toplevel->xdg_toplevel) {
-            // Priority 1: Check app_id (more reliable)
-            if (toplevel->xdg_toplevel->app_id && 
-                strcasestr(toplevel->xdg_toplevel->app_id, "alacritty") != NULL) {
-                is_alacritty = true;
-                wlr_log(WLR_DEBUG, "Detected Alacritty via app_id: '%s'", toplevel->xdg_toplevel->app_id);
-            } 
-            // Priority 2: Fallback to checking the title
-            else if (toplevel->xdg_toplevel->title && 
-                     strcasestr(toplevel->xdg_toplevel->title, "alacritty") != NULL) {
-                is_alacritty = true;
-                wlr_log(WLR_DEBUG, "Detected Alacritty via title: '%s'", toplevel->xdg_toplevel->title);
+        wlr_log(WLR_DEBUG, "Node %p: main background, shader %u.", (void*)node, program_to_use);
+    } else if (server->top_panel_node == node) {
+        wlr_log(WLR_DEBUG, "Node %p: top panel, skipping.", (void*)node);
+        return;
+    } else {
+        // Try to find toplevel by checking node data and parent hierarchy
+        if (node->data) {
+            toplevel = node->data;
+            if (toplevel && toplevel->xdg_toplevel) {
+                is_ssd = true;
+                needs_alpha_blending = true;  // SSD elements need alpha blending
+                wlr_log(WLR_DEBUG, "Node %p: direct toplevel %p found.", (void*)node, (void*)toplevel);
             }
-        } else if (node->data) {
-             wlr_log(WLR_DEBUG, "SSD rect has node->data, but it's not a valid toplevel or has no xdg_toplevel.");
-        } else {
-             wlr_log(WLR_DEBUG, "SSD rect has NULL node->data.");
         }
 
+        // If no direct toplevel, traverse up the scene graph
+        if (!toplevel) {
+            struct wlr_scene_node *current_node = node;
+            int traversal_depth = 0;
+            const int max_traversal_depth = 20;
 
-        if (is_alacritty) {
-            // Use the special Alacritty shader
-            program_to_use = server->ssd2_shader_program;
-            mvp_loc = server->ssd2_shader_mvp_loc;
-            color_loc = server->ssd2_shader_color_loc;
-            time_loc = server->ssd2_shader_time_loc;
-            output_res_loc = server->ssd2_shader_resolution_loc;
+            while (current_node && current_node->parent && traversal_depth < max_traversal_depth) {
+                current_node = &current_node->parent->node;
+                if (current_node->data) {
+                    struct tinywl_toplevel *potential_toplevel = current_node->data;
+                    if (potential_toplevel && potential_toplevel->xdg_toplevel) {
+                        toplevel = potential_toplevel;
+                        is_ssd = true;
+                        needs_alpha_blending = true;  // SSD elements need alpha blending
+                        wlr_log(WLR_DEBUG, "Node %p: found toplevel %p at depth %d for SSD.",
+                                (void*)node, (void*)toplevel, traversal_depth);
+                        break;
+                    }
+                }
+                traversal_depth++;
+            }
+        }
+
+        // If still no toplevel, check server's toplevel list
+        if (!toplevel && !wl_list_empty(&server->toplevels)) {
+            struct tinywl_toplevel *potential_toplevel;
+            wl_list_for_each(potential_toplevel, &server->toplevels, link) {
+                if (potential_toplevel->scene_tree &&
+                    is_node_descendant(node, potential_toplevel->scene_tree)) {
+                    toplevel = potential_toplevel;
+                    is_ssd = true;
+                    needs_alpha_blending = true;  // SSD elements need alpha blending
+                    wlr_log(WLR_DEBUG, "Node %p: found toplevel %p via server toplevels list.",
+                            (void*)node, (void*)toplevel);
+                    break;
+                }
+            }
+        }
+
+        // Apply appropriate shader for SSD or fallback
+        if (toplevel && toplevel->xdg_toplevel) {
+            const char *app_id = toplevel->xdg_toplevel->app_id ? toplevel->xdg_toplevel->app_id : "null";
+            const char *title = toplevel->xdg_toplevel->title ? toplevel->xdg_toplevel->title : "null";
+            wlr_log(WLR_DEBUG, "SSD node %p: app_id=%s, title=%s (window %p)",
+                    (void*)node, app_id, title, (void*)toplevel->xdg_toplevel);
+
+            bool is_alacritty = (app_id && strcasestr(app_id, "alacritty")) ||
+                                (title && strcasestr(title, "alacritty"));
+
+            program_to_use = is_alacritty ? server->ssd2_shader_program : server->ssd_shader_program;
+            mvp_loc = is_alacritty ? server->ssd2_shader_mvp_loc : server->ssd_shader_mvp_loc;
+            color_loc = is_alacritty ? server->ssd2_shader_color_loc : server->ssd_shader_color_loc;
+            time_loc = is_alacritty ? server->ssd2_shader_time_loc : server->ssd_shader_time_loc;
+            res_loc = is_alacritty ? server->ssd2_shader_resolution_loc : server->ssd_shader_resolution_loc;
         } else {
-            // Use the default SSD shader
+            // Fallback for unassociated rect nodes
             program_to_use = server->ssd_shader_program;
             mvp_loc = server->ssd_shader_mvp_loc;
             color_loc = server->ssd_shader_color_loc;
             time_loc = server->ssd_shader_time_loc;
-            output_res_loc = server->ssd_shader_resolution_loc;
+            res_loc = server->ssd_shader_resolution_loc;
+            needs_alpha_blending = true;  // Even fallback SSD needs alpha
+            wlr_log(WLR_DEBUG, "Rect node %p: no associated toplevel, using default SSD shader.", (void*)node);
         }
     }
 
     if (program_to_use == 0) {
+        wlr_log(WLR_ERROR, "Node %p: invalid shader program.", (void*)node);
         return;
     }
+
+    // Enable alpha blending for SSD elements
+    if (needs_alpha_blending) {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        wlr_log(WLR_DEBUG, "Node %p: alpha blending enabled for SSD.", (void*)node);
+    }
+
     glUseProgram(program_to_use);
 
-    // --- Uniform setup (unchanged) ---
+    GLint current_program;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &current_program);
+    if (current_program != (GLint)program_to_use) {
+        wlr_log(WLR_ERROR, "Node %p: failed to bind program %u (current: %d).",
+                (void*)node, program_to_use, current_program);
+        if (needs_alpha_blending) glDisable(GL_BLEND);
+        return;
+    }
+
+    // CRITICAL FIX: Ensure VAO is bound before rendering
+    // Use the existing quad_vao from your server struct
+    if (server->quad_vao == 0) {
+        wlr_log(WLR_ERROR, "Node %p: server quad VAO not initialized.", (void*)node);
+        if (needs_alpha_blending) glDisable(GL_BLEND);
+        return;
+    }
+    
+    glBindVertexArray(server->quad_vao);
+    
+    // Verify VAO is now bound
+    GLint vao;
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
+    if (vao == 0) {
+        wlr_log(WLR_ERROR, "Node %p: failed to bind VAO %u.", (void*)node, server->quad_vao);
+        if (needs_alpha_blending) glDisable(GL_BLEND);
+        return;
+    }
+
     float mvp[9];
-    float box_scale_x = (float)scene_rect->width * (2.0f / output->width);
-    float box_scale_y = (float)scene_rect->height * (-2.0f / output->height);
-    float box_translate_x = ((float)render_sx / output->width) * 2.0f - 1.0f;
-    float box_translate_y = ((float)render_sy / output->height) * -2.0f + 1.0f;
+    float box_scale_x = (float)rect->width * (2.0f / output->width);
+    float box_scale_y = (float)rect->height * (-2.0f / output->height);
+    float box_translate_x = (float)render_sx / output->width * 2.0f - 1.0f;
+    float box_translate_y = (float)render_sy / output->height * -2.0f + 1.0f;
     float base_mvp[9] = {box_scale_x, 0, 0, 0, box_scale_y, 0, box_translate_x, box_translate_y, 1};
+
     if (output->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
         float transform_matrix[9];
         wlr_matrix_transform(transform_matrix, output->transform);
         wlr_matrix_multiply(mvp, transform_matrix, base_mvp);
     } else {
-        memcpy(mvp, base_mvp, sizeof(base_mvp));
+        memcpy(mvp, base_mvp, sizeof(mvp));
+    }
+
+    // For SSD elements, use the original color (which should include alpha)
+    // but ensure we're respecting the alpha channel from the rect->color
+    float final_color[4];
+    if (is_ssd && rect->color[3] < 1.0f) {
+        // Use the original alpha from the rect
+        memcpy(final_color, rect->color, sizeof(final_color));
+        color_to_use = final_color;
+        wlr_log(WLR_DEBUG, "Node %p: using original alpha %.2f for SSD.", (void*)node, rect->color[3]);
     }
 
     if (mvp_loc != -1) glUniformMatrix3fv(mvp_loc, 1, GL_FALSE, mvp);
     if (color_loc != -1) glUniform4fv(color_loc, 1, color_to_use);
     if (time_loc != -1) glUniform1f(time_loc, get_monotonic_time_seconds_as_float());
-    if (output_res_loc != -1) glUniform2f(output_res_loc, scene_rect->width, scene_rect->height);
+    if (res_loc != -1) glUniform2f(res_loc, (float)rect->width, (float)rect->height);
+
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+        wlr_log(WLR_ERROR, "Node %p: pre-draw GL error %d.", (void*)node, err);
+        if (needs_alpha_blending) glDisable(GL_BLEND);
+        return;
+    }
 
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+
+    err = glGetError();
+    if (err != GL_NO_ERROR) {
+        wlr_log(WLR_ERROR, "Node %p: post-draw GL error %d.", (void*)node, err);
+    } else {
+        wlr_log(WLR_DEBUG, "Node %p: rendered successfully%s%s.",
+                (void*)node, is_ssd ? " (SSD)" : "", 
+                needs_alpha_blending ? " with alpha" : "");
+    }
+
+    // Clean up: disable blending if we enabled it
+    if (needs_alpha_blending) {
+        glDisable(GL_BLEND);
+    }
 }
 static void render_panel_node(struct wlr_scene_node *node, void *user_data) {
     struct render_data *rdata = user_data;
