@@ -1362,8 +1362,8 @@ static void toggle_minimize_toplevel(struct tinywl_toplevel *toplevel, bool mini
     toplevel->is_minimizing = true;
     toplevel->minimizing_to_dock = minimized;
     toplevel->minimize_start_time = get_monotonic_time_seconds_as_float();
-    toplevel->minimize_duration = 1.0f;
-
+    toplevel->minimize_duration = 2.5f;
+    toplevel->maximize_duration = 1.5f;
     if (minimized) { // We are minimizing TO the dock
         toplevel->minimized = false; // Not officially minimized until animation ends
         toplevel->minimize_start_geom = toplevel->restored_geom;
@@ -2514,6 +2514,50 @@ void debug_scene_tree(struct wlr_scene *scene, struct wlr_output *output) {
     wlr_log(WLR_INFO, "[DEBUG] Total nodes: %d", node_count);
 }
 
+
+// Texture cache entry
+struct texture_cache_entry {
+    struct tinywl_toplevel *toplevel;
+    struct wlr_texture *texture;
+};
+
+// Texture cache (static array for simplicity)
+#define MAX_CACHED_TEXTURES 16
+static struct texture_cache_entry texture_cache[MAX_CACHED_TEXTURES] = {0};
+
+static void update_texture_cache(struct tinywl_toplevel *toplevel, struct wlr_texture *texture) {
+    // Find existing entry or first free slot
+    int free_slot = -1;
+    for (int i = 0; i < MAX_CACHED_TEXTURES; i++) {
+        if (texture_cache[i].toplevel == toplevel) {
+            // Update existing entry
+            if (texture_cache[i].texture) {
+                wlr_texture_destroy(texture_cache[i].texture);
+            }
+            texture_cache[i].texture = texture;
+            return;
+        }
+        if (!texture_cache[i].toplevel && free_slot == -1) {
+            free_slot = i;
+        }
+    }
+    
+    // Use free slot if available
+    if (free_slot != -1 && texture) {
+        texture_cache[free_slot].toplevel = toplevel;
+        texture_cache[free_slot].texture = texture;
+    }
+}
+
+static struct wlr_texture *get_cached_texture(struct tinywl_toplevel *toplevel) {
+    for (int i = 0; i < MAX_CACHED_TEXTURES; i++) {
+        if (texture_cache[i].toplevel == toplevel) {
+            return texture_cache[i].texture;
+        }
+    }
+    return NULL;
+}
+
 static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
                                  int sx, int sy,
                                  void *user_data) {
@@ -2565,8 +2609,6 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
         depth++;
     }
 
-
-    
     // Projection matrix
     float projection[9];
     enum wl_output_transform transform = wlr_output_transform_invert(output->transform);
@@ -2591,7 +2633,7 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
         
         active_animation_count++;
         
-        // Create texture from surface or fallback to scene buffer
+        // Create texture from surface or fallback to scene buffer or cache
         struct wlr_texture *texture = NULL;
         if (toplevel->xdg_toplevel && toplevel->xdg_toplevel->base && toplevel->xdg_toplevel->base->surface) {
             struct wlr_surface *surface = toplevel->xdg_toplevel->base->surface;
@@ -2602,18 +2644,31 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
         if (!texture) {
             texture = wlr_texture_from_buffer(renderer, scene_buffer->buffer);
         }
+        if (!texture) {
+            texture = get_cached_texture(toplevel);
+            if (texture) {
+                wlr_log(WLR_DEBUG, "[GENIE_ANIM:%s] Using cached texture for toplevel %p", output_name_log, (void*)toplevel);
+            }
+        }
         
         if (!texture) {
-            wlr_log(WLR_ERROR, "[GENIE_ANIM:%s] Failed to create texture for genie animation.", output_name_log);
+            wlr_log(WLR_ERROR, "[GENIE_ANIM:%s] Failed to create or find cached texture for genie animation.", output_name_log);
             active_animation_count--;
             return;
+        }
+
+        // Update cache with new texture if created
+        if (texture != get_cached_texture(toplevel)) {
+            update_texture_cache(toplevel, texture);
         }
 
         wlr_gles2_texture_get_attribs(texture, &tex_attribs);
         
         if (!tex_attribs.tex) {
             wlr_log(WLR_ERROR, "[GENIE_ANIM:%s] Invalid texture attributes.", output_name_log);
-            wlr_texture_destroy(texture);
+            if (texture != get_cached_texture(toplevel)) {
+                wlr_texture_destroy(texture);
+            }
             active_animation_count--;
             return;
         }
@@ -2627,14 +2682,14 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
             elapsed = get_monotonic_time_seconds_as_float() - toplevel->minimize_start_time;
             progress = (toplevel->minimize_duration > 1e-5f)
                      ? fminf(1.0f, elapsed / toplevel->minimize_duration)
-                     : 1.0f;
+                     : 1.5f;
             start_box = toplevel->minimize_start_geom;
             target_box = toplevel->minimize_target_geom;
         } else {
             elapsed = get_monotonic_time_seconds_as_float() - toplevel->maximize_start_time;
             progress = (toplevel->maximize_duration > 1e-5f)
                      ? fminf(1.0f, elapsed / toplevel->maximize_duration)
-                     : 1.0f;
+                     : 1.5f;
             start_box = toplevel->maximize_start_geom;
             target_box = toplevel->maximize_target_geom;
         }
@@ -2644,7 +2699,9 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
             target_box.width <= 0 || target_box.height <= 0) {
             wlr_log(WLR_ERROR, "[GENIE_ANIM] Invalid geometry: start %dx%d, target %dx%d", 
                     start_box.width, start_box.height, target_box.width, target_box.height);
-            wlr_texture_destroy(texture);
+            if (texture != get_cached_texture(toplevel)) {
+                wlr_texture_destroy(texture);
+            }
             active_animation_count--;
             return;
         }
@@ -2664,7 +2721,9 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
                 toplevel->maximized = true;
             }
             
-            wlr_texture_destroy(texture);
+            if (texture != get_cached_texture(toplevel)) {
+                wlr_texture_destroy(texture);
+            }
             active_animation_count--;
             return;
         }
@@ -2695,8 +2754,6 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
             .height = fmaxf(1, render_box.height - decoration_top - decoration_bottom)
         };
 
- 
-
         // Render genie animation
         if (render_box.width > 0 && render_box.height > 0 && 
             render_box.width <= 8192 && render_box.height <= 8192) {
@@ -2725,7 +2782,9 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
                 glBindFramebuffer(GL_FRAMEBUFFER, original_fbo);
                 glDeleteTextures(1, &intermediate_texture);
                 glDeleteFramebuffers(1, &intermediate_fbo);
-                wlr_texture_destroy(texture);
+                if (texture != get_cached_texture(toplevel)) {
+                    wlr_texture_destroy(texture);
+                }
                 active_animation_count--;
                 return;
             }
@@ -2740,7 +2799,7 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
             glUseProgram(server->passthrough_shader_program);
             glBindVertexArray(server->quad_vao);
             
-            // Passthrough MVP matrix (from second version)
+            // Passthrough MVP matrix
             float passthrough_mvp[9] = {
                 2.0f, 0.0f, 0.0f,
                 0.0f, -2.0f, 0.0f,
@@ -2798,7 +2857,7 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
                 glUniform1f(server->passthrough_shader_cornerRadius_loc, 12.0f);
             }
             
-            // Cycling bevel color (from second version)
+            // Cycling bevel color
             static const float color_palette[][4] = {
                 {1.0f, 0.2f, 0.2f, 0.7f}, // Red
                 {1.0f, 1.0f, 0.2f, 0.7f}, // Yellow
@@ -2845,7 +2904,9 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
                 wlr_log(WLR_ERROR, "[GENIE_ANIM:%s] Genie VAO not initialized.", output_name_log);
                 glDeleteTextures(1, &intermediate_texture);
                 glDeleteFramebuffers(1, &intermediate_fbo);
-                wlr_texture_destroy(texture);
+                if (texture != get_cached_texture(toplevel)) {
+                    wlr_texture_destroy(texture);
+                }
                 active_animation_count--;
                 return;
             }
@@ -2957,7 +3018,9 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
             glDisable(GL_BLEND);
         }
         
-        wlr_texture_destroy(texture);
+        if (texture != get_cached_texture(toplevel)) {
+            wlr_texture_destroy(texture);
+        }
         active_animation_count--;
         return;
     }
@@ -2966,15 +3029,28 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
     wlr_log(WLR_DEBUG, "[NORMAL] Normal rendering for scene_buffer %p", (void*)scene_buffer);
     
     struct wlr_texture *texture = wlr_texture_from_buffer(renderer, scene_buffer->buffer);
+    if (!texture && toplevel) {
+        texture = get_cached_texture(toplevel);
+        if (texture) {
+            wlr_log(WLR_DEBUG, "[NORMAL:%s] Using cached texture for toplevel %p", output_name_log, (void*)toplevel);
+        }
+    }
     if (!texture) {
-        wlr_log(WLR_ERROR, "[SCENE_INV:%s] Failed to create wlr_texture from buffer %p.", output_name_log, (void*)scene_buffer->buffer);
-        return;//
+        wlr_log(WLR_ERROR, "[SCENE_INV:%s] Failed to create or find cached wlr_texture from buffer %p.", output_name_log, (void*)scene_buffer->buffer);
+        return;
+    }
+
+    // Update cache with new texture if created
+    if (toplevel && texture != get_cached_texture(toplevel)) {
+        update_texture_cache(toplevel, texture);
     }
 
     struct wlr_scene_surface *current_scene_surface = wlr_scene_surface_try_from_buffer(scene_buffer);
     struct wlr_surface *surface_to_render = current_scene_surface ? current_scene_surface->surface : NULL;
     if (!surface_to_render) {
-        wlr_texture_destroy(texture);
+        if (texture != get_cached_texture(toplevel)) {
+            wlr_texture_destroy(texture);
+        }
         return;
     }
 
@@ -3053,11 +3129,13 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
             wlr_log(WLR_DEBUG, "[DEBUG:%s] '%s' scaled to zero width/height.", output_name_log, title_buffer);
             wlr_output_schedule_frame(output);
         }
-        wlr_texture_destroy(texture);
+        if (texture != get_cached_texture(toplevel)) {
+            wlr_texture_destroy(texture);
+        }
         return;
     }
 
-    // Calculate MVP matrix (from second version)
+    // Calculate MVP matrix
     float main_mvp[9];
     wlr_matrix_identity(main_mvp);
     float box_scale_x = (float)main_render_box.width * (2.0f / output->width);
@@ -3107,19 +3185,19 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
         glUniform1i(tex_loc, 0);
     }
 
-    // Set time uniform (from second version)
+    // Set time uniform
     struct timespec now_shader_time_iter_draw;
     clock_gettime(CLOCK_MONOTONIC, &now_shader_time_iter_draw);
     float time_value_iter_draw = now_shader_time_iter_draw.tv_sec + now_shader_time_iter_draw.tv_nsec / 1e9f;
     GLint time_loc_iter_draw = glGetUniformLocation(server->passthrough_shader_program, "time");
     if (time_loc_iter_draw != -1) glUniform1f(time_loc_iter_draw, time_value_iter_draw);
 
-    // Set resolution uniform (from second version)
+    // Set resolution uniform
     float resolution_iter_draw[2] = {(float)output->width, (float)output->height};
     GLint resolution_loc_iter_draw = glGetUniformLocation(server->passthrough_shader_program, "iResolution");
     if (resolution_loc_iter_draw != -1) glUniform2fv(resolution_loc_iter_draw, 1, resolution_iter_draw);
 
-    // Set new uniforms (from second version)
+    // Set new uniforms
     if (server->passthrough_shader_res_loc != -1) {
         glUniform2f(server->passthrough_shader_res_loc, (float)main_render_box.width, (float)main_render_box.height);
     }
@@ -3128,7 +3206,7 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
         glUniform1f(server->passthrough_shader_cornerRadius_loc, 12.0f);
     }
 
-    // Cycling bevel color (from second version)
+    // Cycling bevel color
     static const float color_palette[][4] = {
         {1.0f, 0.2f, 0.2f, 0.7f}, // Red
         {1.0f, 1.0f, 0.2f, 0.7f}, // Yellow
@@ -3186,7 +3264,9 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
             }
             if (desktop_window_count == 0) {
                 wlr_log(WLR_DEBUG, "[PREVIEW:%s] No windows on desktop %d.", output_name_log, rdata->desktop_index);
-                wlr_texture_destroy(texture);
+                if (texture != get_cached_texture(toplevel)) {
+                    wlr_texture_destroy(texture);
+                }
                 return;
             }
             
@@ -3264,7 +3344,9 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
     glBindTexture(tex_attribs.target, 0);
     glDisable(GL_BLEND);
     
-    wlr_texture_destroy(texture);
+    if (texture != get_cached_texture(toplevel)) {
+        wlr_texture_destroy(texture);
+    }
 }////////////////////////////////////////////////////////////////////////
 static pthread_mutex_t rdp_transmit_mutex = PTHREAD_MUTEX_INITIALIZER;
 
