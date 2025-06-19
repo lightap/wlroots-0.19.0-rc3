@@ -2725,7 +2725,7 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
                 wlr_texture_destroy(texture);
             }
             active_animation_count--;
-            return;
+          //  return;
         }
 
         // Schedule next frame
@@ -5253,6 +5253,7 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
     struct wlr_xdg_toplevel *xdg_toplevel = toplevel->xdg_toplevel;
     const char *title = (xdg_toplevel->title) ? xdg_toplevel->title : "N/A";
 
+    
     wlr_log(WLR_INFO, "[MAP:%s] Toplevel mapped. Starting geometry negotiation.", title);
     toplevel->mapped = true;
 
@@ -5314,21 +5315,42 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 }
 
 static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
-    struct tinywl_toplevel *toplevel_wrapper = wl_container_of(listener, toplevel_wrapper, unmap);
-    if (!toplevel_wrapper || !toplevel_wrapper->xdg_toplevel) return;
-    const char *title = toplevel_wrapper->xdg_toplevel->title ? toplevel_wrapper->xdg_toplevel->title : "N/A";
-
-    wlr_log(WLR_ERROR, "[UNMAP SUPER DEBUG RECT:%s Ptr:%p] Event received.", title, toplevel_wrapper);
-
-    // For this test, unmap does very little. Destroy will handle the debug rect.
-    toplevel_wrapper->is_animating = false;
-    toplevel_wrapper->pending_destroy = false; // It won't be destroyed by iterator
-
-    if (toplevel_wrapper->scene_tree && !toplevel_wrapper->scene_tree->node.enabled) {
-        wlr_scene_node_set_enabled(&toplevel_wrapper->scene_tree->node, true);
+    struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, unmap);
+    const char *title = (toplevel->xdg_toplevel && toplevel->xdg_toplevel->title) ? toplevel->xdg_toplevel->title : "N/A";
+    
+    // Mark as unmapped internally
+    toplevel->mapped = false;
+    
+    // --- THIS IS THE FIX ---
+    // If the window is unmapped in the middle of a minimize or maximize
+    // animation, we should NOT immediately hide it. Let the animation
+    // continue to its end. The animation code is responsible for setting
+    // the final visibility (e.g., hiding the node after a minimize anim).
+    if (toplevel->is_minimizing || toplevel->is_maximizing) {
+        wlr_log(WLR_INFO, "[UNMAP:%s] Unmapped during animation. Letting animation complete.", title);
+        // By returning here, we keep the scene node enabled, allowing the
+        // animation in scene_buffer_iterator to finish smoothly.
+        return;
     }
-    struct tinywl_output *out;
-    wl_list_for_each(out, &toplevel_wrapper->server->outputs, link) { wlr_output_schedule_frame(out->wlr_output); }
+
+    // --- Original logic for a standard, non-animated unmap ---
+    wlr_log(WLR_INFO, "[UNMAP:%s] Standard unmap. Hiding scene node.", title);
+
+    // Stop any other types of animations if you have them
+    toplevel->is_animating = false;
+    
+    // Hide the window from the scene graph since it's not animating
+    if (toplevel->scene_tree) {
+        wlr_scene_node_set_enabled(&toplevel->scene_tree->node, false);
+    }
+    
+    // Schedule a frame to ensure the screen updates to the hidden state
+    struct tinywl_output *output;
+    wl_list_for_each(output, &toplevel->server->outputs, link) {
+        if (output->wlr_output && output->wlr_output->enabled) {
+            wlr_output_schedule_frame(output->wlr_output);
+        }
+    }
 }
 
 
