@@ -829,7 +829,8 @@ static void update_decoration_geometry(struct tinywl_toplevel *toplevel);
  void update_toplevel_visibility(struct tinywl_server *server) ;
  void update_compositor_state(struct tinywl_server *server);
  static void begin_interactive(struct tinywl_toplevel *toplevel, enum tinywl_cursor_mode mode, uint32_t edges);
-// Function to compile a shader
+static void set_decorations_visible(struct tinywl_toplevel *toplevel, bool visible);
+ // Function to compile a shader
 static GLuint compile_shader(GLenum type, const char *source) {
     GLuint shader = glCreateShader(type);
     glShaderSource(shader, 1, &source, NULL);
@@ -1359,11 +1360,13 @@ if (toplevel->server->animating_toplevel && toplevel->server->animating_toplevel
 */
 
 // Add this function near toggle_minimize_toplevel
-// Add this function near toggle_minimize_toplevel
 static void toggle_maximize_toplevel(struct tinywl_toplevel *toplevel, bool maximized) {
     if (toplevel->maximized == maximized) {
         return;
     }
+
+    // NEW: Hide decorations when starting the animation.
+    set_decorations_visible(toplevel, false);
 
     struct tinywl_output *output;
     // Find the first enabled output to base our geometry on
@@ -1419,8 +1422,8 @@ static void toggle_minimize_toplevel(struct tinywl_toplevel *toplevel, bool mini
     wlr_log(WLR_INFO, "Toggling minimize for '%s' to %d",
             toplevel->xdg_toplevel->title, minimized);
 
-    // REMOVE OR COMMENT OUT this line to allow multiple animations:
-    // toplevel->server->animating_toplevel = toplevel;
+    // NEW: Hide decorations when starting the animation.
+    set_decorations_visible(toplevel, false);
 
     // Set up animation parameters
     toplevel->is_minimizing = true;
@@ -2809,6 +2812,7 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
         }
 
         // Check animation completion
+         // --- MODIFIED SECTION: Check animation completion ---
         if (progress >= 1.0f) {
             if (is_minimize_anim) {
                 toplevel->is_minimizing = false;
@@ -2816,18 +2820,25 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
                 if (toplevel->minimizing_to_dock) {
                     toplevel->minimized = true;
                     wlr_scene_node_set_enabled(&toplevel->scene_tree->node, false);
+                    // Decorations remain hidden since window is not visible
+                } else {
+                    // Restoring FROM dock, so make decorations visible again.
+                    set_decorations_visible(toplevel, true);
                 }
-            } else {
+            } else { // is_maximizing
                 toplevel->is_maximizing = false;
                 toplevel->server->animating_toplevel = NULL;
-                toplevel->maximized = true;
+                toplevel->maximized = toplevel->xdg_toplevel->current.maximized; // Use the final state
+                // Animation is finished, make decorations visible again.
+                set_decorations_visible(toplevel, true);
             }
             
             if (texture != get_cached_texture(toplevel)) {
                 wlr_texture_destroy(texture);
             }
             active_animation_count--;
-          //  return;
+            // keep this commented out to render the final state
+            // return; 
         }
 
         // Schedule next frame
@@ -6242,6 +6253,42 @@ static void handle_xdg_decoration_new(struct wl_listener *listener, void *data) 
     // Force client-side decorations (no server decorations)
     wlr_xdg_toplevel_decoration_v1_set_mode(decoration, 
         WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
+}
+
+/**
+ * A helper function to set the visibility of all server-side decoration
+ * scene nodes for a given toplevel.
+ */
+static void set_decorations_visible(struct tinywl_toplevel *toplevel, bool visible) {
+    if (!toplevel || !toplevel->ssd.enabled) {
+        return;
+    }
+
+    wlr_log(WLR_INFO, "Setting decorations for '%s' to visible: %d",
+            toplevel->xdg_toplevel->title ? toplevel->xdg_toplevel->title : "N/A", visible);
+
+    // Check each decoration component before trying to set its visibility
+    if (toplevel->ssd.title_bar) {
+        wlr_scene_node_set_enabled(&toplevel->ssd.title_bar->node, visible);
+    }
+    if (toplevel->ssd.border_left) {
+        wlr_scene_node_set_enabled(&toplevel->ssd.border_left->node, visible);
+    }
+    if (toplevel->ssd.border_right) {
+        wlr_scene_node_set_enabled(&toplevel->ssd.border_right->node, visible);
+    }
+    if (toplevel->ssd.border_bottom) {
+        wlr_scene_node_set_enabled(&toplevel->ssd.border_bottom->node, visible);
+    }
+    if (toplevel->ssd.close_button) {
+        wlr_scene_node_set_enabled(&toplevel->ssd.close_button->node, visible);
+    }
+    if (toplevel->ssd.maximize_button) {
+        wlr_scene_node_set_enabled(&toplevel->ssd.maximize_button->node, visible);
+    }
+    if (toplevel->ssd.minimize_button) {
+        wlr_scene_node_set_enabled(&toplevel->ssd.minimize_button->node, visible);
+    }
 }
 
 
