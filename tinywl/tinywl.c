@@ -613,6 +613,11 @@ GLuint intermediate_rbo[16];
     GLuint genie_vbo;
     GLuint genie_ibo;
     int genie_index_count;
+
+    GLuint solid_shader_program;
+    GLint solid_shader_mvp_loc;
+    GLint solid_shader_color_loc;
+    GLint solid_shader_time_loc;
 };
 
 static float current_rotation = 0.0f;
@@ -652,7 +657,11 @@ struct tinywl_decoration { // Your struct for SSD scene rects
         struct wlr_scene_rect *border_right;
         struct wlr_scene_rect *border_bottom;
 
-
+// --- ADD THESE TWO LINES ---
+    struct wlr_scene_rect *minimize_button;
+    struct wlr_scene_rect *maximize_button;
+    struct wlr_scene_rect *close_button;
+   
 
 };
 
@@ -673,7 +682,10 @@ struct tinywl_toplevel {
 
     // This will point to the scene tree specifically for the client's content
     // (i.e., the tree returned by wlr_scene_xdg_surface_create for the base xdg_surface)
-    struct wlr_scene_tree *client_xdg_scene_tree; // Tree for xdg_toplevel->base
+    // NEW: A dedicated tree for our server-side decorations
+   
+
+    struct wlr_scene_tree *client_xdg_scene_tree; // Tree for xdg_toplevel->base// Tree for xdg_toplevel->base
 
     struct wl_listener map;
     struct wl_listener unmap;
@@ -1345,6 +1357,58 @@ if (toplevel->server->animating_toplevel && toplevel->server->animating_toplevel
     }
 }
 */
+
+// Add this function near toggle_minimize_toplevel
+// Add this function near toggle_minimize_toplevel
+static void toggle_maximize_toplevel(struct tinywl_toplevel *toplevel, bool maximized) {
+    if (toplevel->maximized == maximized) {
+        return;
+    }
+
+    struct tinywl_output *output;
+    // Find the first enabled output to base our geometry on
+    wl_list_for_each(output, &toplevel->server->outputs, link) {
+        if (output->wlr_output && output->wlr_output->enabled) {
+            
+            // Set up animation parameters
+            toplevel->is_maximizing = true;
+            toplevel->maximize_start_time = get_monotonic_time_seconds_as_float();
+            toplevel->maximize_duration = 0.35f; // A quick, snappy animation
+
+            if (maximized) { // Animating TO maximized state
+                toplevel->maximize_start_geom = toplevel->restored_geom;
+                
+                // Target is the full output geometry, minus panel height if you have one
+                toplevel->maximize_target_geom.x = 0;
+                toplevel->maximize_target_geom.y = 0; // Assuming panel is at the bottom
+                toplevel->maximize_target_geom.width = output->wlr_output->width;
+                // Adjust for your panel height. If no panel, use output->wlr_output->height
+                toplevel->maximize_target_geom.height = output->wlr_output->height - TITLE_BAR_HEIGHT; 
+            } else { // Animating FROM maximized TO restored state
+                // The start geometry is the current (maximized) geometry
+                toplevel->maximize_start_geom.x = toplevel->scene_tree->node.x;
+                toplevel->maximize_start_geom.y = toplevel->scene_tree->node.y;
+                
+                // === THIS IS THE FIX ===
+                // Get the current content geometry directly from the struct member.
+                // No function call is needed in modern wlroots.
+                toplevel->maximize_start_geom.width = toplevel->xdg_toplevel->base->geometry.width;
+                toplevel->maximize_start_geom.height = toplevel->xdg_toplevel->base->geometry.height;
+                // =======================
+
+                toplevel->maximize_target_geom = toplevel->restored_geom;
+            }
+
+            // Tell the client its state is changing
+            wlr_xdg_toplevel_set_maximized(toplevel->xdg_toplevel, maximized);
+            // Schedule a frame to start the animation
+            wlr_output_schedule_frame(output->wlr_output);
+            
+            // We only need to set this up for one output, so break the loop
+            break;
+        }
+    }
+}
 
 static void toggle_minimize_toplevel(struct tinywl_toplevel *toplevel, bool minimized) {
     if (toplevel->minimized == minimized) {
@@ -2177,14 +2241,13 @@ static void server_cursor_motion_absolute(struct wl_listener *listener, void *da
 
 
 
-// --- Modified server_cursor_button ---
-// MODIFIED: server_cursor_button to handle clicks on the panel previews
+// The complete, updated server_cursor_button function
 static void server_cursor_button(struct wl_listener *listener, void *data) {
     struct tinywl_server *server = wl_container_of(listener, server, cursor_button);
     struct wlr_pointer_button_event *event = data;
     struct wlr_seat *seat = server->seat;
 
-    // Check if the click occurred within the panel's area first.
+    // --- 1. Check for clicks inside the panel area first ---
     if (server->top_panel_node && server->top_panel_node->enabled) {
         struct wlr_scene_rect *panel_srect = wlr_scene_rect_from_node(server->top_panel_node);
         struct wlr_box panel_box = {
@@ -2216,33 +2279,60 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
         }
     }
 
-    // --- Original logic for window interaction (move, resize, focus) ---
+    // --- 2. Find which toplevel (if any) is under the cursor ---
     struct wlr_surface *surface_at_cursor = NULL;
     double sx, sy;
     struct tinywl_toplevel *toplevel = find_toplevel_at(server,
         server->cursor->x, server->cursor->y, &surface_at_cursor, &sx, &sy);
 
+    // --- 3. Handle button release ---
     if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
+        // If we are in a move or resize mode, releasing the button ends it.
         if (server->cursor_mode != TINYWL_CURSOR_PASSTHROUGH) {
             server->cursor_mode = TINYWL_CURSOR_PASSTHROUGH;
             server->grabbed_toplevel = NULL;
         }
-    } else { // Button pressed
+    } 
+    // --- 4. Handle button press ---
+    else { 
         bool handled_by_compositor = false;
-        if (toplevel && !toplevel->minimized) { // Don't interact with minimized windows
-            focus_toplevel(toplevel);
+
+        // Only interact with a toplevel if one was found and it's not minimized
+        if (toplevel && !toplevel->minimized) {
+            focus_toplevel(toplevel); // Bring window to front and give it focus
+
+            // Check if decorations are enabled and the click was the left mouse button
             if (toplevel->ssd.enabled && event->button == BTN_LEFT) {
                 double dummy_sx, dummy_sy;
+                // Find the specific scene node (title bar, button, border) under the cursor
                 struct wlr_scene_node *node_at = wlr_scene_node_at(
                     &toplevel->scene_tree->node, server->cursor->x, server->cursor->y, &dummy_sx, &dummy_sy);
-                if (node_at == &toplevel->ssd.title_bar->node) {
+
+                // Check which decoration element was clicked
+                if (node_at == &toplevel->ssd.close_button->node) {
+                    wlr_xdg_toplevel_send_close(toplevel->xdg_toplevel);
+                    handled_by_compositor = true;
+
+                } else if (node_at == &toplevel->ssd.maximize_button->node) {
+                    toggle_maximize_toplevel(toplevel, !toplevel->maximized);
+                    handled_by_compositor = true;
+
+                } else if (node_at == &toplevel->ssd.minimize_button->node) { // NEW
+                    // Minimize the window. The panel click logic will handle restoring it.
+                    toggle_minimize_toplevel(toplevel, true); 
+                    handled_by_compositor = true;    
+
+                } else if (node_at == &toplevel->ssd.title_bar->node) {
                     begin_interactive(toplevel, TINYWL_CURSOR_MOVE, 0);
                     handled_by_compositor = true;
+
                 } else {
+                    // Check for border resize clicks
                     uint32_t resize_edges = 0;
                     if (node_at == &toplevel->ssd.border_left->node) resize_edges = WLR_EDGE_LEFT;
                     else if (node_at == &toplevel->ssd.border_right->node) resize_edges = WLR_EDGE_RIGHT;
                     else if (node_at == &toplevel->ssd.border_bottom->node) resize_edges = WLR_EDGE_BOTTOM;
+                    
                     if (resize_edges != 0) {
                         begin_interactive(toplevel, TINYWL_CURSOR_RESIZE, resize_edges);
                         handled_by_compositor = true;
@@ -2250,13 +2340,25 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
                 }
             }
         } else {
+            // If the user clicked on the empty desktop, clear keyboard focus.
             wlr_seat_keyboard_clear_focus(seat);
         }
+        
+        // If the click wasn't handled by our compositor (e.g., it was on the client's content area),
+        // make sure the keyboard is ready to be passed to the client.
         if (!handled_by_compositor) {
-            wlr_seat_set_keyboard(seat, wlr_seat_get_keyboard(seat));
+            // This ensures the correct keyboard is associated with the seat for the client.
+            struct tinywl_keyboard *keyboard;
+            if (!wl_list_empty(&server->keyboards)) {
+                 keyboard = wl_container_of(server->keyboards.next, keyboard, link);
+                 wlr_seat_set_keyboard(seat, keyboard->wlr_keyboard);
+            }
         }
     }
     
+    // --- 5. Forward the button event ---
+    // This is crucial. Even if we handle the click, the seat needs to be notified.
+    // If we didn't handle it, this forwards the click to the focused client application.
     wlr_seat_pointer_notify_button(seat, event->time_msec, event->button, event->state);
 }
 static void server_cursor_axis(struct wl_listener *listener, void *data) {
@@ -3547,7 +3649,15 @@ static void render_rect_node(struct wlr_scene_node *node, void *user_data) {
         }
 
         // Apply appropriate shader for SSD or fallback
-        if (toplevel && toplevel->xdg_toplevel) {
+        if (toplevel && (node == &toplevel->ssd.close_button->node || node == &toplevel->ssd.maximize_button->node || node == &toplevel->ssd.minimize_button->node)) {
+            // This is a button. Use the simple solid color shader.
+            program_to_use = server->solid_shader_program;
+            mvp_loc = server->solid_shader_mvp_loc;
+            color_loc = server->solid_shader_color_loc;
+            time_loc = server->solid_shader_time_loc; 
+            // time_loc and res_loc remain -1, which is fine.
+            wlr_log(WLR_DEBUG, "Rendering node %p as a BUTTON.", (void*)node);
+        } else if (toplevel && toplevel->xdg_toplevel) {
             const char *app_id = toplevel->xdg_toplevel->app_id ? toplevel->xdg_toplevel->app_id : "null";
             const char *title = toplevel->xdg_toplevel->title ? toplevel->xdg_toplevel->title : "null";
             wlr_log(WLR_DEBUG, "SSD node %p: app_id=%s, title=%s (window %p)",
@@ -3576,6 +3686,11 @@ static void render_rect_node(struct wlr_scene_node *node, void *user_data) {
     if (program_to_use == 0) {
         wlr_log(WLR_ERROR, "Node %p: invalid shader program.", (void*)node);
         return;
+    }
+
+    // This logic is slightly adjusted to be correct for all cases
+    if (rect->color[3] < 1.0f) {
+        needs_alpha_blending = true;
     }
 
     // Enable alpha blending for SSD elements
@@ -5049,6 +5164,10 @@ static void ensure_ssd_disabled(struct tinywl_toplevel *toplevel) {
     }
 }
 
+// Add these constants near the top of your file if you haven't already
+#define BUTTON_SIZE 18
+#define BUTTON_PADDING 5
+
 static void update_decoration_geometry(struct tinywl_toplevel *toplevel) {
     const char *title = (toplevel && toplevel->xdg_toplevel && toplevel->xdg_toplevel->title) ?
                         toplevel->xdg_toplevel->title : "N/A";
@@ -5067,64 +5186,45 @@ static void update_decoration_geometry(struct tinywl_toplevel *toplevel) {
         if (toplevel->ssd.border_left) wlr_scene_node_set_enabled(&toplevel->ssd.border_left->node, false);
         if (toplevel->ssd.border_right) wlr_scene_node_set_enabled(&toplevel->ssd.border_right->node, false);
         if (toplevel->ssd.border_bottom) wlr_scene_node_set_enabled(&toplevel->ssd.border_bottom->node, false);
+        if (toplevel->ssd.close_button) wlr_scene_node_set_enabled(&toplevel->ssd.close_button->node, false);
+        if (toplevel->ssd.maximize_button) wlr_scene_node_set_enabled(&toplevel->ssd.maximize_button->node, false);
         return;
     }
 
     struct wlr_xdg_toplevel *xdg_toplevel = toplevel->xdg_toplevel;
-    struct wlr_scene_node *client_content_node = &toplevel->client_xdg_scene_tree->node;
-
-    // Get the actual dimensions of the client's content scene node.
-    // This usually comes from the wlr_scene_buffer associated with the client's surface.
     int actual_content_width = 0;
     int actual_content_height = 0;
 
-    // The client_xdg_scene_tree is a wlr_scene_surface. Its first child should be the wlr_scene_buffer.
-    if (!wl_list_empty(&client_content_node->parent->children)) { // client_content_node is the wlr_scene_xdg_surface tree
-        struct wlr_scene_node *buffer_node_candidate = wl_container_of(toplevel->client_xdg_scene_tree->children.next, buffer_node_candidate, link);
-
-        if (buffer_node_candidate && buffer_node_candidate->type == WLR_SCENE_NODE_BUFFER) {
-            struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(buffer_node_candidate);
-            if (scene_buffer && scene_buffer->buffer) {
-                actual_content_width = scene_buffer->buffer->width;
-                actual_content_height = scene_buffer->buffer->height;
-                 wlr_log(WLR_DEBUG, "[UPDATE_DECO:%s] Using scene_buffer dimensions: %dx%d", title, actual_content_width, actual_content_height);
-            } else if (scene_buffer && scene_buffer->dst_width > 0 && scene_buffer->dst_height > 0) {
-                // Fallback if buffer isn't present yet but dst dimensions are set
-                actual_content_width = scene_buffer->dst_width;
-                actual_content_height = scene_buffer->dst_height;
-                wlr_log(WLR_DEBUG, "[UPDATE_DECO:%s] Using scene_buffer->dst_width/height: %dx%d", title, actual_content_width, actual_content_height);
-            }
-        }
-    }
-
-    // Fallback to xdg_toplevel->current if scene buffer dimensions are not available/valid
-    if (actual_content_width <= 0 || actual_content_height <= 0) {
-        wlr_log(WLR_DEBUG, "[UPDATE_DECO:%s] Scene buffer dimensions not available or zero, falling back to xdg_toplevel->current (%dx%d).",
-                title, xdg_toplevel->current.width, xdg_toplevel->current.height);
+    if (xdg_toplevel->base->geometry.width > 0 && xdg_toplevel->base->geometry.height > 0) {
+        actual_content_width = xdg_toplevel->base->geometry.width;
+        actual_content_height = xdg_toplevel->base->geometry.height;
+    } else {
         actual_content_width = xdg_toplevel->current.width;
         actual_content_height = xdg_toplevel->current.height;
     }
 
-
     if (actual_content_width <= 0 || actual_content_height <= 0) {
-        wlr_log(WLR_DEBUG, "[UPDATE_DECO:%s] Final effective content size is %dx%d. Hiding SSDs. Client at (0,0).",
+        wlr_log(WLR_DEBUG, "[UPDATE_DECO:%s] Final effective content size is %dx%d. Hiding SSDs.",
                 title, actual_content_width, actual_content_height);
         if (toplevel->ssd.title_bar) wlr_scene_node_set_enabled(&toplevel->ssd.title_bar->node, false);
         if (toplevel->ssd.border_left) wlr_scene_node_set_enabled(&toplevel->ssd.border_left->node, false);
         if (toplevel->ssd.border_right) wlr_scene_node_set_enabled(&toplevel->ssd.border_right->node, false);
         if (toplevel->ssd.border_bottom) wlr_scene_node_set_enabled(&toplevel->ssd.border_bottom->node, false);
+        if (toplevel->ssd.close_button) wlr_scene_node_set_enabled(&toplevel->ssd.close_button->node, false);
+        if (toplevel->ssd.maximize_button) wlr_scene_node_set_enabled(&toplevel->ssd.maximize_button->node, false);
         wlr_scene_node_set_position(&toplevel->client_xdg_scene_tree->node, 0, 0);
         return;
     }
 
-    wlr_log(WLR_INFO, "[UPDATE_DECO:%s] Effective content geometry for SSD sizing: %dx%d (from scene/current)",
+    wlr_log(WLR_INFO, "[UPDATE_DECO:%s] Sizing SSDs around content of %dx%d",
             title, actual_content_width, actual_content_height);
 
     if (!toplevel->ssd.title_bar || !toplevel->ssd.border_left ||
-        !toplevel->ssd.border_right || !toplevel->ssd.border_bottom) {
-        wlr_log(WLR_ERROR, "[UPDATE_DECO:%s] SSD rects NULL. Re-enabling.", title);
-        ensure_ssd_enabled(toplevel); // This will call update_decoration_geometry again
-        return; // Avoid continuing if re-enable is needed, it will recall this func.
+        !toplevel->ssd.border_right || !toplevel->ssd.border_bottom ||
+        !toplevel->ssd.close_button || !toplevel->ssd.maximize_button) {
+        wlr_log(WLR_ERROR, "[UPDATE_DECO:%s] SSD rects are NULL even though SSD is enabled. Re-creating.", title);
+        ensure_ssd_enabled(toplevel);
+        return;
     }
     
     wlr_scene_node_set_enabled(&toplevel->ssd.title_bar->node, true);
@@ -5134,6 +5234,7 @@ static void update_decoration_geometry(struct tinywl_toplevel *toplevel) {
 
     int ssd_total_width = actual_content_width + 2 * BORDER_WIDTH;
 
+    // --- BORDERS AND TITLE BAR ---
     wlr_scene_rect_set_size(toplevel->ssd.title_bar, ssd_total_width, TITLE_BAR_HEIGHT);
     wlr_scene_node_set_position(&toplevel->ssd.title_bar->node, 0, 0);
 
@@ -5146,9 +5247,38 @@ static void update_decoration_geometry(struct tinywl_toplevel *toplevel) {
     wlr_scene_rect_set_size(toplevel->ssd.border_bottom, ssd_total_width, BORDER_WIDTH);
     wlr_scene_node_set_position(&toplevel->ssd.border_bottom->node, 0, TITLE_BAR_HEIGHT + actual_content_height);
 
-    wlr_log(WLR_INFO, "[UPDATE_DECO:%s] Positioning client_xdg_scene_tree at (%d, %d).",
-            title, BORDER_WIDTH, TITLE_BAR_HEIGHT);
+     // --- BUTTON POSITIONING ---
+    int button_y = (TITLE_BAR_HEIGHT - BUTTON_SIZE) / 2;
+    int close_button_x = ssd_total_width - BORDER_WIDTH - BUTTON_PADDING - BUTTON_SIZE;
+    wlr_scene_rect_set_size(toplevel->ssd.close_button, BUTTON_SIZE, BUTTON_SIZE);
+    wlr_scene_node_set_position(&toplevel->ssd.close_button->node, close_button_x, button_y);
+    wlr_scene_node_set_enabled(&toplevel->ssd.close_button->node, true);
+
+
+    
+    int maximize_button_x = close_button_x - BUTTON_PADDING - BUTTON_SIZE;
+    wlr_scene_rect_set_size(toplevel->ssd.maximize_button, BUTTON_SIZE, BUTTON_SIZE);
+    wlr_scene_node_set_position(&toplevel->ssd.maximize_button->node, maximize_button_x, button_y);
+    wlr_scene_node_set_enabled(&toplevel->ssd.maximize_button->node, true);
+
+// Minimize button (to the left of maximize) - NEW
+    int minimize_button_x = maximize_button_x - BUTTON_PADDING - BUTTON_SIZE;
+    wlr_scene_rect_set_size(toplevel->ssd.minimize_button, BUTTON_SIZE, BUTTON_SIZE);
+    wlr_scene_node_set_position(&toplevel->ssd.minimize_button->node, minimize_button_x, button_y);
+    wlr_scene_node_set_enabled(&toplevel->ssd.minimize_button->node, true);
+
+
+    // --- CLIENT CONTENT POSITIONING ---
     wlr_scene_node_set_position(&toplevel->client_xdg_scene_tree->node, BORDER_WIDTH, TITLE_BAR_HEIGHT);
+
+    // --- Z-ORDERING (THE REAL FIX) ---
+    // 1. Lower the client content to the bottom of the stack. It will be drawn first.
+    wlr_scene_node_lower_to_bottom(&toplevel->client_xdg_scene_tree->node);
+    
+    // 2. Now, raise the buttons so they are drawn on top of everything else (including the title bar).
+    wlr_scene_node_raise_to_top(&toplevel->ssd.minimize_button->node);
+    wlr_scene_node_raise_to_top(&toplevel->ssd.maximize_button->node);
+    wlr_scene_node_raise_to_top(&toplevel->ssd.close_button->node);
 }
 /* Updated server_new_output without damage */
 
@@ -5619,9 +5749,9 @@ static void xdg_toplevel_request_resize(struct wl_listener *listener, void *data
 
 static void xdg_toplevel_request_maximize(struct wl_listener *listener, void *data) {
     struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, request_maximize);
-    if (toplevel->xdg_toplevel->base->initialized) {
-        wlr_xdg_surface_schedule_configure(toplevel->xdg_toplevel->base);
-    }
+    // The event tells us the new desired state.
+    bool new_maximized_state = toplevel->xdg_toplevel->requested.maximized;
+    toggle_maximize_toplevel(toplevel, new_maximized_state);
 }
 
 static void xdg_toplevel_request_fullscreen(struct wl_listener *listener, void *data) {
@@ -5685,10 +5815,15 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
         wl_resource_post_no_memory(xdg_toplevel->resource);
         return;
     }
-    toplevel->scene_tree->node.data = toplevel;
+   toplevel->scene_tree->node.data = toplevel;
 
+   
+
+    // Create the client content tree as a sibling to the decoration tree
     toplevel->client_xdg_scene_tree = wlr_scene_xdg_surface_create(
         toplevel->scene_tree, xdg_toplevel->base);
+
+   
     if (!toplevel->client_xdg_scene_tree) {
         wlr_log(WLR_ERROR, "Failed to create client_xdg_scene_tree for %p", (void*)xdg_toplevel);
         wlr_scene_node_destroy(&toplevel->scene_tree->node);
@@ -5973,19 +6108,37 @@ void ensure_ssd_enabled(struct tinywl_toplevel *toplevel) {
  float title_bar_color[4] = {0.0f, 0.0f, 0.8f, 0.7f};
     float border_color[4]    = {0.1f, 0.1f, 0.1f, 0.7f};
 
-    // Pass the toplevel pointer to the helper function
-    toplevel->ssd.title_bar    = create_decoration_rect(toplevel->scene_tree, toplevel, 0, 0, 0, 0, title_bar_color);
-    toplevel->ssd.border_left  = create_decoration_rect(toplevel->scene_tree, toplevel, 0, 0, 0, 0, border_color);
-    toplevel->ssd.border_right = create_decoration_rect(toplevel->scene_tree, toplevel, 0, 0, 0, 0, border_color);
-    toplevel->ssd.border_bottom= create_decoration_rect(toplevel->scene_tree, toplevel, 0, 0, 0, 0, border_color);
+     // NEW: Define button colors
+     float minimize_button_color[4] = {1.0f, 1.0f, 0.6f, 1.0f}; // Yellow
+     float maximize_button_color[4] = {0.6f, 1.0f, 0.6f, 1.0f}; // Green
+     float close_button_color[4] = {1.0f, 0.6f, 0.6f, 1.0f}; // Red
+   
+    
+// NEW: Create the button rectangles and associate them with the toplevel
+   // Pass the toplevel pointer to the helper function
+    toplevel->ssd.title_bar       = create_decoration_rect(toplevel->scene_tree, toplevel, 0, 0, 0, 0, title_bar_color);
+    toplevel->ssd.border_left     = create_decoration_rect(toplevel->scene_tree, toplevel, 0, 0, 0, 0, border_color);
+    toplevel->ssd.border_right    = create_decoration_rect(toplevel->scene_tree, toplevel, 0, 0, 0, 0, border_color);
+    toplevel->ssd.border_bottom   = create_decoration_rect(toplevel->scene_tree, toplevel, 0, 0, 0, 0, border_color);
+    toplevel->ssd.minimize_button = create_decoration_rect(toplevel->scene_tree, toplevel, 0, 0, 0, 0, minimize_button_color); 
+    toplevel->ssd.close_button    = create_decoration_rect(toplevel->scene_tree, toplevel, 0, 0, 0, 0, close_button_color);
+    toplevel->ssd.maximize_button = create_decoration_rect(toplevel->scene_tree, toplevel, 0, 0, 0, 0, maximize_button_color);
+
+    // MODIFIED: Add minimize_button to the check
     if (!toplevel->ssd.title_bar || !toplevel->ssd.border_left ||
-        !toplevel->ssd.border_right || !toplevel->ssd.border_bottom) {
+        !toplevel->ssd.border_right || !toplevel->ssd.border_bottom ||
+        !toplevel->ssd.minimize_button || !toplevel->ssd.maximize_button || !toplevel->ssd.close_button) {
+        
         wlr_log(WLR_ERROR, "[SSD_HELPER] FAILED TO CREATE SOME SSD ELEMENTS for %s", title);
         // Clean up any successfully created ones
         if (toplevel->ssd.title_bar) { wlr_scene_node_destroy(&toplevel->ssd.title_bar->node); toplevel->ssd.title_bar = NULL; }
         if (toplevel->ssd.border_left) { wlr_scene_node_destroy(&toplevel->ssd.border_left->node); toplevel->ssd.border_left = NULL; }
         if (toplevel->ssd.border_right) { wlr_scene_node_destroy(&toplevel->ssd.border_right->node); toplevel->ssd.border_right = NULL; }
         if (toplevel->ssd.border_bottom) { wlr_scene_node_destroy(&toplevel->ssd.border_bottom->node); toplevel->ssd.border_bottom = NULL; }
+        if (toplevel->ssd.minimize_button) { wlr_scene_node_destroy(&toplevel->ssd.minimize_button->node); toplevel->ssd.minimize_button = NULL; } // NEW
+        if (toplevel->ssd.maximize_button) { wlr_scene_node_destroy(&toplevel->ssd.maximize_button->node); toplevel->ssd.maximize_button = NULL; }
+        if (toplevel->ssd.close_button) { wlr_scene_node_destroy(&toplevel->ssd.close_button->node); toplevel->ssd.close_button = NULL; }
+        
         toplevel->ssd.enabled = false;
     } else {
         toplevel->ssd.enabled = true;
@@ -10756,6 +10909,70 @@ const char *genie_vertex_shader_src =
     "    // Flip the Y-coordinate as texture origin is often top-left.\n"
     "    frag_color = texture(u_texture, vec2(v_texcoord.x, 1.0 - v_texcoord.y));\n"
     "}\n";
+
+// No changes needed for the vertex shader
+static const char *solid_vertex_shader_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "layout(location = 0) in vec2 position;\n"
+    "uniform mat3 mvp;\n"
+    "out vec2 v_uv;\n"
+    "void main() {\n"
+    "    v_uv = position;\n"
+    "    gl_Position = vec4((mvp * vec3(position, 1.0)).xy, 0.0, 1.0);\n"
+    "}\n";
+
+// *** MODIFIED FRAGMENT SHADER ***
+static const char *solid_fragment_shader_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "uniform vec4 u_color;\n"
+    "uniform float time;\n"
+    "in vec2 v_uv;\n"
+    "out vec4 frag_color;\n"
+    "void main() {\n"
+    "    // Center the UV coordinates to [-0.5, 0.5]\n"
+    "    vec2 uv = v_uv - 0.5;\n"
+    "    \n"
+    "    // Distance from the center\n"
+    "    float dist = length(uv);\n"
+    "\n"
+    "    // --- Circle Mask ---\n"
+    "    // Define the circle's radius. 0.5 will touch the edges of the quad.\n"
+    "    float radius = 0.35;\n"
+    "    // Create a smooth mask that is 1.0 inside the circle and fades to 0.0 at the edge.\n"
+    "    // This provides a clean, anti-aliased cutoff.\n"
+    "    float circle_mask = 1.0 - smoothstep(radius - 0.01, radius, dist);\n"
+    "\n"
+    "    // If we are outside the circle, make the fragment transparent and exit.\n"
+    "    if (circle_mask <= 0.0) {\n"
+    "        discard; // More efficient than returning a transparent color\n"
+    "    }\n"
+    "    \n"
+    "    // Create spiral angle\n"
+    "    float angle = atan(uv.y, uv.x) + dist * 5.0 + time * 3.0;\n"
+    "    \n"
+    "    // Create star shape\n"
+    "    float star = sin(angle * 5.0) * 0.5 + 0.5;\n"
+    "    star = pow(star, 2.0);\n"
+    "    \n"
+    "    // The original 'radial' falloff is now replaced by our sharp circle_mask\n"
+    "    star *= circle_mask;\n"
+    "    \n"
+    "    // Pulsate\n"
+    "    float pulse = 0.8 + 0.2 * sin(time * 4.0);\n"
+    "    star *= pulse;\n"
+    "    \n"
+    "    // Glow\n"
+    "    float glow = exp(-dist * 3.0) * 1.5;\n"
+    "    float intensity = star + glow;\n"
+    "    \n"
+    "    // Apply the circle mask to the final intensity as well\n"
+    "    intensity *= circle_mask;\n"
+    "\n"
+    "    vec3 final_color = u_color.rgb * intensity;\n"
+    "    frag_color = vec4(final_color, u_color.a * intensity);\n"
+    "}\n";
     setenv("MESA_VK_VERSION_OVERRIDE", "1.2", 1);
     setenv("MESA_LOADER_DRIVER_OVERRIDE", "zink", 1);
    // setenv("GALLIUM_DRIVER", "zink", 1);
@@ -11091,6 +11308,24 @@ if (!create_generic_shader_program(server.renderer, "CubeBackgroundShader",
                                  cube_bg_uniforms,
                                  sizeof(cube_bg_uniforms) / sizeof(cube_bg_uniforms[0]))) {
     wlr_log(WLR_ERROR, "Failed to create cube background shader program.");
+    server_destroy(&server);
+    return 1;
+}
+
+
+// In main(), with your other shader creations
+struct shader_uniform_spec solid_uniforms[] = {
+    {"mvp", &server.solid_shader_mvp_loc},
+    {"u_color", &server.solid_shader_color_loc},
+    {"time", &server.solid_shader_time_loc}, 
+};
+if (!create_generic_shader_program(server.renderer, "SolidColorShader",
+                                 solid_vertex_shader_src,
+                                 solid_fragment_shader_src,
+                                 &server.solid_shader_program,
+                                 solid_uniforms,
+                                 sizeof(solid_uniforms) / sizeof(solid_uniforms[0]))) {
+    wlr_log(WLR_ERROR, "Failed to create solid color shader program.");
     server_destroy(&server);
     return 1;
 }
