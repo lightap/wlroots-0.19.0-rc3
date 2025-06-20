@@ -1935,7 +1935,9 @@ static struct tinywl_toplevel *find_toplevel_at(struct tinywl_server *server,
         if (!toplevel->scene_tree->node.enabled) {
             continue;
         }
-        
+         if (toplevel->minimized || toplevel->is_minimizing) {
+            continue;
+        }
         // Condition 3: Must be on the currently active desktop.
         // This is the key logic that makes windows on other desktops non-interactive.
         if (toplevel->desktop != server->current_desktop) {
