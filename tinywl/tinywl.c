@@ -1412,7 +1412,6 @@ static void toggle_maximize_toplevel(struct tinywl_toplevel *toplevel, bool maxi
         }
     }
 }
-
 static void toggle_minimize_toplevel(struct tinywl_toplevel *toplevel, bool minimized) {
     if (toplevel->minimized == minimized) {
         if (!minimized) focus_toplevel(toplevel);
@@ -1422,20 +1421,21 @@ static void toggle_minimize_toplevel(struct tinywl_toplevel *toplevel, bool mini
     wlr_log(WLR_INFO, "Toggling minimize for '%s' to %d",
             toplevel->xdg_toplevel->title, minimized);
 
-    // NEW: Hide decorations when starting the animation.
     set_decorations_visible(toplevel, false);
 
-    // Set up animation parameters
     toplevel->is_minimizing = true;
     toplevel->minimizing_to_dock = minimized;
     toplevel->minimize_start_time = get_monotonic_time_seconds_as_float();
     toplevel->minimize_duration = 2.5f;
     toplevel->maximize_duration = 1.5f;
+
     if (minimized) { // We are minimizing TO the dock
-        toplevel->minimized = false; // Not officially minimized until animation ends
+        toplevel->minimized = false; 
         toplevel->minimize_start_geom = toplevel->restored_geom;
         toplevel->minimize_target_geom = toplevel->panel_preview_box;
         
+        // *** THE FIX IS HERE: Keep the node enabled for the animation. ***
+        // By keeping it enabled, scene_buffer_iterator will continue to be called for it.
         wlr_scene_node_set_enabled(&toplevel->scene_tree->node, true);
         
         if (toplevel->server->seat->keyboard_state.focused_surface == toplevel->xdg_toplevel->base->surface) {
@@ -5525,7 +5525,6 @@ static struct wlr_scene_rect *create_decoration_rect(
 
 
 
-
 static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
     struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, commit);
     struct wlr_xdg_toplevel *xdg_toplevel = toplevel->xdg_toplevel;
@@ -5593,22 +5592,35 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
         wlr_xdg_surface_schedule_configure(xdg_surface);
     }
 
-    // Caching and redrawing logic remains the same.
+    // Caching and redrawing logic.
     if (surface->current.buffer) {
+        // A new buffer has been committed. We need to update our cached texture
+        // if it's different from the last one.
         if (!(toplevel->cached_texture && toplevel->last_commit_seq == surface->current.seq)) {
-            if (toplevel->cached_texture) wlr_texture_destroy(toplevel->cached_texture);
+            if (toplevel->cached_texture) {
+                wlr_texture_destroy(toplevel->cached_texture);
+            }
             toplevel->cached_texture = wlr_texture_from_buffer(server->renderer, surface->current.buffer);
             toplevel->last_commit_seq = surface->current.seq;
         }
     } else {
-        if (toplevel->cached_texture) {
+        // The client committed a NULL buffer. This often happens when a window is
+        // hidden or minimized.
+
+        // --- THE FIX ---
+        // We only destroy the cached texture if the window is NOT minimized.
+        // If it is minimized or in the process of minimizing, we want to keep
+        // the last valid frame to use as its preview texture.
+        if (toplevel->cached_texture && !toplevel->minimized && !toplevel->is_minimizing) {
+            wlr_log(WLR_INFO, "[COMMIT:%s] Surface committed with NULL buffer and is not minimized. Destroying cached texture.", title);
             wlr_texture_destroy(toplevel->cached_texture);
             toplevel->cached_texture = NULL;
         }
+        
+        // We still update the sequence number so we don't try to re-use an old
+        // texture if a new buffer eventually appears.
         toplevel->last_commit_seq = surface->current.seq;
     }
-
-    
 
    if (surface->mapped && !toplevel->minimized && !toplevel->is_minimizing) {
         toplevel->restored_geom.x = toplevel->scene_tree->node.x;
@@ -5627,21 +5639,6 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
         }
     }
 
-    // Caching and redrawing logic remains the same.
-    if (surface->current.buffer) {
-        if (!(toplevel->cached_texture && toplevel->last_commit_seq == surface->current.seq)) {
-            if (toplevel->cached_texture) wlr_texture_destroy(toplevel->cached_texture);
-            toplevel->cached_texture = wlr_texture_from_buffer(server->renderer, surface->current.buffer);
-            toplevel->last_commit_seq = surface->current.seq;
-        }
-    } else {
-        if (toplevel->cached_texture) {
-            wlr_texture_destroy(toplevel->cached_texture);
-            toplevel->cached_texture = NULL;
-        }
-        toplevel->last_commit_seq = surface->current.seq;
-    }
-
     if (surface->mapped) {
         struct tinywl_output *output_iter;
         wl_list_for_each(output_iter, &server->outputs, link) {
@@ -5651,7 +5648,6 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
         }
     }
 }
-
 static void decoration_handle_destroy(struct wl_listener *listener, void *data) {
     struct tinywl_toplevel *toplevel =
         wl_container_of(listener, toplevel, decoration_destroy_listener);
