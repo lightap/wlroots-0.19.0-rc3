@@ -314,7 +314,16 @@ struct desktop_fb {
 int DestopGridSize ; // 2x2 grid for 4 desktops
 float GLOBAL_vertical_offset;
 
-float dockX_align =10;
+float dockX_align =10.0;
+
+// Add near the top of the file, with other struct definitions
+#define MAX_DOCK_ICONS 10
+
+struct dock_icon {
+    struct wlr_box box;         // On-screen geometry, updated every frame
+    const char *app_command;    // The base command to run, e.g., "alacritty"
+    GLuint texture_id;          // Texture for this icon
+};
 
 struct tinywl_server {
     struct wl_display *wl_display;
@@ -623,6 +632,9 @@ GLuint intermediate_rbo[16];
     GLint solid_shader_color_loc;
     GLint solid_shader_time_loc;
 
+    struct dock_icon dock_icons[MAX_DOCK_ICONS];
+    int num_dock_icons;
+    const char *socket_name;
 
     bool dock_anim_active;
     bool dock_mouse_at_edge; // Latch to prevent re-triggering
@@ -842,6 +854,27 @@ static void update_decoration_geometry(struct tinywl_toplevel *toplevel);
  void update_compositor_state(struct tinywl_server *server);
  static void begin_interactive(struct tinywl_toplevel *toplevel, enum tinywl_cursor_mode mode, uint32_t edges);
 static void set_decorations_visible(struct tinywl_toplevel *toplevel, bool visible);
+
+// Add this new function with other function implementations
+static void launch_application(struct tinywl_server *server, const char *command) {
+    if (fork() == 0) {
+        // Child process
+        setsid(); // Create a new session to detach from the compositor
+        
+        // Set environment variables for the new process
+        setenv("WAYLAND_DISPLAY", server->socket_name, 1);
+        // This command is an example; your original code had this, so I've kept it.
+        // It forces software rendering, which can be useful for certain apps under a custom compositor.
+        setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+        
+        // Execute the command using the shell
+        execl("/bin/sh", "/bin/sh", "-c", command, (void *)NULL);
+        
+        // If execl returns, it's an error
+        wlr_log(WLR_ERROR, "execl failed for command: %s", command);
+        _exit(127); // Exit child process
+    }
+}
  // Function to compile a shader
 static GLuint compile_shader(GLenum type, const char *source) {
     GLuint shader = glCreateShader(type);
@@ -2290,6 +2323,25 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
     struct wlr_pointer_button_event *event = data;
     struct wlr_seat *seat = server->seat;
 
+
+ // NEW: Check for dock icon clicks first
+    if (event->button == BTN_LEFT && event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
+        for (int i = 0; i < server->num_dock_icons; i++) {
+            // Check if the cursor's current position is inside the icon's box
+            if (wlr_box_contains_point(&server->dock_icons[i].box, server->cursor->x, server->cursor->y)) {
+                wlr_log(WLR_INFO, "Clicked on dock icon %d, launching: %s", i, server->dock_icons[i].app_command);
+                
+                // Call the new launch function
+                launch_application(server, server->dock_icons[i].app_command);
+                
+                // Notify the seat that a button was pressed and then return,
+                // as this event has been fully handled by the compositor.
+                wlr_seat_pointer_notify_button(seat, event->time_msec, event->button, event->state);
+                return;
+            }
+        }
+    }
+
     // --- 1. Check for clicks inside the panel area first ---
     if (server->top_panel_node && server->top_panel_node->enabled) {
         struct wlr_scene_rect *panel_srect = wlr_scene_rect_from_node(server->top_panel_node);
@@ -3524,8 +3576,7 @@ float p_box_scale_x, p_box_scale_y , p_box_translate_x,  p_box_translate_y;
 
 // Modified rendering code
 {
-    // Load textures (do this once, preferably during initialization)
-    static GLuint textures[10] = {0};
+  static GLuint textures[10] = {0};
     static bool textures_loaded = false;
     
     if (!textures_loaded) {
@@ -3537,20 +3588,25 @@ float p_box_scale_x, p_box_scale_y , p_box_translate_x,  p_box_translate_y;
         }
     }
 
+    // 1. **CRITICAL FIX**: Explicitly set the correct shader program for the dock.
+    glUseProgram(server->passthrough_shader_program);
+    
+    // 2. Bind the standard quad VAO.
+    glBindVertexArray(server->quad_vao);
     
     // Define placeholder dimensions and layout
-    float empty_width = 50.0f;
-    float empty_height = 50.0f;
+    float empty_width = 50;
+    float empty_height = 50;
     float empty_x = PANEL_LEFT_MARGIN-dockX_align;
-    int num_placeholders = 10;
-    float placeholder_spacing = 10.0f;
+    int num_placeholders =  server->num_dock_icons;;
+    float placeholder_spacing = 10;
 
     // Calculate total content dimensions
     float total_content_height = (num_placeholders * empty_height) + ((num_placeholders - 1) * placeholder_spacing);
     float total_content_width = empty_width; // Single column width
     
     // Calculate dock background dimensions (slightly larger than content)
-    float dock_padding = 15.0f; // Padding around the content
+    float dock_padding = 15; // Padding around the content
     float dock_width = total_content_width + (dock_padding * 2);
     float dock_height = total_content_height + (dock_padding * 2);
     
@@ -3564,12 +3620,12 @@ float p_box_scale_x, p_box_scale_y , p_box_translate_x,  p_box_translate_y;
     // RENDER BACKGROUND PLACEHOLDER (dock-sized empty placeholder)
     {
         float dock_mvp[9];
-        float dock_scale_x = dock_width * (2.0f / output->width);
-        float dock_scale_y = dock_height * (-2.0f / output->height);
+        float dock_scale_x = (float)dock_width * (2.0f / output->width);
+        float dock_scale_y = (float)dock_height * (-2.0f / output->height);
         
         // Fix positioning: use same coordinate system as the placeholders
-        float dock_translate_x = (dock_x / output->width) * 2.0f - 1.0f;
-        float dock_translate_y = (dock_y / output->height) * -2.0f + 1.0f;
+        float dock_translate_x = ((float)dock_x / output->width) * 2.0f - 1.0f;
+        float dock_translate_y = ((float)dock_y / output->height) * -2.0f + 1.0f;
         
         float dock_model_view[] = {
             dock_scale_x, 0.0f, 0.0f,
@@ -3578,7 +3634,7 @@ float p_box_scale_x, p_box_scale_y , p_box_translate_x,  p_box_translate_y;
         };
         memcpy(dock_mvp, dock_model_view, sizeof(dock_mvp));
         
-        glUseProgram(server->passthrough_shader_program);        
+               
         
         if (server->flame_shader_mvp_loc != -1) {
             glUniformMatrix3fv(server->passthrough_shader_mvp_loc, 1, GL_FALSE, dock_mvp);
@@ -3609,30 +3665,38 @@ float p_box_scale_x, p_box_scale_y , p_box_translate_x,  p_box_translate_y;
   
     // RENDER TEXTURED PLACEHOLDERS (existing code, unchanged)
     // Calculate starting Y position to center vertically (reuse the same calculation)
-    for (int i = 0; i < num_placeholders; i++) {
-        float current_x = empty_x;
-        float current_y = start_y + (i * (empty_height + placeholder_spacing));
-        
-        float preview_mvp[9];
-        float p_box_scale_x = empty_width * (2.0f / output->width);
-        float p_box_scale_y = empty_height * (-2.0f / output->height);
-        
-        // Calculate translation for current placeholder position (back to original)
-        float p_box_translate_x = (current_x / output->width) * 2.0f - 1.0f;
-        float p_box_translate_y = (current_y / output->height) * -2.0f + 1.0f;
-        
-        float p_model_view[] = {
-            p_box_scale_x, 0.0f, 0.0f,
-            0.0f, p_box_scale_y, 0.0f,
-            p_box_translate_x, p_box_translate_y, 1.0f
-        };
-        memcpy(preview_mvp, p_model_view, sizeof(preview_mvp));
-        
-        if (server->passthrough_shader_mvp_loc != -1) {
-            glUniformMatrix3fv(server->passthrough_shader_mvp_loc, 1, GL_FALSE, preview_mvp);
-        }
+   for (int i = 0; i < server->num_dock_icons; i++) {
 
-        // Bind the loaded texture instead of unbinding
+
+    
+            float current_x = empty_x;
+            float current_y = start_y + (i * (empty_height + placeholder_spacing));
+
+            // CRITICAL: Update the stored bounding box for this icon for click detection.
+            server->dock_icons[i].box.x = (int)current_x;
+            server->dock_icons[i].box.y = (int)current_y;
+            server->dock_icons[i].box.width = (int)empty_width;
+            server->dock_icons[i].box.height = (int)empty_height;
+
+            float preview_mvp[9];
+            float p_box_scale_x = empty_width * (2.0f / output->width);
+            float p_box_scale_y = empty_height * (-2.0f / output->height);
+            float p_box_translate_x = (current_x / output->width) * 2.0f - 1.0f;
+            float p_box_translate_y = (current_y / output->height) * -2.0f + 1.0f;
+
+            float p_model_view[] = {
+                p_box_scale_x, 0.0f, 0.0f,
+                0.0f, p_box_scale_y, 0.0f,
+                p_box_translate_x, p_box_translate_y, 1.0f
+            };
+            memcpy(preview_mvp, p_model_view, sizeof(preview_mvp));
+
+            if (server->passthrough_shader_mvp_loc != -1) {
+                glUniformMatrix3fv(server->passthrough_shader_mvp_loc, 1, GL_FALSE, preview_mvp);
+            }
+
+            
+         // Bind the loaded texture instead of unbinding
         glActiveTexture(GL_TEXTURE0);
         if (textures[i] != 0) {
             glBindTexture(GL_TEXTURE_2D, textures[i]);
@@ -3641,23 +3705,16 @@ float p_box_scale_x, p_box_scale_y , p_box_translate_x,  p_box_translate_y;
             glBindTexture(GL_TEXTURE_2D, 0); // Fallback to no texture if loading failed
             wlr_log(WLR_DEBUG, "[PREVIEW:%s] Texture%d.png not loaded, drawing empty placeholder %d", output_name_log, i+1, i);
         }
-        
-        if (server->passthrough_shader_tex_loc != -1) {
-            glUniform1i(server->passthrough_shader_tex_loc, 0);
-        }
+        // Tell the 'u_texture' sampler to use texture unit 0.
+        glUniform1i(server->passthrough_shader_tex_loc, 0);
 
-        if (server->passthrough_shader_time_loc != -1) {
-            glUniform1f(server->passthrough_shader_time_loc, time_sec);
-        }
-        
-        if (server->passthrough_shader_res_loc != -1) {
-            float preview_res[2] = {empty_width, empty_height};
-            glUniform2fv(server->passthrough_shader_res_loc, 1, preview_res);
-        }
+        // Set the other uniforms required by this specific shader.
+        glUniform2f(server->passthrough_shader_res_loc, empty_width, empty_height);
+        glUniform1f(server->passthrough_shader_cornerRadius_loc, 8.0f);
+        glUniform1f(server->passthrough_shader_time_loc, get_monotonic_time_seconds_as_float());
 
-        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
-
-    }
+            glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+        }
     
 }
         }
@@ -11278,6 +11335,8 @@ static const char *solid_fragment_shader_src =
     }
 
     struct tinywl_server server = {0};
+
+
     server.dock_anim_active = true;
     server.dock_mouse_at_edge = false;
     server.dock_anim_duration = 0.8f; 
@@ -11358,7 +11417,7 @@ server.backend = wlr_RDP_backend_create(server.wl_display);
         return 1;
     }
 
-  
+
 
 const char *vendor = (const char *)glGetString(GL_VENDOR);
     const char *renderer = (const char *)glGetString(GL_RENDERER);
@@ -12088,6 +12147,25 @@ desktop_panel(&server);
     }
 
 
+    // NEW: Initialize the dock icons
+server.num_dock_icons = 4; // Set how many icons you want
+server.socket_name = socket; // Store the socket name to pass it to new applications
+
+
+// Define the command and texture for each icon
+server.dock_icons[0].app_command = "WAYLAND_DISPLAY=wayland-1 LIBGL_ALWAYS_SOFTWARE=0 weston-simple-egl";
+//server.dock_icons[0].texture_id = load_texture_from_file("texture1.png");
+
+server.dock_icons[1].app_command = "LIBGL_ALWAYS_SOFTWARE=1 LIBGL_ALWAYS_SOFTWARE=0 alacritty"; // Example: terminal
+//server.dock_icons[1].texture_id = load_texture_from_file("texture2.png");
+
+server.dock_icons[2].app_command = "WAYLAND_DISPLAY=wayland-1 LIBGL_ALWAYS_SOFTWARE=0  kitty"; // Example: browser
+//server.dock_icons[2].texture_id = load_texture_from_file("texture3.png");
+
+server.dock_icons[3].app_command = "WAYLAND_DISPLAY=wayland-1 LIBGL_ALWAYS_SOFTWARE=0 LIBGL_ALWAYS_SOFTWARE=0 gnome-calculator"; // Example: calculator
+//server.dock_icons[3].texture_id = load_texture_from_file("texture4.png");
+
+  
 
     wlr_log(WLR_INFO, "Running Wayland compositor on WAYLAND_DISPLAY=%s", socket);
 
@@ -12099,3 +12177,8 @@ desktop_panel(&server);
     server_destroy(&server);
     return 0;
 }
+
+/////////////////////////////////////////////////////////
+/////////////////////////////////////
+///////////////////////////////
+///////////////////////////////////////////////
