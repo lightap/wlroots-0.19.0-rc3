@@ -1,6 +1,3 @@
-
-
-
 /*Copyright (c) 2025 Andrew Pliatsikas
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of
@@ -3491,7 +3488,6 @@ float p_box_scale_x, p_box_scale_y , p_box_translate_x,  p_box_translate_y;
 
 // Modified rendering code
 {
-    // Load texture1.png (do this once, preferably during initialization)
     // Load textures (do this once, preferably during initialization)
     static GLuint textures[10] = {0};
     static bool textures_loaded = false;
@@ -3504,22 +3500,76 @@ float p_box_scale_x, p_box_scale_y , p_box_translate_x,  p_box_translate_y;
             textures[t] = load_texture_from_file(filename);
         }
     }
-    // Render textured placeholders vertically centered
+
+    // Define placeholder dimensions and layout
     float empty_width = 50.0f;
     float empty_height = 50.0f;
-    float empty_x = PANEL_LEFT_MARGIN;
+    float empty_x = PANEL_LEFT_MARGIN-10;
+    int num_placeholders = 10;
+    float placeholder_spacing = 10.0f;
 
-    // Define how many placeholders to render
-    int num_placeholders = 10; // Adjust as needed
-    float placeholder_spacing = 10.0f; // Space between placeholders
-
-    // Calculate total height needed for all placeholders
+    // Calculate total content dimensions
     float total_content_height = (num_placeholders * empty_height) + ((num_placeholders - 1) * placeholder_spacing);
-
-    // Calculate starting Y position to center vertically (top = 1.0, bottom = -1.0)
-    // Center the content in pixel coordinates, adjusted for NDC
+    float total_content_width = empty_width; // Single column width
+    
+    // Calculate dock background dimensions (slightly larger than content)
+    float dock_padding = 15.0f; // Padding around the content
+    float dock_width = total_content_width + (dock_padding * 2);
+    float dock_height = total_content_height + (dock_padding * 2);
+    
+    // Calculate starting Y position for content (same as texture calculation)
     float start_y = (output->height - total_content_height) / 2.0f;
+    
+    // Calculate dock background position (centered around the content)
+    float dock_x = empty_x - dock_padding;
+    float dock_y = start_y - dock_padding;
 
+    // RENDER BACKGROUND PLACEHOLDER (dock-sized empty placeholder)
+    {
+        float dock_mvp[9];
+        float dock_scale_x = dock_width * (2.0f / output->width);
+        float dock_scale_y = dock_height * (-2.0f / output->height);
+        
+        // Fix positioning: use same coordinate system as the placeholders
+        float dock_translate_x = (dock_x / output->width) * 2.0f - 1.0f;
+        float dock_translate_y = (dock_y / output->height) * -2.0f + 1.0f;
+        
+        float dock_model_view[] = {
+            dock_scale_x, 0.0f, 0.0f,
+            0.0f, dock_scale_y, 0.0f,
+            dock_translate_x, dock_translate_y, 1.0f
+        };
+        memcpy(dock_mvp, dock_model_view, sizeof(dock_mvp));
+glUseProgram(server->passthrough_shader_program);        
+        if (server->flame_shader_mvp_loc != -1) {
+            glUniformMatrix3fv(server->passthrough_shader_mvp_loc, 1, GL_FALSE, dock_mvp);
+        }
+
+        // Render empty background (no texture)
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, 0); // No texture for background
+        
+        if (server->passthrough_shader_tex_loc != -1) {
+            glUniform1i(server->passthrough_shader_tex_loc, 0);
+        }
+
+        if (server->passthrough_shader_time_loc != -1) {
+            glUniform1f(server->passthrough_shader_time_loc, time_sec);
+        }
+        
+        if (server->passthrough_shader_res_loc != -1) {
+            float dock_res[2] = {dock_width, dock_height};
+            glUniform2fv(server->passthrough_shader_res_loc, 1, dock_res);
+        }
+
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+       
+        wlr_log(WLR_DEBUG, "[PREVIEW:%s] Rendered dock background placeholder (%.1fx%.1f) at (%.1f,%.1f)", 
+                output_name_log, dock_width, dock_height, dock_x, dock_y);
+    }
+  
+    // RENDER TEXTURED PLACEHOLDERS (existing code, unchanged)
+    // Calculate starting Y position to center vertically (reuse the same calculation)
     for (int i = 0; i < num_placeholders; i++) {
         float current_x = empty_x;
         float current_y = start_y + (i * (empty_height + placeholder_spacing));
@@ -3528,7 +3578,7 @@ float p_box_scale_x, p_box_scale_y , p_box_translate_x,  p_box_translate_y;
         float p_box_scale_x = empty_width * (2.0f / output->width);
         float p_box_scale_y = empty_height * (-2.0f / output->height);
         
-        // Calculate translation for current placeholder position
+        // Calculate translation for current placeholder position (back to original)
         float p_box_translate_x = (current_x / output->width) * 2.0f - 1.0f;
         float p_box_translate_y = (current_y / output->height) * -2.0f + 1.0f;
         
@@ -3539,35 +3589,37 @@ float p_box_scale_x, p_box_scale_y , p_box_translate_x,  p_box_translate_y;
         };
         memcpy(preview_mvp, p_model_view, sizeof(preview_mvp));
         
-        if (server->flame_shader_mvp_loc != -1) {
-            glUniformMatrix3fv(server->flame_shader_mvp_loc, 1, GL_FALSE, preview_mvp);
+        if (server->passthrough_shader_mvp_loc != -1) {
+            glUniformMatrix3fv(server->passthrough_shader_mvp_loc, 1, GL_FALSE, preview_mvp);
         }
 
         // Bind the loaded texture instead of unbinding
         glActiveTexture(GL_TEXTURE0);
         if (textures[i] != 0) {
             glBindTexture(GL_TEXTURE_2D, textures[i]);
-            wlr_log(WLR_DEBUG, "[PREVIEW:%s] Using texture1.png for placeholder %d", output_name_log, i);
+            wlr_log(WLR_DEBUG, "[PREVIEW:%s] Using texture%d.png for placeholder %d", output_name_log, i+1, i);
         } else {
             glBindTexture(GL_TEXTURE_2D, 0); // Fallback to no texture if loading failed
-            wlr_log(WLR_DEBUG, "[PREVIEW:%s] Texture1.png not loaded, drawing empty placeholder %d", output_name_log, i);
+            wlr_log(WLR_DEBUG, "[PREVIEW:%s] Texture%d.png not loaded, drawing empty placeholder %d", output_name_log, i+1, i);
         }
         
-        if (server->flame_shader_tex_loc != -1) {
-            glUniform1i(server->flame_shader_tex_loc, 0);
+        if (server->passthrough_shader_tex_loc != -1) {
+            glUniform1i(server->passthrough_shader_tex_loc, 0);
         }
 
-        if (server->flame_shader_time_loc != -1) {
-            glUniform1f(server->flame_shader_time_loc, time_sec);
+        if (server->passthrough_shader_time_loc != -1) {
+            glUniform1f(server->passthrough_shader_time_loc, time_sec);
         }
         
-        if (server->flame_shader_res_loc != -1) {
+        if (server->passthrough_shader_res_loc != -1) {
             float preview_res[2] = {empty_width, empty_height};
-            glUniform2fv(server->flame_shader_res_loc, 1, preview_res);
+            glUniform2fv(server->passthrough_shader_res_loc, 1, preview_res);
         }
 
         glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+
     }
+    
 }
         }
     } else if (toplevel) {
