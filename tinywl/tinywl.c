@@ -1,3 +1,6 @@
+
+
+
 /*Copyright (c) 2025 Andrew Pliatsikas
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of
@@ -19,6 +22,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 #include <wlr/types/wlr_xdg_shell.h>
 #include <assert.h>
 #include <getopt.h>
@@ -1413,7 +1418,7 @@ static void toggle_maximize_toplevel(struct tinywl_toplevel *toplevel, bool maxi
     }
 }
 static void toggle_minimize_toplevel(struct tinywl_toplevel *toplevel, bool minimized) {
-    if (toplevel->minimized == minimized) {
+    if (toplevel->minimized == minimized && !toplevel->is_minimizing) {
         if (!minimized) focus_toplevel(toplevel);
         return;
     }
@@ -1427,25 +1432,27 @@ static void toggle_minimize_toplevel(struct tinywl_toplevel *toplevel, bool mini
     toplevel->minimizing_to_dock = minimized;
     toplevel->minimize_start_time = get_monotonic_time_seconds_as_float();
     toplevel->minimize_duration = 2.5f;
-    toplevel->maximize_duration = 1.5f;
 
-    if (minimized) { // We are minimizing TO the dock
-        toplevel->minimized = false; 
+    if (minimized) { // Minimizing TO the dock
+        toplevel->minimized = false;
         toplevel->minimize_start_geom = toplevel->restored_geom;
         toplevel->minimize_target_geom = toplevel->panel_preview_box;
-        
-        // *** THE FIX IS HERE: Keep the node enabled for the animation. ***
-        // By keeping it enabled, scene_buffer_iterator will continue to be called for it.
         wlr_scene_node_set_enabled(&toplevel->scene_tree->node, true);
-        
         if (toplevel->server->seat->keyboard_state.focused_surface == toplevel->xdg_toplevel->base->surface) {
             wlr_seat_keyboard_clear_focus(toplevel->server->seat);
         }
-    } else { // We are restoring FROM the dock
+    } else { // Restoring FROM the dock
         toplevel->minimized = false;
         toplevel->minimize_start_geom = toplevel->panel_preview_box;
         toplevel->minimize_target_geom = toplevel->restored_geom;
         wlr_scene_node_set_enabled(&toplevel->scene_tree->node, true);
+
+        // *** THE FIX - PART 1 ***
+        // When restoring, we must re-enable the client's content so it becomes visible.
+        if (toplevel->client_xdg_scene_tree) {
+            wlr_scene_node_set_enabled(&toplevel->client_xdg_scene_tree->node, true);
+        }
+        
         focus_toplevel(toplevel);
     }
 
@@ -2665,6 +2672,38 @@ static struct wlr_texture *get_cached_texture(struct tinywl_toplevel *toplevel) 
     return NULL;
 }
 
+ // Function to load texture from file (you'll need to implement or include this)
+GLuint load_texture_from_file(const char* filename) {
+    GLuint texture_id;
+    glGenTextures(1, &texture_id);
+    glBindTexture(GL_TEXTURE_2D, texture_id);
+    
+    // Set texture parameters
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    
+    // You'll need to implement image loading here using a library like stb_image
+    // This is a placeholder - replace with actual image loading code
+    int width, height, channels;
+    unsigned char* data = stbi_load(filename, &width, &height, &channels, 0);
+    
+    if (data) {
+        GLenum format = (channels == 4) ? GL_RGBA : GL_RGB;
+        glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0, format, GL_UNSIGNED_BYTE, data);
+        glGenerateMipmap(GL_TEXTURE_2D);
+        stbi_image_free(data);
+        wlr_log(WLR_INFO, "Loaded texture: %s (%dx%d, %d channels)", filename, width, height, channels);
+    } else {
+        wlr_log(WLR_ERROR, "Failed to load texture: %s", filename);
+        glDeleteTextures(1, &texture_id);
+        return 0;
+    }
+    
+    return texture_id;
+}
+
 static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
                                  int sx, int sy,
                                  void *user_data) {
@@ -3360,6 +3399,7 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
     wlr_log(WLR_DEBUG, "[DEBUG:%s] Drew main window for '%s'", output_name_log, tl_title_for_log);
 
+float p_box_scale_x, p_box_scale_y , p_box_translate_x,  p_box_translate_y;
     // Preview rendering
     if (toplevel && server->top_panel_node && server->top_panel_node->enabled) {
         struct wlr_scene_rect *panel_srect = wlr_scene_rect_from_node(server->top_panel_node);
@@ -3372,7 +3412,7 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
             float preview_y_padding = PREVIEW_PADDING;
             float preview_height = (float)panel_srect->height - 2.0f * preview_y_padding;
             
-            int desktop_window_count = 0;
+            int desktop_window_count = 10;
             struct tinywl_toplevel *iter_tl;
             wl_list_for_each(iter_tl, &server->toplevels, link) {
                 if (iter_tl->desktop == rdata->desktop_index) desktop_window_count++;
@@ -3413,11 +3453,11 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
 
             if (preview_box.width > 0 && preview_box.height > 0) {
                 float preview_mvp[9];
-                float p_box_scale_x = (float)preview_box.width * (2.0f / output->width);
-                float p_box_scale_y = (float)preview_box.height * (-2.0f / output->height);
-                float p_box_translate_x = ((float)preview_box.x / output->width) * 2.0f - 1.0f;
-                float p_box_translate_y = ((float)preview_box.y / output->height) * -2.0f + 1.0f;
-                float p_model_view[] = {
+                 p_box_scale_x = (float)preview_box.width * (2.0f / output->width);
+                 p_box_scale_y = (float)preview_box.height * (-2.0f / output->height);
+                 p_box_translate_x = ((float)preview_box.x / output->width) * 2.0f - 1.0f;
+                 p_box_translate_y = ((float)preview_box.y / output->height) * -2.0f + 1.0f;
+                float  p_model_view[] = {
                     p_box_scale_x, 0.0f, 0.0f,
                     0.0f, p_box_scale_y, 0.0f,
                     p_box_translate_x, p_box_translate_y, 1.0f
@@ -3447,6 +3487,88 @@ static void scene_buffer_iterator(struct wlr_scene_buffer *scene_buffer,
                 glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
                 wlr_log(WLR_DEBUG, "[PREVIEW:%s] Drew preview for %s", output_name_log, tl_title_for_log);
             }
+
+
+// Modified rendering code
+{
+    // Load texture1.png (do this once, preferably during initialization)
+    // Load textures (do this once, preferably during initialization)
+    static GLuint textures[10] = {0};
+    static bool textures_loaded = false;
+    
+    if (!textures_loaded) {
+        textures_loaded = true;
+        for (int t = 0; t < 10; t++) {
+            char filename[32];
+            snprintf(filename, sizeof(filename), "texture%d.png", t + 1);
+            textures[t] = load_texture_from_file(filename);
+        }
+    }
+    // Render textured placeholders vertically centered
+    float empty_width = 50.0f;
+    float empty_height = 50.0f;
+    float empty_x = PANEL_LEFT_MARGIN;
+
+    // Define how many placeholders to render
+    int num_placeholders = 10; // Adjust as needed
+    float placeholder_spacing = 10.0f; // Space between placeholders
+
+    // Calculate total height needed for all placeholders
+    float total_content_height = (num_placeholders * empty_height) + ((num_placeholders - 1) * placeholder_spacing);
+
+    // Calculate starting Y position to center vertically (top = 1.0, bottom = -1.0)
+    // Center the content in pixel coordinates, adjusted for NDC
+    float start_y = (output->height - total_content_height) / 2.0f;
+
+    for (int i = 0; i < num_placeholders; i++) {
+        float current_x = empty_x;
+        float current_y = start_y + (i * (empty_height + placeholder_spacing));
+        
+        float preview_mvp[9];
+        float p_box_scale_x = empty_width * (2.0f / output->width);
+        float p_box_scale_y = empty_height * (-2.0f / output->height);
+        
+        // Calculate translation for current placeholder position
+        float p_box_translate_x = (current_x / output->width) * 2.0f - 1.0f;
+        float p_box_translate_y = (current_y / output->height) * -2.0f + 1.0f;
+        
+        float p_model_view[] = {
+            p_box_scale_x, 0.0f, 0.0f,
+            0.0f, p_box_scale_y, 0.0f,
+            p_box_translate_x, p_box_translate_y, 1.0f
+        };
+        memcpy(preview_mvp, p_model_view, sizeof(preview_mvp));
+        
+        if (server->flame_shader_mvp_loc != -1) {
+            glUniformMatrix3fv(server->flame_shader_mvp_loc, 1, GL_FALSE, preview_mvp);
+        }
+
+        // Bind the loaded texture instead of unbinding
+        glActiveTexture(GL_TEXTURE0);
+        if (textures[i] != 0) {
+            glBindTexture(GL_TEXTURE_2D, textures[i]);
+            wlr_log(WLR_DEBUG, "[PREVIEW:%s] Using texture1.png for placeholder %d", output_name_log, i);
+        } else {
+            glBindTexture(GL_TEXTURE_2D, 0); // Fallback to no texture if loading failed
+            wlr_log(WLR_DEBUG, "[PREVIEW:%s] Texture1.png not loaded, drawing empty placeholder %d", output_name_log, i);
+        }
+        
+        if (server->flame_shader_tex_loc != -1) {
+            glUniform1i(server->flame_shader_tex_loc, 0);
+        }
+
+        if (server->flame_shader_time_loc != -1) {
+            glUniform1f(server->flame_shader_time_loc, time_sec);
+        }
+        
+        if (server->flame_shader_res_loc != -1) {
+            float preview_res[2] = {empty_width, empty_height};
+            glUniform2fv(server->flame_shader_res_loc, 1, preview_res);
+        }
+
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+    }
+}
         }
     } else if (toplevel) {
         toplevel->panel_preview_box = (struct wlr_box){0, 0, 0, 0};
@@ -5596,8 +5718,7 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
 
     // Caching and redrawing logic.
     if (surface->current.buffer) {
-        // A new buffer has been committed. We need to update our cached texture
-        // if it's different from the last one.
+        // A new, valid buffer was committed. Update the cache.
         if (!(toplevel->cached_texture && toplevel->last_commit_seq == surface->current.seq)) {
             if (toplevel->cached_texture) {
                 wlr_texture_destroy(toplevel->cached_texture);
@@ -5606,24 +5727,16 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
             toplevel->last_commit_seq = surface->current.seq;
         }
     } else {
-        // The client committed a NULL buffer. This often happens when a window is
-        // hidden or minimized.
-
-        // --- THE FIX ---
-        // We only destroy the cached texture if the window is NOT minimized.
-        // If it is minimized or in the process of minimizing, we want to keep
-        // the last valid frame to use as its preview texture.
+        // A NULL buffer was committed. This happens on minimize.
+        // *** THE FIX - PART 2 ***
+        // We only destroy the texture if the window is neither minimized nor in the process of minimizing.
         if (toplevel->cached_texture && !toplevel->minimized && !toplevel->is_minimizing) {
-            wlr_log(WLR_INFO, "[COMMIT:%s] Surface committed with NULL buffer and is not minimized. Destroying cached texture.", title);
+            wlr_log(WLR_INFO, "[COMMIT:%s] Surface has NULL buffer and is not minimized/minimizing. Destroying cached texture.", title);
             wlr_texture_destroy(toplevel->cached_texture);
             toplevel->cached_texture = NULL;
         }
-        
-        // We still update the sequence number so we don't try to re-use an old
-        // texture if a new buffer eventually appears.
         toplevel->last_commit_seq = surface->current.seq;
     }
-
    if (surface->mapped && !toplevel->minimized && !toplevel->is_minimizing) {
         toplevel->restored_geom.x = toplevel->scene_tree->node.x;
         toplevel->restored_geom.y = toplevel->scene_tree->node.y;
