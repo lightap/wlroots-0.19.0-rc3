@@ -314,6 +314,8 @@ struct desktop_fb {
 int DestopGridSize ; // 2x2 grid for 4 desktops
 float GLOBAL_vertical_offset;
 
+float dockX_align =10;
+
 struct tinywl_server {
     struct wl_display *wl_display;
     struct wlr_backend *backend;
@@ -620,6 +622,14 @@ GLuint intermediate_rbo[16];
     GLint solid_shader_mvp_loc;
     GLint solid_shader_color_loc;
     GLint solid_shader_time_loc;
+
+
+    bool dock_anim_active;
+    bool dock_mouse_at_edge; // Latch to prevent re-triggering
+    float dock_anim_start_value;
+    float dock_anim_target_value;
+    float dock_anim_start_time;
+    float dock_anim_duration;
 };
 
 static float current_rotation = 0.0f;
@@ -2202,6 +2212,31 @@ static void ensure_popup_responsiveness(struct tinywl_server *server, struct wlr
 /////////////////////////////////////////////////////////////
 // Replace this function
 static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
+    /* NEW: Dock animation trigger logic */
+    if (server->cursor->x <= 0 && !server->dock_mouse_at_edge) {
+        // Mouse just hit the left edge, and the animation isn't already running
+        server->dock_mouse_at_edge = true; // Set the latch
+
+        // Start a new animation
+        server->dock_anim_active = true;
+        server->dock_anim_start_time = get_monotonic_time_seconds_as_float();
+        server->dock_anim_start_value = dockX_align;
+
+        // Toggle the target value
+        if (server->dock_anim_target_value == 90.0f) {
+            server->dock_anim_target_value = 10.0f;
+        } else {
+            server->dock_anim_target_value = 90.0f;
+        }
+        wlr_log(WLR_INFO, "Dock animation triggered. Target: %.1f", server->dock_anim_target_value);
+
+    } else if (server->cursor->x > 0) {
+        // Mouse has moved away from the edge, reset the latch
+        server->dock_mouse_at_edge = false;
+    }
+
+
+    /* The rest of the function remains the same */
     if (server->cursor_mode == TINYWL_CURSOR_MOVE) {
         process_cursor_move(server);
         return;
@@ -2214,7 +2249,6 @@ static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
     struct wlr_seat *seat = server->seat;
     struct wlr_surface *surface = NULL;
     
-    // Use our NEW, reliable function
     struct tinywl_toplevel *toplevel = find_toplevel_at(server,
             server->cursor->x, server->cursor->y, &surface, &sx, &sy);
 
@@ -3486,6 +3520,8 @@ float p_box_scale_x, p_box_scale_y , p_box_translate_x,  p_box_translate_y;
             }
 
 
+
+
 // Modified rendering code
 {
     // Load textures (do this once, preferably during initialization)
@@ -3501,10 +3537,11 @@ float p_box_scale_x, p_box_scale_y , p_box_translate_x,  p_box_translate_y;
         }
     }
 
+    
     // Define placeholder dimensions and layout
     float empty_width = 50.0f;
     float empty_height = 50.0f;
-    float empty_x = PANEL_LEFT_MARGIN-10;
+    float empty_x = PANEL_LEFT_MARGIN-dockX_align;
     int num_placeholders = 10;
     float placeholder_spacing = 10.0f;
 
@@ -3540,7 +3577,9 @@ float p_box_scale_x, p_box_scale_y , p_box_translate_x,  p_box_translate_y;
             dock_translate_x, dock_translate_y, 1.0f
         };
         memcpy(dock_mvp, dock_model_view, sizeof(dock_mvp));
-glUseProgram(server->passthrough_shader_program);        
+        
+        glUseProgram(server->passthrough_shader_program);        
+        
         if (server->flame_shader_mvp_loc != -1) {
             glUniformMatrix3fv(server->passthrough_shader_mvp_loc, 1, GL_FALSE, dock_mvp);
         }
@@ -4795,6 +4834,26 @@ static void output_frame(struct wl_listener *listener, void *data) {
     if (!scene_output) {
         wlr_log(WLR_ERROR, "[%s] Output_frame: no scene_output", wlr_output->name);
         return;
+    }
+
+    /* NEW: Dock animation logic */
+    if (server->dock_anim_active) {
+        float elapsed = get_monotonic_time_seconds_as_float() - server->dock_anim_start_time;
+        float progress = elapsed / server->dock_anim_duration;
+
+        if (progress >= 1.0f) {
+            // Animation finished
+            dockX_align = (float)server->dock_anim_target_value;
+            server->dock_anim_active = false;
+        } else {
+            // Animation in progress: use an ease-in-out curve for smoothness
+            float eased_progress = progress * progress * (3.0f - 2.0f * progress);
+            // Interpolate the value
+            dockX_align = (float)server->dock_anim_start_value + 
+                          (server->dock_anim_target_value - server->dock_anim_start_value) * eased_progress;
+        }
+        // Schedule another frame to continue the animation
+        wlr_output_schedule_frame(wlr_output);
     }
 
     // --- Damage Detection and Early Exit (only for non-effect path) ---
@@ -11219,6 +11278,9 @@ static const char *solid_fragment_shader_src =
     }
 
     struct tinywl_server server = {0};
+    server.dock_anim_active = true;
+    server.dock_mouse_at_edge = false;
+    server.dock_anim_duration = 0.8f; 
     server.animating_toplevel = NULL; 
 
     server.tv_is_on = true; // Start with the TV on
