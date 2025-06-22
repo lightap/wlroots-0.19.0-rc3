@@ -12148,22 +12148,19 @@ desktop_panel(&server);
 
 
     // NEW: Initialize the dock icons
-server.num_dock_icons = 4; // Set how many icons you want
+server.num_dock_icons = 8; // Set how many icons you want
 server.socket_name = socket; // Store the socket name to pass it to new applications
 
 
 // Define the command and texture for each icon
 server.dock_icons[0].app_command = "WAYLAND_DISPLAY=wayland-1 LIBGL_ALWAYS_SOFTWARE=0 weston-simple-egl";
-//server.dock_icons[0].texture_id = load_texture_from_file("texture1.png");
-
-server.dock_icons[1].app_command = "LIBGL_ALWAYS_SOFTWARE=1 LIBGL_ALWAYS_SOFTWARE=0 alacritty"; // Example: terminal
-//server.dock_icons[1].texture_id = load_texture_from_file("texture2.png");
-
+server.dock_icons[1].app_command = "WAYLAND_DISPLAY=wayland-1 LIBGL_ALWAYS_SOFTWARE=0 alacritty"; // Example: terminal
 server.dock_icons[2].app_command = "WAYLAND_DISPLAY=wayland-1 LIBGL_ALWAYS_SOFTWARE=0  kitty"; // Example: browser
-//server.dock_icons[2].texture_id = load_texture_from_file("texture3.png");
-
-server.dock_icons[3].app_command = "WAYLAND_DISPLAY=wayland-1 LIBGL_ALWAYS_SOFTWARE=0 LIBGL_ALWAYS_SOFTWARE=0 gnome-calculator"; // Example: calculator
-//server.dock_icons[3].texture_id = load_texture_from_file("texture4.png");
+server.dock_icons[3].app_command = "WAYLAND_DISPLAY=wayland-1 LIBGL_ALWAYS_SOFTWARE=0 gtk3-demo"; // Example: calculator
+server.dock_icons[4].app_command = "WAYLAND_DISPLAY=wayland-1 LIBGL_ALWAYS_SOFTWARE=0 gtk4-demo";
+server.dock_icons[5].app_command = "WAYLAND_DISPLAY=wayland-1 LIBGL_ALWAYS_SOFTWARE=0 epiphany"; // Example: terminal
+server.dock_icons[6].app_command = "WAYLAND_DISPLAY=wayland-1 LIBGL_ALWAYS_SOFTWARE=0  gedit"; // Example: browser
+server.dock_icons[7].app_command = "WAYLAND_DISPLAY=wayland-0 LIBGL_ALWAYS_SOFTWARE=0 weston --backend=x11"; // Example: calculator
 
   
 
