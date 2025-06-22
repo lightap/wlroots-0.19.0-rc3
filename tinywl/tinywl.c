@@ -612,6 +612,16 @@ GLuint intermediate_rbo[16];
     GLint passthrough_shader_bevelColor_loc;
     GLint passthrough_shader_time_loc;
 
+
+     GLuint passthrough_icons_shader_program;
+    GLint passthrough_icons_shader_mvp_loc;
+    GLint passthrough_icons_shader_tex_loc;
+
+     GLint passthrough_icons_shader_res_loc;
+    GLint passthrough_icons_shader_cornerRadius_loc;
+    GLint passthrough_icons_shader_bevelColor_loc;
+    GLint passthrough_icons_shader_time_loc;
+
     // NEW: Genie/Minimize Effect Shader
     GLuint genie_shader_program;
     GLint genie_shader_mvp_loc;
@@ -1236,6 +1246,7 @@ static void server_destroy(struct tinywl_server *server) {
     if (egl_destroy && wlr_egl_make_current(egl_destroy, NULL)) {
         if (server->shader_program) glDeleteProgram(server->shader_program);
         if (server->passthrough_shader_program) glDeleteProgram(server->passthrough_shader_program);
+         if (server->passthrough_icons_shader_program) glDeleteProgram(server->passthrough_icons_shader_program);
         if (server->rect_shader_program) glDeleteProgram(server->rect_shader_program);
         if (server->panel_shader_program) glDeleteProgram(server->panel_shader_program);
         if (server->ssd_shader_program) glDeleteProgram(server->ssd_shader_program);
@@ -3663,6 +3674,8 @@ float p_box_scale_x, p_box_scale_y , p_box_translate_x,  p_box_translate_y;
                 output_name_log, dock_width, dock_height, dock_x, dock_y);
     }
   
+
+    glUseProgram(server->passthrough_icons_shader_program);
     // RENDER TEXTURED PLACEHOLDERS (existing code, unchanged)
     // Calculate starting Y position to center vertically (reuse the same calculation)
    for (int i = 0; i < server->num_dock_icons; i++) {
@@ -3691,10 +3704,15 @@ float p_box_scale_x, p_box_scale_y , p_box_translate_x,  p_box_translate_y;
             };
             memcpy(preview_mvp, p_model_view, sizeof(preview_mvp));
 
-            if (server->passthrough_shader_mvp_loc != -1) {
-                glUniformMatrix3fv(server->passthrough_shader_mvp_loc, 1, GL_FALSE, preview_mvp);
+    if (server->passthrough_icons_shader_bevelColor_loc != -1) {
+        glUniform4fv(server->passthrough_icons_shader_bevelColor_loc, 1, final_bevel_color);
+    }
+
+            if (server->passthrough_icons_shader_mvp_loc != -1) {
+                glUniformMatrix3fv(server->passthrough_icons_shader_mvp_loc, 1, GL_FALSE, preview_mvp);
             }
 
+         
             
          // Bind the loaded texture instead of unbinding
         glActiveTexture(GL_TEXTURE0);
@@ -3706,12 +3724,12 @@ float p_box_scale_x, p_box_scale_y , p_box_translate_x,  p_box_translate_y;
             wlr_log(WLR_DEBUG, "[PREVIEW:%s] Texture%d.png not loaded, drawing empty placeholder %d", output_name_log, i+1, i);
         }
         // Tell the 'u_texture' sampler to use texture unit 0.
-        glUniform1i(server->passthrough_shader_tex_loc, 0);
+        glUniform1i(server->passthrough_icons_shader_tex_loc, 0);
 
         // Set the other uniforms required by this specific shader.
-        glUniform2f(server->passthrough_shader_res_loc, empty_width, empty_height);
-        glUniform1f(server->passthrough_shader_cornerRadius_loc, 8.0f);
-        glUniform1f(server->passthrough_shader_time_loc, get_monotonic_time_seconds_as_float());
+        glUniform2f(server->passthrough_icons_shader_res_loc, empty_width, empty_height);
+        glUniform1f(server->passthrough_icons_shader_cornerRadius_loc, 8.0f);
+        glUniform1f(server->passthrough_icons_shader_time_loc, get_monotonic_time_seconds_as_float()*(float)(i+3)/(float)(i+2));
 
             glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
         }
@@ -4769,9 +4787,7 @@ GLuint get_desktop_fbo(struct tinywl_server *server, int desktop_idx) {
     return server->desktops[desktop_idx].fbo;
 }
 
-// =============================================================================
-// <<< ADD THIS ENTIRE FUNCTION TO YOUR .c FILE >>>
-// =============================================================================
+
 static bool setup_post_process_framebuffer(struct tinywl_server *server, int width, int height) {
     // This function is almost identical to setup_intermediate_framebuffer, but for the
     // single final FBO used for post-processing.
@@ -11066,9 +11082,7 @@ static const char *passthrough_vertex_shader_src =
     "}\n";
 
 // NEW: Enhanced fragment shader with rounded corners and a bevel.
-// NEW: Enhanced fragment shader with a cycling gradient bevel.
-// NEW: Enhanced fragment shader with a cycling gradient bevel.
-// NEW: Enhanced fragment shader with a base color from C and a moving gradient highlight.
+
 static const char *passthrough_fragment_shader_src =
     "#version 300 es\n"
     "precision highp float;\n"
@@ -11123,6 +11137,48 @@ static const char *passthrough_fragment_shader_src =
     "}\n";
 
 
+static const char *passthrough_icons_fragment_shader_src =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "in vec2 v_texcoord;\n"
+    "out vec4 frag_color;\n"
+    "\n"
+    "uniform sampler2D u_texture;\n"
+    "uniform vec2 iResolution;\n"
+    "uniform float cornerRadius;\n"
+    "uniform vec4 bevelColor;\n"
+    "uniform float time;\n"
+    "\n"
+    "const float bevelWidth = 8.0; // Increased for visibility\n"
+    "const float aa = 1.5;\n"
+    "\n"
+    "float sdRoundedBox(vec2 p, vec2 b, float r) {\n"
+    "    vec2 q = abs(p) - b + r;\n"
+    "    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;\n"
+    "}\n"
+    "\n"
+    "void main() {\n"
+    "    float bounce = sin(time * 3.0) * 0.03 + 1.00;\n"
+    "    vec2 p = (v_texcoord - 0.5) * iResolution;\n"
+    "    float scaledCornerRadius = cornerRadius * bounce;\n"
+    "    float d = sdRoundedBox(p, iResolution * 0.5 * bounce, scaledCornerRadius);\n"
+    "    float shape_alpha = 1.0 - smoothstep(-aa, aa, d);\n"
+    "    float bevel_intensity = smoothstep(-bevelWidth, 0.0, d);\n"
+    "    bevel_intensity -= smoothstep(0.0, aa, d);\n"
+    "    float angle = atan(p.y, p.x);\n"
+    "    float gradient_wave = sin(angle * 2.0 - time * 2.5) * 0.5 + 0.5;\n"
+    "    float highlight_factor = pow(gradient_wave, 8.0);\n"
+    "    float brightness_modulator = 0.7 + highlight_factor * 0.6;\n"
+    "    vec2 scaled_uv = (v_texcoord - 0.5) / bounce + 0.5;\n"
+    "    scaled_uv = clamp(scaled_uv, 0.0, 1.0);\n"
+    "    vec4 tex_color = texture(u_texture, scaled_uv);\n"
+    "    vec3 final_bevel_color = bevelColor.rgb * brightness_modulator;\n"
+    "    vec3 final_rgb = mix(tex_color.rgb, final_bevel_color, bevel_intensity * bevelColor.a);\n"
+    "    float final_alpha = tex_color.a * shape_alpha;\n"
+    "    // Debug: Uncomment to visualize bevel intensity\n"
+    "    // frag_color = vec4(vec3(bevel_intensity), 1.0);\n"
+    "    frag_color = vec4(final_rgb, final_alpha).bgra;\n"
+    "}\n";
 
 /*    //squezze genie
 const char *genie_vertex_shader_src =
@@ -11744,6 +11800,25 @@ for (int i = 0; i < 16; ++i) {
         // ... error handling ...
     }
 
+       // --- Create Pass-Through Shader ---
+    struct shader_uniform_spec passthrough_icons_uniforms[] = {
+        {"mvp", &server.passthrough_icons_shader_mvp_loc},
+        {"u_texture", &server.passthrough_icons_shader_tex_loc},
+        {"iResolution", &server.passthrough_icons_shader_res_loc},
+        {"cornerRadius", &server.passthrough_icons_shader_cornerRadius_loc},
+        {"bevelColor", &server.passthrough_icons_shader_bevelColor_loc},
+        {"time", &server.passthrough_icons_shader_time_loc} // <<< ADD THIS
+    };
+    if (!create_generic_shader_program(server.renderer, "PassThroughShaderIcons",
+                                     passthrough_vertex_shader_src, 
+                                     passthrough_icons_fragment_shader_src,
+                                     &server.passthrough_icons_shader_program,
+                                     passthrough_icons_uniforms, 
+                                     sizeof(passthrough_icons_uniforms) / sizeof(passthrough_icons_uniforms[0]))) {
+        // ... error handling ...
+    }
+
+
 
 // In main(), inside the shader setup section
     // ... (after your other create_generic_shader_program calls)
@@ -12148,7 +12223,7 @@ desktop_panel(&server);
 
 
     // NEW: Initialize the dock icons
-server.num_dock_icons = 8; // Set how many icons you want
+server.num_dock_icons = 10; // Set how many icons you want
 server.socket_name = socket; // Store the socket name to pass it to new applications
 
 
@@ -12160,7 +12235,9 @@ server.dock_icons[3].app_command = "WAYLAND_DISPLAY=wayland-1 LIBGL_ALWAYS_SOFTW
 server.dock_icons[4].app_command = "WAYLAND_DISPLAY=wayland-1 LIBGL_ALWAYS_SOFTWARE=0 gtk4-demo";
 server.dock_icons[5].app_command = "WAYLAND_DISPLAY=wayland-1 LIBGL_ALWAYS_SOFTWARE=0 epiphany"; // Example: terminal
 server.dock_icons[6].app_command = "WAYLAND_DISPLAY=wayland-1 LIBGL_ALWAYS_SOFTWARE=0  gedit"; // Example: browser
-server.dock_icons[7].app_command = "WAYLAND_DISPLAY=wayland-0 LIBGL_ALWAYS_SOFTWARE=0 weston --backend=x11"; // Example: calculator
+server.dock_icons[7].app_command = "WAYLAND_DISPLAY=wayland-1 LIBGL_ALWAYS_SOFTWARE=0 weston "; // Example: calculator
+server.dock_icons[8].app_command = "WAYLAND_DISPLAY=wayland-1 LIBGL_ALWAYS_SOFTWARE=0  weston-flower"; // Example: browser
+server.dock_icons[9].app_command = "WAYLAND_DISPLAY=wayland-1 LIBGL_ALWAYS_SOFTWARE=0 weston-smoke "; // Example: calculator
 
   
 
