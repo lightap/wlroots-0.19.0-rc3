@@ -689,7 +689,7 @@ struct tinywl_decoration { // Your struct for SSD scene rects
 
 };
 
-#define TITLE_BAR_HEIGHT 10
+#define TITLE_BAR_HEIGHT 13
 #define BORDER_WIDTH 10
 
 struct tinywl_toplevel {
@@ -4957,9 +4957,9 @@ if (!server->cube_effect_active) {
             float now_sec = get_monotonic_time_seconds_as_float();
             float elapsed_sec = now_sec - server->cube_anim_start_time_sec;
             float t = (server->cube_anim_duration_sec > 1e-5f) ? (elapsed_sec / server->cube_anim_duration_sec) : 1.0f;
-server->effect_is_animating_zoom = false;
-server->expo_effect_active = false;
-server->effect_is_target_zoomed=false;
+            server->effect_is_animating_zoom = false;
+            server->expo_effect_active = false;
+            server->effect_is_target_zoomed=false;
             if (t >= 1.0f) {
                 server->cube_anim_current_factor = server->cube_anim_target_factor;
                 server->cube_is_animating_zoom = false;
