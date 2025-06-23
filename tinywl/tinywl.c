@@ -11195,7 +11195,7 @@ static const char *passthrough_icons_fragment_shader_src =
     "    // 3D Button bevel effect - raised center\n"
     "    float center_distance = length(p) / (min(iResolution.x, iResolution.y) * 0.5);\n"
     "    float button_height = 1.0 - smoothstep(0.0, 0.8, center_distance);\n"
-    "    button_height = pow(button_height, 30.0); // Smooth falloff\n"
+    "    button_height = pow(button_height, 2.0); // Smooth falloff\n"
     "    \n"
     "    // Light direction for 3D effect (top-left lighting)\n"
     "    vec2 light_dir = normalize(vec2(-1.0, -1.0));\n"
